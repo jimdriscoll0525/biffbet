@@ -7,7 +7,7 @@ lives in one reusable place rather than being copy-pasted into the CLI.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date as date_cls
+from datetime import date as date_cls, datetime, timezone
 
 from mlb_value_bot.analysis.ev_calculator import (
     SideEvaluation,
@@ -79,12 +79,38 @@ def _odds_by_team(game: GameOdds) -> dict[str, int]:
 
 
 def _match_odds(scheduled: ScheduledGame, odds: list[GameOdds]) -> GameOdds | None:
-    """Match a scheduled game to its odds by the unordered team pair."""
+    """Match a scheduled game to its odds by team pair AND date.
+
+    The Odds API returns every upcoming event, so a multi-day series has several
+    events sharing the same team pair. Matching on the pair alone (the old bug)
+    grabbed whichever appeared first — often the WRONG day's line. We pick the
+    event whose start is on the game date, and if the only candidates fall on
+    other days we return None (skip) rather than publish a misleading line.
+    """
     target = frozenset({scheduled.home_team, scheduled.away_team})
-    for g in odds:
-        if frozenset({g.home_team, g.away_team}) == target:
-            return g
-    return None
+    candidates = [g for g in odds if frozenset({g.home_team, g.away_team}) == target]
+    if not candidates:
+        return None
+
+    # Reference ~mid-slate on the game date (21:00 UTC ≈ 5pm ET). Same-day MLB
+    # first pitches land within ~8h of this; the next day's are ~17h+ away, so a
+    # 12h tolerance cleanly separates "today's game" from the rest of the series.
+    try:
+        ref = datetime.fromisoformat(scheduled.game_date).replace(hour=21, tzinfo=timezone.utc)
+    except ValueError:
+        return candidates[0]
+
+    def _hours_off(g: GameOdds) -> float:
+        try:
+            dt = datetime.fromisoformat((g.commence_time or "").replace("Z", "+00:00"))
+        except ValueError:
+            return float("inf")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return abs((dt - ref).total_seconds()) / 3600.0
+
+    best = min(candidates, key=_hours_off)
+    return best if _hours_off(best) <= 12.0 else None
 
 
 def evaluate_game(

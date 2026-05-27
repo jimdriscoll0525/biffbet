@@ -176,6 +176,31 @@ def test_tracking_roundtrip(tmp_path=None):
         importlib.reload(recs)
 
 
+# --- Odds <-> schedule matching (date-aware, series-safe) --------------------
+def test_match_odds_picks_correct_day_in_a_series():
+    from types import SimpleNamespace
+    from mlb_value_bot.pipeline import _match_odds
+    from mlb_value_bot.data.odds_client import GameOdds
+
+    sched = SimpleNamespace(
+        home_team="San Diego Padres", away_team="Philadelphia Phillies", game_date="2026-05-27"
+    )
+    # Same matchup on consecutive days (a series). Padres are PT, so a 5/27 night
+    # game starts early on 5/28 UTC — the matcher must still bucket it to 5/27.
+    tonight = GameOdds(event_id="tonight", commence_time="2026-05-28T01:40:00Z",
+                       home_team="San Diego Padres", away_team="Philadelphia Phillies")
+    tomorrow = GameOdds(event_id="tomorrow", commence_time="2026-05-29T01:40:00Z",
+                        home_team="San Diego Padres", away_team="Philadelphia Phillies")
+
+    # Order-independent: always returns the game on the analyzed date.
+    assert _match_odds(sched, [tomorrow, tonight]).event_id == "tonight"
+    assert _match_odds(sched, [tonight, tomorrow]).event_id == "tonight"
+    # If only a different day's odds exist, skip rather than show a wrong line.
+    assert _match_odds(sched, [tomorrow]) is None
+    # No matchup at all -> None.
+    assert _match_odds(sched, []) is None
+
+
 # --- Manual runner -----------------------------------------------------------
 def _run_all() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
