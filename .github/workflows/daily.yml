@@ -1,0 +1,48 @@
+name: BiffBet daily pipeline
+
+# Runs the engine on a schedule and publishes to Supabase (which the website
+# reads). Supabase is the source of truth: each run PULLs prior state into a
+# fresh SQLite, grades yesterday, builds today's slate, then SYNCs back.
+on:
+  schedule:
+    - cron: "0 14 * * *"    # 14:00 UTC (~10am ET): morning slate + grade yesterday
+    - cron: "30 22 * * *"   # 22:30 UTC (~6:30pm ET): re-price for closing-line value
+  workflow_dispatch: {}      # allow manual runs from the Actions tab
+
+# Never let two runs clobber each other (they share the Supabase tables).
+concurrency:
+  group: biffbet-pipeline
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      # Check out into a subfolder so the package imports as `mlb_value_bot`
+      # (i.e. `python -m mlb_value_bot ...` resolves from the workspace root).
+      - name: Checkout engine into ./mlb_value_bot
+        uses: actions/checkout@v4
+        with:
+          path: mlb_value_bot
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: mlb_value_bot/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r mlb_value_bot/requirements.txt
+
+      - name: Run pipeline (pull -> grade -> slate -> sync)
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          BANKROLL: ${{ secrets.BANKROLL }}   # optional; defaults to 1000 if unset
+        run: |
+          python -m mlb_value_bot pull
+          python -m mlb_value_bot results || echo "results: nothing to settle"
+          python -m mlb_value_bot today
+          python -m mlb_value_bot sync

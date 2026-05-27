@@ -1,0 +1,21 @@
+# secrets / config
+.env
+
+# virtualenv
+.venv/
+venv/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# runtime data (DB, cached parquet, logs)
+storage/*.db
+storage/*.log
+storage/cache/
+
+# OS
+.DS_Store
+Thumbs.db

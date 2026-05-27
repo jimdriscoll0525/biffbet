@@ -1,0 +1,208 @@
+# =============================================================================
+# mlb_value_bot configuration
+#
+# Everything that controls model behavior, thresholds, and bet sizing lives
+# here so you can tune the bot WITHOUT touching code. Reloaded on every run.
+#
+# The model produces a home-team win probability by starting from a base rate
+# and applying a series of additive probability deltas, each scaled by a weight
+# defined under `model.weights`. Set a weight to 0.0 to disable a component
+# entirely; raise it to make that factor matter more. See
+# analysis/win_probability.py for exactly how each delta is computed.
+# =============================================================================
+
+odds_api:
+  base_url: "https://api.the-odds-api.com/v4"
+  sport_key: "baseball_mlb"
+  regions: "us"            # us | us2 | uk | eu | au (comma-separated allowed)
+  markets: "h2h"           # moneyline
+  odds_format: "american"
+  # Which sportsbooks to consider. Empty list = all books the API returns.
+  # The bot picks the BEST (highest) price available across these books per side.
+  bookmakers:
+    - "draftkings"
+    - "fanduel"
+    - "betmgm"
+    - "caesars"
+    - "pointsbetus"
+  request_timeout_seconds: 20
+
+mlb_api:
+  base_url: "https://statsapi.mlb.com/api"
+  request_timeout_seconds: 20
+
+cache:
+  # TTL for pybaseball / Statcast parquet pulls, in hours.
+  ttl_hours: 24
+
+# FanGraphs CSV fallback. FanGraphs sits behind a Cloudflare JS challenge that
+# 403s all scrapers (pybaseball included), so the reliable way to get xFIP/SIERA/
+# K-BB%/wRC+/bullpen-FIP is to export the leaderboards from your browser and drop
+# the CSVs in `dir` below. The model prefers these over (blocked) live scraping.
+# See README "FanGraphs CSV workflow" and `python -m mlb_value_bot data-status`.
+fangraphs_csv:
+  enabled: true
+  dir: "storage/fangraphs"
+  # {season} is substituted; the season-less name (pitching.csv) also works.
+  pitching_filename: "pitching_{season}.csv"
+  batting_filename: "batting_{season}.csv"
+
+# -----------------------------------------------------------------------------
+# League-average constants used to convert rate stats into win-equivalents.
+# These are the "anchors" the model regresses toward. Update them seasonally.
+# -----------------------------------------------------------------------------
+league:
+  avg_xfip: 4.00          # league-average xFIP (runs/9)
+  avg_siera: 4.00         # league-average SIERA (runs/9)
+  avg_bullpen_fip: 4.10   # league-average relief FIP
+  runs_per_win: 10.0      # ~10 runs ≈ 1 win (Pythagorean rule of thumb)
+  runs_per_game: 4.5      # league-average runs scored per team per game
+  # Used to derive a pitcher run-prevention rate from Statcast xwOBA-against
+  # when FanGraphs (xFIP/SIERA) is unavailable. statcast_rate (runs/9) =
+  #   avg_xfip + (xwoba_against - avg_xwoba) * xwoba_to_run9
+  # so it lands on the same ~4.00 scale the model already uses.
+  avg_xwoba: 0.315        # league-average xwOBA against
+  xwoba_to_run9: 40.0     # wOBA points -> runs/9 (e.g. .025 below avg ≈ -1.0 run)
+
+# -----------------------------------------------------------------------------
+# Win-probability model
+# -----------------------------------------------------------------------------
+model:
+  # Primary pitcher rate stat: "xfip" or "siera". Falls back to the other if
+  # the preferred one is missing for a given pitcher.
+  pitcher_stat: "xfip"
+
+  # Early-season regression of team win% toward .500.
+  # regressed_wp = (wins + k*0.5) / (games + k). Larger k = more regression.
+  team_regression_games: 30
+
+  # Converts a 1-run/9 difference in pitcher xFIP/SIERA into a win-prob points
+  # delta vs a league-average pitcher (before log5). 1 run/9 over ~6 IP and the
+  # runs_per_win rule lands around 0.06-0.07 win% per run; 0.065 is a sane start.
+  pitcher_run_to_winpct: 0.065
+
+  # Converts a 1-run bullpen FIP differential into a win-prob delta. Bullpens
+  # throw ~1/3 of innings, so the per-run effect is smaller than the starter's.
+  bullpen_run_to_winpct: 0.022
+
+  # Recent-form scaling (see analysis/win_probability.py).
+  form_scale: 0.5
+
+  # --- Market anchoring (calibration) ---------------------------------------
+  # The betting market is the sharpest public probability estimate. Rather than
+  # trust the standalone model (which, like any heuristic, "finds" edges
+  # everywhere), we blend the model toward the de-vigged market:
+  #   final_prob = market_blend * model_prob + (1 - market_blend) * market_prob
+  # 0.0 = trust the market entirely (no bets ever); 1.0 = ignore the market
+  # (overconfident, flags everything). Keep this LOW — the model should express
+  # a bounded tilt off the market, not replace it. Raise it only once backtests
+  # show the model's raw edges are real. Lower it in degraded data modes.
+  market_blend: 0.25
+
+  # Sample-size regression for the Statcast-derived rate (statcast_rate). Until a
+  # pitcher has faced this many batters, his xwOBA-against is shrunk toward
+  # league average, so a few hot/cold starts don't read as ace/replacement level.
+  statcast_regression_pa: 200
+
+  # Each component below is computed as a probability delta in [-x, x] and then
+  # multiplied by its weight. Net home_wp = base_wp + sum(weight_i * delta_i),
+  # clamped to [prob_floor, prob_ceiling].
+  weights:
+    starter: 1.0          # SP matchup (log5 of pitcher win-equivalents)
+    bullpen: 1.0          # relief corps FIP differential
+    park: 0.25            # ballpark run environment (mostly a totals factor;
+                          # small ML effect, kept low + tunable on purpose)
+    home_field: 1.0       # constant home-field edge
+    form: 1.0             # recent pitcher (last N starts) + offense (last 14d)
+
+  home_field_advantage: 0.035   # ~3.5% baseline boost to the home side
+  prob_floor: 0.02
+  prob_ceiling: 0.98
+
+# -----------------------------------------------------------------------------
+# EV / bet sizing
+# -----------------------------------------------------------------------------
+ev:
+  # Flag a bet as +EV when EV% >= this threshold. 0.03 = 3%. Deliberately not
+  # 5% — too high a bar filters out almost everything early in the season.
+  threshold: 0.03
+
+  # De-vig method for converting the two-sided market into fair probabilities:
+  # "power" (iterative, accounts for favorite-longshot bias) or "proportional".
+  devig_method: "power"
+
+# -----------------------------------------------------------------------------
+# Sanity guards — reject games whose market data is implausible, so a bad or
+# stale odds feed can never manufacture fake "edge" (e.g. a public dashboard
+# flashing +400% EV on a +3300 placeholder line). A failing game is SKIPPED with
+# a reason; it is never saved, ranked, or shown as a pick. These bounds sit far
+# outside real MLB markets (underdogs top out ~+330; real +EV is low single-to-
+# double-digit %), so they catch garbage without rejecting legitimate games.
+# -----------------------------------------------------------------------------
+sanity:
+  max_abs_odds: 800     # skip if either side's American moneyline exceeds +/-800
+  max_ev: 0.30          # skip a pick whose EV exceeds 30% (almost surely bad odds)
+
+kelly:
+  fraction: 0.25          # quarter-Kelly
+  max_bankroll_fraction: 0.02   # never stake more than 2% of bankroll
+
+# -----------------------------------------------------------------------------
+# Confidence score weights (0-100). Components are each normalized to [0,1] and
+# combined as a weighted average, then scaled to 100. See win_probability.py
+# (compute_confidence) for the exact formula and rationale.
+# -----------------------------------------------------------------------------
+confidence:
+  weights:
+    data_completeness: 0.30   # did we get both pitchers + team data?
+    sample_size: 0.20         # pitcher IP relative to a "trustworthy" threshold
+    edge_magnitude: 0.25      # bigger edges -> more confidence (capped)
+    component_agreement: 0.25 # are the model factors all leaning one way?
+  # Pitcher IP at which sample-size confidence saturates to 1.0.
+  ip_full_confidence: 60.0
+  # EV% at which edge-magnitude confidence saturates to 1.0 (0.10 = 10%).
+  edge_full_confidence: 0.10
+
+# -----------------------------------------------------------------------------
+# Hardcoded ballpark factors (100 = neutral, >100 favors offense).
+# Keyed by MLB team name (home team). Source: rough multi-year runs park
+# factors; edit freely. Used by the `park` model component.
+# -----------------------------------------------------------------------------
+park_factors:
+  "Colorado Rockies": 112
+  "Boston Red Sox": 108
+  "Cincinnati Reds": 106
+  "Kansas City Royals": 104
+  "Arizona Diamondbacks": 103
+  "Philadelphia Phillies": 102
+  "Baltimore Orioles": 102
+  "Texas Rangers": 102
+  "Los Angeles Angels": 101
+  "Toronto Blue Jays": 101
+  "Atlanta Braves": 101
+  "Chicago Cubs": 100
+  "Minnesota Twins": 100
+  "Washington Nationals": 100
+  "Houston Astros": 100
+  "St. Louis Cardinals": 99
+  "Pittsburgh Pirates": 99
+  "Chicago White Sox": 99
+  "New York Yankees": 99
+  "Milwaukee Brewers": 98
+  "Los Angeles Dodgers": 98
+  "Detroit Tigers": 98
+  "New York Mets": 97
+  "Tampa Bay Rays": 97
+  "Cleveland Guardians": 97
+  "Athletics": 96
+  "San Diego Padres": 96
+  "Seattle Mariners": 95
+  "San Francisco Giants": 94
+  "Miami Marlins": 94
+
+# Default park factor when a team isn't in the table above.
+default_park_factor: 100
+
+logging:
+  level: "INFO"
+  file: "storage/mlb_value_bot.log"

@@ -1,0 +1,100 @@
+"""Grade open recommendations against final scores from the MLB Stats API."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from mlb_value_bot.data.mlb_client import MLBClient
+from mlb_value_bot.tracking import recommendations as recs
+from mlb_value_bot.utils import get_logger
+
+log = get_logger("tracking.results")
+
+
+@dataclass
+class GradedBet:
+    rec_id: int
+    matchup: str
+    side: str
+    result: str
+    profit_loss: float
+
+
+@dataclass
+class GradingSummary:
+    date: str
+    graded: int = 0
+    wins: int = 0
+    losses: int = 0
+    voids: int = 0
+    pending: int = 0           # still not final (in progress / no result yet)
+    staked: float = 0.0        # total bankroll fraction staked on graded bets
+    profit_loss: float = 0.0   # net bankroll fraction
+    bets: list[GradedBet] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.bets is None:
+            self.bets = []
+
+    @property
+    def roi(self) -> float:
+        return self.profit_loss / self.staked if self.staked > 0 else 0.0
+
+
+def grade_date(game_date: str, mlb_client: MLBClient | None = None) -> GradingSummary:
+    """Fetch final scores for `game_date` and settle all pending bets on it."""
+    mlb = mlb_client or MLBClient()
+    open_bets = recs.get_open_for_date(game_date)
+    summary = GradingSummary(date=game_date)
+    if not open_bets:
+        log.info("No open bets for %s", game_date)
+        return summary
+
+    results_by_id = {r.game_id: r for r in mlb.get_results(game_date)}
+
+    for bet in open_bets:
+        game = results_by_id.get(bet["game_id"])
+        matchup = f'{bet["away_team"]} @ {bet["home_team"]}'
+
+        if game is None:
+            summary.pending += 1
+            continue
+
+        # Postponed/cancelled/suspended -> void the bet (stake returned).
+        if not game.is_final:
+            if game.status in {"Postponed", "Cancelled", "Canceled", "Suspended"}:
+                recs.update_result(bet["id"], "void", 0.0)
+                summary.voids += 1
+                summary.bets.append(GradedBet(bet["id"], matchup, bet["recommended_side"], "void", 0.0))
+            else:
+                summary.pending += 1
+            continue
+
+        bet_team = bet["home_team"] if bet["recommended_side"] == "home" else bet["away_team"]
+        winner = game.winner
+        stake = float(bet["kelly_stake"])
+        decimal_odds = float(bet["decimal_odds"])
+
+        if winner is None:
+            summary.pending += 1
+            continue
+        if winner == bet_team:
+            pl = stake * (decimal_odds - 1.0)
+            recs.update_result(bet["id"], "win", pl)
+            summary.wins += 1
+            result_str = "win"
+        else:
+            pl = -stake
+            recs.update_result(bet["id"], "loss", pl)
+            summary.losses += 1
+            result_str = "loss"
+
+        summary.graded += 1
+        summary.staked += stake
+        summary.profit_loss += pl
+        summary.bets.append(GradedBet(bet["id"], matchup, bet["recommended_side"], result_str, pl))
+
+    log.info(
+        "Graded %s: %d settled (%dW-%dL), %d void, %d pending, P/L %.4f",
+        game_date, summary.graded, summary.wins, summary.losses, summary.voids, summary.pending, summary.profit_loss,
+    )
+    return summary
