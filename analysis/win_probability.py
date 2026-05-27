@@ -177,8 +177,9 @@ def compute_win_probability(
         park_avail = False
     components.append(_mk("park", park_delta, weights["park"], note, park_avail))
 
-    # 5) HOME FIELD — constant boost to the home side.
-    hfa = float(m.get("home_field_advantage", 0.035))
+    # 5) HOME FIELD — park-specific boost to the home side (Coors > the rest).
+    default_hfa = float(m.get("default_park_hfa", m.get("home_field_advantage", 0.035)))
+    hfa = float(m.get("park_hfa", {}).get(home_team.team, default_hfa))
     components.append(_mk("home_field", hfa, weights["home_field"], f"+{hfa:.3f} home", True))
 
     # 6) RECENT FORM — pitcher last ~5 starts via Statcast (xwOBA-on-contact,

@@ -146,13 +146,36 @@ def test_golden_win_probability_locks_current_math():
     res = compute_win_probability(ht, at, hp, ap)
 
     assert approx(res.base_prob, 0.550802, tol=1e-5), res.base_prob
-    assert approx(res.home_win_prob, 0.669446, tol=1e-5), res.home_win_prob
+    assert approx(res.home_win_prob, 0.659446, tol=1e-5), res.home_win_prob
     deltas = {c.name: c.weighted_delta for c in res.components}
     assert approx(deltas["starter"], 0.051895, tol=1e-5), deltas["starter"]
     assert approx(deltas["bullpen"], 0.011000, tol=1e-5), deltas["bullpen"]
     assert approx(deltas["park"], 0.000750, tol=1e-5), deltas["park"]
-    assert approx(deltas["home_field"], 0.035000, tol=1e-5), deltas["home_field"]
+    # home_field is now the park-specific DEFAULT (team "H" isn't in park_hfa);
+    # changed 0.035 -> 0.025 on 2026-05-27 with park-specific HFA.
+    assert approx(deltas["home_field"], 0.025000, tol=1e-5), deltas["home_field"]
     assert approx(deltas["form"], 0.020000, tol=1e-5), deltas["form"]
+
+
+def test_park_specific_home_field_advantage():
+    """Home-field is park-specific: Coors (Rockies) > default; unlisted -> default."""
+    at = TeamProfile(team="A", raw_winpct=0.50, games=80, wins=40, losses=40,
+                     offense_wrc_plus=100, bullpen_fip=4.00, park_factor=100)
+    hp = PitcherProfile(player_id=1, name="H SP", ip=80, xfip=4.0, k_bb_pct=0.16,
+                        csw_pct=0.29, recent_xwoba_con=0.330, recent_starts=5,
+                        has_season_stats=True, has_statcast=True)
+    ap = PitcherProfile(player_id=2, name="A SP", ip=80, xfip=4.0, k_bb_pct=0.16,
+                        csw_pct=0.29, recent_xwoba_con=0.330, recent_starts=5,
+                        has_season_stats=True, has_statcast=True)
+
+    def hfa_for(home_name: str) -> float:
+        ht = TeamProfile(team=home_name, raw_winpct=0.50, games=80, wins=40, losses=40,
+                         offense_wrc_plus=100, bullpen_fip=4.00, park_factor=100)
+        res = compute_win_probability(ht, at, hp, ap)
+        return next(c.weighted_delta for c in res.components if c.name == "home_field")
+
+    assert approx(hfa_for("Colorado Rockies"), 0.045, tol=1e-9)   # Coors
+    assert approx(hfa_for("Some Unlisted Team"), 0.025, tol=1e-9)  # default
 
 
 def test_confidence_drops_with_missing_data():

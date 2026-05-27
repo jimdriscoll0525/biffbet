@@ -117,7 +117,17 @@ model:
     home_field: 1.0       # constant home-field edge
     form: 1.0             # recent pitcher (last N starts) + offense (last 14d)
 
-  home_field_advantage: 0.035   # ~3.5% baseline boost to the home side
+  # Home-field advantage (win-prob points added to the HOME side). Park-specific:
+  # look up the home team in park_hfa, else fall back to default_park_hfa. This
+  # replaces the old flat home_field_advantage (kept below only as a last resort).
+  default_park_hfa: 0.025
+  park_hfa:
+    "Colorado Rockies": 0.045      # Coors Field (altitude)
+    "Boston Red Sox": 0.030        # Fenway Park
+    "New York Yankees": 0.028      # Yankee Stadium
+    "Los Angeles Dodgers": 0.025   # Dodger Stadium
+    "Kansas City Royals": 0.023    # Kauffman Stadium
+  home_field_advantage: 0.035      # legacy fallback (used only if park_hfa/default absent)
   prob_floor: 0.02
   prob_ceiling: 0.98
 
