@@ -178,6 +178,27 @@ def test_park_specific_home_field_advantage():
     assert approx(hfa_for("Some Unlisted Team"), 0.025, tol=1e-9)  # default
 
 
+def test_recent_form_regresses_toward_season():
+    """Recent xwOBAcon is regressed toward the season value (0.6/0.4), damping
+    the delta vs using raw recent form."""
+    from mlb_value_bot.analysis.win_probability import _form_delta
+
+    home = PitcherProfile(player_id=1, name="H", recent_xwoba_con=0.300, xwoba_con=0.340, recent_starts=5)
+    away = PitcherProfile(player_id=2, name="A", recent_xwoba_con=0.360, xwoba_con=0.340, recent_starts=5)
+    # 0.6 recent / 0.4 season -> H=0.316, A=0.352, diff 0.036, *0.5 scale = 0.018.
+    delta, _, avail = _form_delta(home, away, scale=0.5, recent_weight=0.6)
+    assert avail
+    assert approx(delta, 0.018, tol=1e-6), delta
+    # Raw recent (weight 1.0) would be 0.030 — regression dampens it.
+    raw, _, _ = _form_delta(home, away, scale=0.5, recent_weight=1.0)
+    assert approx(raw, 0.030, tol=1e-6) and delta < raw
+    # No season value -> falls back to recent only (no crash).
+    h2 = PitcherProfile(player_id=3, name="H2", recent_xwoba_con=0.300, recent_starts=5)
+    a2 = PitcherProfile(player_id=4, name="A2", recent_xwoba_con=0.360, recent_starts=5)
+    d2, _, ok2 = _form_delta(h2, a2, scale=0.5, recent_weight=0.6)
+    assert ok2 and approx(d2, 0.030, tol=1e-6)
+
+
 def test_confidence_drops_with_missing_data():
     home_t = _mk_team("H", 0.5, 60, 100, 4.0)
     away_t = _mk_team("A", 0.5, 60, 100, 4.0)

@@ -86,6 +86,10 @@ model:
 
   # Recent-form scaling (see analysis/win_probability.py).
   form_scale: 0.5
+  # Recent xwOBA/CSW is regressed toward the pitcher's SEASON value to damp
+  # hot/cold-streak noise: blended = form_recent_weight*recent + (1-w)*season.
+  # Falls back to recent-only when the season value is unavailable.
+  form_recent_weight: 0.6
 
   # --- Market anchoring (calibration) ---------------------------------------
   # The betting market is the sharpest public probability estimate. Rather than

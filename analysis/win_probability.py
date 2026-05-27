@@ -185,7 +185,10 @@ def compute_win_probability(
     # 6) RECENT FORM — pitcher last ~5 starts via Statcast (xwOBA-on-contact,
     # fallback CSW%). NOTE: rolling team-offense form (last 14d) is not yet
     # pulled; this component currently reflects recent PITCHING form only.
-    form_delta, form_note, form_avail = _form_delta(home_pitcher, away_pitcher, float(m.get("form_scale", 0.5)))
+    form_delta, form_note, form_avail = _form_delta(
+        home_pitcher, away_pitcher,
+        float(m.get("form_scale", 0.5)), float(m.get("form_recent_weight", 0.6)),
+    )
     components.append(_mk("form", form_delta, weights["form"], form_note, form_avail))
 
     # Assemble.
@@ -209,18 +212,34 @@ def _mk(name: str, raw: float, weight: float, note: str, available: bool) -> Com
     return Component(name=name, raw_delta=raw, weight=weight, weighted_delta=raw * weight, note=note, available=available)
 
 
-def _form_delta(home: PitcherProfile, away: PitcherProfile, scale: float) -> tuple[float, str, bool]:
-    """Recent-form delta from pitchers' last-5-start Statcast (+ favors home)."""
+def _regress_recent(recent: float | None, season: float | None, w_recent: float) -> float | None:
+    """Regress a recent rate toward its season value to damp streak noise:
+    w_recent*recent + (1-w_recent)*season. Falls back to recent if season is absent."""
+    if recent is None:
+        return None
+    if season is None:
+        return recent
+    return w_recent * recent + (1.0 - w_recent) * season
+
+
+def _form_delta(home: PitcherProfile, away: PitcherProfile, scale: float,
+                recent_weight: float = 0.6) -> tuple[float, str, bool]:
+    """Recent-form delta from pitchers' last-5-start Statcast, each regressed
+    toward the pitcher's season rate (+ favors home)."""
     # Prefer xwOBA-on-contact (lower = better); home advantage when home's
-    # recent xwOBA is lower than away's.
-    if home.recent_xwoba_con is not None and away.recent_xwoba_con is not None:
-        diff = away.recent_xwoba_con - home.recent_xwoba_con  # + favors home
+    # (season-regressed) recent xwOBA is lower than away's.
+    h_xw = _regress_recent(home.recent_xwoba_con, home.xwoba_con, recent_weight)
+    a_xw = _regress_recent(away.recent_xwoba_con, away.xwoba_con, recent_weight)
+    if h_xw is not None and a_xw is not None:
+        diff = a_xw - h_xw  # + favors home
         delta = clamp(diff * scale, -0.05, 0.05)
-        return delta, f"recent xwOBAcon H={home.recent_xwoba_con:.3f} A={away.recent_xwoba_con:.3f}", True
-    if home.recent_csw_pct is not None and away.recent_csw_pct is not None:
-        diff = home.recent_csw_pct - away.recent_csw_pct  # higher CSW = better
+        return delta, f"recent xwOBAcon(reg) H={h_xw:.3f} A={a_xw:.3f}", True
+    h_csw = _regress_recent(home.recent_csw_pct, home.csw_pct, recent_weight)
+    a_csw = _regress_recent(away.recent_csw_pct, away.csw_pct, recent_weight)
+    if h_csw is not None and a_csw is not None:
+        diff = h_csw - a_csw  # higher CSW = better
         delta = clamp(diff * scale, -0.05, 0.05)
-        return delta, f"recent CSW% H={home.recent_csw_pct:.3f} A={away.recent_csw_pct:.3f}", True
+        return delta, f"recent CSW%(reg) H={h_csw:.3f} A={a_csw:.3f}", True
     return 0.0, "missing recent Statcast form", False
 
 
