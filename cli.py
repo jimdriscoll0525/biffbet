@@ -67,9 +67,14 @@ def cli() -> None:
 @click.option("--save/--no-save", default=True, help="Save +EV bets to the tracking DB.")
 @click.option("--min-ev", type=float, default=None, help="Override EV threshold (e.g. 0.03).")
 @click.option("--all", "show_all", is_flag=True, help="Show every game, not just +EV ones.")
-def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool) -> None:
+@click.option("--market-blend", type=float, default=None,
+              help="Override the model/market blend weight (0=market only, 1=model only).")
+def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
+          market_blend: float | None) -> None:
     """Analyze today's slate and print the ranked +EV table."""
     config = load_config()
+    if market_blend is not None:
+        config = {**config, "model": {**config["model"], "market_blend": market_blend}}
     game_date = date_ or date.today().isoformat()
     threshold = min_ev if min_ev is not None else float(config["ev"]["threshold"])
     bankroll = get_bankroll()
@@ -260,11 +265,16 @@ def _render_segment(title: str, df) -> None:
 @click.option("--start", required=True, help="Start date YYYY-MM-DD.")
 @click.option("--end", required=True, help="End date YYYY-MM-DD.")
 @click.option("--csv", "csv_path", required=True, help="CSV of historical odds (see README).")
-def backtest(start: str, end: str, csv_path: str) -> None:
+@click.option("--market-blend", type=float, default=None,
+              help="Override the model/market blend weight for this backtest (e.g. 0.25 vs 0.35).")
+def backtest(start: str, end: str, csv_path: str, market_blend: float | None) -> None:
     """Re-run the model over historical games using a CSV of odds."""
     from mlb_value_bot.backtest.backtester import run_backtest
 
-    result = run_backtest(start, end, csv_path)
+    config = load_config()
+    if market_blend is not None:
+        config = {**config, "model": {**config["model"], "market_blend": market_blend}}
+    result = run_backtest(start, end, csv_path, config=config)
     s = result.summary
     if s.get("bets", 0) == 0:
         console.print("[yellow]No qualifying +EV bets in the backtest window.[/]")

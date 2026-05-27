@@ -96,7 +96,10 @@ model:
   # (overconfident, flags everything). Keep this LOW — the model should express
   # a bounded tilt off the market, not replace it. Raise it only once backtests
   # show the model's raw edges are real. Lower it in degraded data modes.
-  market_blend: 0.25
+  # Raised 0.25 -> 0.35 on 2026-05-27; validate with
+  #   `python -m mlb_value_bot backtest --market-blend 0.35 ...`
+  # before trusting it. Override per-run with the --market-blend CLI flag.
+  market_blend: 0.35
 
   # Sample-size regression for the Statcast-derived rate (statcast_rate). Until a
   # pitcher has faced this many batters, his xwOBA-against is shrunk toward
