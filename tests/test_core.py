@@ -199,6 +199,23 @@ def test_recent_form_regresses_toward_season():
     assert ok2 and approx(d2, 0.030, tol=1e-6)
 
 
+def test_starter_delta_is_clamped():
+    """The starter component (previously unbounded) is capped at +/- starter_clamp."""
+    def starter(hx: float, ax: float) -> float:
+        ht = TeamProfile(team="H", raw_winpct=0.5, games=80, wins=40, losses=40,
+                         offense_wrc_plus=100, bullpen_fip=4.0, park_factor=100)
+        at = TeamProfile(team="A", raw_winpct=0.5, games=80, wins=40, losses=40,
+                         offense_wrc_plus=100, bullpen_fip=4.0, park_factor=100)
+        hp = PitcherProfile(player_id=1, name="H", xfip=hx, recent_starts=5, has_season_stats=True)
+        ap = PitcherProfile(player_id=2, name="A", xfip=ax, recent_starts=5, has_season_stats=True)
+        res = compute_win_probability(ht, at, hp, ap)
+        return next(c.weighted_delta for c in res.components if c.name == "starter")
+
+    assert approx(starter(2.0, 7.0), 0.15, tol=1e-6)    # elite vs awful -> capped
+    assert approx(starter(7.0, 2.0), -0.15, tol=1e-6)   # symmetric
+    assert abs(starter(3.4, 4.2)) < 0.15                # normal matchup untouched
+
+
 def test_confidence_drops_with_missing_data():
     home_t = _mk_team("H", 0.5, 60, 100, 4.0)
     away_t = _mk_team("A", 0.5, 60, 100, 4.0)

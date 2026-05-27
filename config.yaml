@@ -80,6 +80,12 @@ model:
   # runs_per_win rule lands around 0.06-0.07 win% per run; 0.065 is a sane start.
   pitcher_run_to_winpct: 0.065
 
+  # Cap the starter component's win-prob swing. The SP delta (log5 of pitcher
+  # win-equivalents) was otherwise UNBOUNDED and dominated on extreme matchups /
+  # thin samples (observed -9% to +21%). Clamp to +/- this. Other components are
+  # already clamped (bullpen 0.10, park/form 0.05). Tune via backtest.
+  starter_clamp: 0.15
+
   # Converts a 1-run bullpen FIP differential into a win-prob delta. Bullpens
   # throw ~1/3 of innings, so the per-run effect is smaller than the starter's.
   bullpen_run_to_winpct: 0.022
@@ -108,7 +114,9 @@ model:
   # Sample-size regression for the Statcast-derived rate (statcast_rate). Until a
   # pitcher has faced this many batters, his xwOBA-against is shrunk toward
   # league average, so a few hot/cold starts don't read as ace/replacement level.
-  statcast_regression_pa: 200
+  # Raised 200 -> 250 on 2026-05-27 (~60 IP of faced batters) to further damp
+  # small-sample volatility; tune via backtest.
+  statcast_regression_pa: 250
 
   # Each component below is computed as a probability delta in [-x, x] and then
   # multiplied by its weight. Net home_wp = base_wp + sum(weight_i * delta_i),

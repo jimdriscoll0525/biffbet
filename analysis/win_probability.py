@@ -139,7 +139,8 @@ def compute_win_probability(
     h_pwp = pitcher_win_equiv(h_rate, lg_pitch, float(m["pitcher_run_to_winpct"]))
     a_pwp = pitcher_win_equiv(a_rate, lg_pitch, float(m["pitcher_run_to_winpct"]))
     if h_pwp is not None and a_pwp is not None:
-        starter_delta = log5(h_pwp, a_pwp) - 0.5
+        starter_cap = float(m.get("starter_clamp", 0.15))
+        starter_delta = clamp(log5(h_pwp, a_pwp) - 0.5, -starter_cap, starter_cap)
         h_src = home_pitcher.primary_rate_source(prefer) or "?"
         a_src = away_pitcher.primary_rate_source(prefer) or "?"
         note = f"rate H={h_rate:.2f}({h_src}) A={a_rate:.2f}({a_src})"
