@@ -43,6 +43,7 @@ class ScheduledGame:
     home_pitcher: ProbablePitcher
     away_pitcher: ProbablePitcher
     venue: str | None = None
+    game_datetime: str | None = None   # ISO UTC first-pitch time (MLB API `gameDate`)
 
     @property
     def is_playable(self) -> bool:
@@ -136,6 +137,7 @@ class MLBClient:
             home_pitcher=self._parse_pitcher(home.get("probablePitcher")),
             away_pitcher=self._parse_pitcher(away.get("probablePitcher")),
             venue=g.get("venue", {}).get("name"),
+            game_datetime=g.get("gameDate"),
         )
 
     @staticmethod

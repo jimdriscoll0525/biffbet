@@ -37,6 +37,7 @@ class GameAnalysis:
     status: str
     home_pitcher: str | None
     away_pitcher: str | None
+    game_datetime: str | None = None         # ISO UTC first-pitch time
     wp: WinProbabilityResult | None = None
     evals: dict[str, SideEvaluation] | None = None
     best_side: str | None = None
@@ -66,6 +67,8 @@ class GameAnalysis:
             "blend_weight": self.blend,
             "blended_home_prob": round(self.blended_home_prob, 4) if self.blended_home_prob is not None else None,
         }
+        data["pitchers"] = {"home": self.home_pitcher, "away": self.away_pitcher}
+        data["game_datetime"] = self.game_datetime
         return data
 
 
@@ -131,6 +134,7 @@ def evaluate_game(
         status=scheduled.status,
         home_pitcher=scheduled.home_pitcher.name,
         away_pitcher=scheduled.away_pitcher.name,
+        game_datetime=scheduled.game_datetime,
     )
 
     if not scheduled.is_playable:
