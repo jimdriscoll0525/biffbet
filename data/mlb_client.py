@@ -207,3 +207,80 @@ class MLBClient:
                 }
         log.info("Standings %s: %d teams", season, len(out))
         return out
+
+    # -- Team offense / bullpen (automatable proxies, no FanGraphs) ------------
+    @staticmethod
+    def _parse_ip(ip: object) -> float:
+        """MLB innings strings ('72.1' = 72 1/3) -> decimal innings."""
+        try:
+            whole, _, frac = str(ip).partition(".")
+            return int(whole) + (int(frac) / 3.0 if frac else 0.0)
+        except (ValueError, AttributeError):
+            return 0.0
+
+    def get_team_hitting(self, season: int) -> dict[str, dict[str, float]]:
+        """{canonical_team: {obp, slg, ops}} from MLB Stats API team hitting.
+
+        Used as an automatable stand-in for FanGraphs wRC+ (which is Cloudflare-
+        blocked). Returns {} on failure so callers degrade gracefully.
+        """
+        try:
+            data = self._get(
+                "/v1/teams/stats",
+                {"sportId": 1, "season": int(season), "group": "hitting", "stats": "season"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("team hitting fetch failed (%s)", exc)
+            return {}
+        out: dict[str, dict[str, float]] = {}
+        for grp in data.get("stats", []):
+            for sp in grp.get("splits", []):
+                team = normalize_team(sp.get("team", {}).get("name"))
+                st = sp.get("stat", {})
+                if not team:
+                    continue
+                try:
+                    out[team] = {
+                        "obp": float(st["obp"]),
+                        "slg": float(st["slg"]),
+                        "ops": float(st["ops"]),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return out
+
+    def get_team_bullpen_era(self, season: int) -> dict[str, float]:
+        """{canonical_team: IP-weighted reliever ERA}, relievers := GS/G < 0.5.
+
+        One call to the all-pitchers season endpoint (playerPool=all), aggregated
+        per team. Automatable stand-in for FanGraphs bullpen FIP. {} on failure.
+        """
+        try:
+            data = self._get(
+                "/v1/stats",
+                {"stats": "season", "group": "pitching", "season": int(season),
+                 "sportId": 1, "gameType": "R", "playerPool": "all", "limit": 3000},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bullpen stats fetch failed (%s)", exc)
+            return {}
+        ip_sum: dict[str, float] = {}
+        era_ip: dict[str, float] = {}
+        for grp in data.get("stats", []):
+            for sp in grp.get("splits", []):
+                team = normalize_team(sp.get("team", {}).get("name"))
+                st = sp.get("stat", {})
+                g = st.get("gamesPlayed") or 0
+                gs = st.get("gamesStarted") or 0
+                if not team or not g or gs / g >= 0.5:  # starters excluded
+                    continue
+                innings = self._parse_ip(st.get("inningsPitched"))
+                try:
+                    era = float(st.get("era"))
+                except (TypeError, ValueError):
+                    continue
+                if innings <= 0:
+                    continue
+                ip_sum[team] = ip_sum.get(team, 0.0) + innings
+                era_ip[team] = era_ip.get(team, 0.0) + era * innings
+        return {t: era_ip[t] / ip_sum[t] for t in ip_sum if ip_sum[t] > 0}

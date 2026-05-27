@@ -90,7 +90,11 @@ class TeamMetricsProvider:
         return cached_dataframe(f"fg_team_batting_{self.season}", _producer)
 
     def offense_ratings(self) -> dict[str, float]:
-        """Map canonical team -> wRC+ (100 = average). Empty if unavailable."""
+        """Map canonical team -> offense index (100 = average). Empty if unavailable.
+
+        Prefers FanGraphs wRC+; falls back to an automatable OPS+ proxy from the
+        MLB Stats API when FanGraphs is blocked (the usual case).
+        """
         if self._offense is not None:
             return self._offense
         df = self._team_batting()
@@ -101,7 +105,34 @@ class TeamMetricsProvider:
                 val = row.get("wRC+")
                 if team and pd.notna(val):
                     out[team] = float(val)
+        if not out:
+            out = self._offense_proxy()
         self._offense = out
+        return out
+
+    def _offense_proxy(self) -> dict[str, float]:
+        """OPS+ (100 = league avg) from MLB Stats API, when FanGraphs wRC+ is
+        unavailable. OPS+ = 100 * (OBP/lgOBP + SLG/lgSLG - 1) — same 100-centered
+        scale the park/offense component expects.
+        """
+        hitting = self.mlb.get_team_hitting(self.season)
+        if not hitting:
+            return {}
+        obps = [v["obp"] for v in hitting.values() if v.get("obp")]
+        slgs = [v["slg"] for v in hitting.values() if v.get("slg")]
+        if not obps or not slgs:
+            return {}
+        lg_obp = sum(obps) / len(obps)
+        lg_slg = sum(slgs) / len(slgs)
+        if lg_obp <= 0 or lg_slg <= 0:
+            return {}
+        out = {
+            team: 100.0 * (v["obp"] / lg_obp + v["slg"] / lg_slg - 1.0)
+            for team, v in hitting.items()
+            if v.get("obp") and v.get("slg")
+        }
+        if out:
+            log.info("Offense: MLB Stats API OPS+ proxy for %d teams (FanGraphs wRC+ unavailable)", len(out))
         return out
 
     # -- Bullpen FIP (derived from reliever leaderboard) ----------------------
@@ -127,6 +158,12 @@ class TeamMetricsProvider:
                 ip_total = grp["IP"].sum()
                 if team and ip_total > 0:
                     out[team] = float((grp["FIP"] * grp["IP"]).sum() / ip_total)
+        if not out:
+            # FanGraphs blocked -> automatable proxy: IP-weighted reliever ERA
+            # from the MLB Stats API (same ~4.10 scale as relief FIP).
+            out = self.mlb.get_team_bullpen_era(self.season)
+            if out:
+                log.info("Bullpen: MLB Stats API reliever-ERA proxy for %d teams (FanGraphs FIP unavailable)", len(out))
         self._bullpen = out
         return out
 
