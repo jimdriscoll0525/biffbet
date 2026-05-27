@@ -125,6 +125,36 @@ def test_model_favors_better_pitcher_and_breaks_down():
     assert approx(res.home_win_prob + res.away_win_prob, 1.0)
 
 
+def test_golden_win_probability_locks_current_math():
+    """Golden snapshot of compute_win_probability on one fixed game, so any change
+    to the model formulas surfaces as an explicit diff here. When a weight/formula
+    change is INTENTIONAL, update these expected numbers deliberately (and note why).
+
+    Locked 2026-05-27, before the prediction-engine improvements (blend, park HFA,
+    form regression, pitcher-volatility tuning).
+    """
+    ht = TeamProfile(team="H", raw_winpct=0.55, games=80, wins=44, losses=36,
+                     offense_wrc_plus=110, bullpen_fip=3.80, park_factor=104)
+    at = TeamProfile(team="A", raw_winpct=0.48, games=80, wins=38.4, losses=41.6,
+                     offense_wrc_plus=95, bullpen_fip=4.30, park_factor=100)
+    hp = PitcherProfile(player_id=1, name="Home SP", ip=90, xfip=3.40, k_bb_pct=0.18,
+                        csw_pct=0.30, recent_xwoba_con=0.320, recent_starts=5,
+                        has_season_stats=True, has_statcast=True)
+    ap = PitcherProfile(player_id=2, name="Away SP", ip=85, xfip=4.20, k_bb_pct=0.14,
+                        csw_pct=0.28, recent_xwoba_con=0.360, recent_starts=5,
+                        has_season_stats=True, has_statcast=True)
+    res = compute_win_probability(ht, at, hp, ap)
+
+    assert approx(res.base_prob, 0.550802, tol=1e-5), res.base_prob
+    assert approx(res.home_win_prob, 0.669446, tol=1e-5), res.home_win_prob
+    deltas = {c.name: c.weighted_delta for c in res.components}
+    assert approx(deltas["starter"], 0.051895, tol=1e-5), deltas["starter"]
+    assert approx(deltas["bullpen"], 0.011000, tol=1e-5), deltas["bullpen"]
+    assert approx(deltas["park"], 0.000750, tol=1e-5), deltas["park"]
+    assert approx(deltas["home_field"], 0.035000, tol=1e-5), deltas["home_field"]
+    assert approx(deltas["form"], 0.020000, tol=1e-5), deltas["form"]
+
+
 def test_confidence_drops_with_missing_data():
     home_t = _mk_team("H", 0.5, 60, 100, 4.0)
     away_t = _mk_team("A", 0.5, 60, 100, 4.0)
