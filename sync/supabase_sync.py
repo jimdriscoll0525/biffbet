@@ -137,8 +137,15 @@ def _rec_rows(since: str | None) -> list[dict]:
     if df.empty:
         return []
     rows: list[dict] = []
+    # Postgres integer columns reject float literals like "390.0". pandas promotes
+    # a nullable int column (e.g. closing_line, NULL on some rows) to float64, so
+    # coerce these back to int before sending.
+    int_cols = ("game_id", "american_odds", "opening_line", "closing_line")
     for _, r in df.iterrows():
         row = {col: _clean(r.get(col)) for col in _REC_COLUMNS}
+        for col in int_cols:
+            if row.get(col) is not None:
+                row[col] = int(row[col])
         # reasoning_json (TEXT) -> reasoning (jsonb)
         raw = r.get("reasoning_json")
         if isinstance(raw, str) and raw:
