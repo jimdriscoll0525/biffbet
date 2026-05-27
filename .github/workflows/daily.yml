@@ -5,9 +5,10 @@ name: BiffBet daily pipeline
 # fresh SQLite, grades yesterday, builds today's slate, then SYNCs back.
 on:
   schedule:
-    - cron: "0 14 * * *"    # 14:00 UTC (~10am ET): morning slate + grade yesterday
-    - cron: "30 22 * * *"   # 22:30 UTC (~6:30pm ET): re-price for closing-line value
-  workflow_dispatch: {}      # allow manual runs from the Actions tab
+    - cron: "0 14 * * *"       # 14:00 UTC (~10am ET): morning slate + grade yesterday
+    - cron: "*/30 18-21 * * *" # every 30m 18:00-21:30 UTC (~2:00-5:30pm ET): afternoon line refresh
+    - cron: "30 22 * * *"      # 22:30 UTC (~6:30pm ET): re-price for closing-line value
+  workflow_dispatch: {}        # allow manual runs from the Actions tab
 
 # Never let two runs clobber each other (they share the Supabase tables).
 concurrency:
