@@ -4,11 +4,12 @@ name: BiffBet daily pipeline
 # reads). Supabase is the source of truth: each run PULLs prior state into a
 # fresh SQLite, grades yesterday, builds today's slate, then SYNCs back.
 on:
-  schedule:
-    - cron: "0 14 * * *"       # 14:00 UTC (~10am ET): morning slate + grade yesterday
-    - cron: "*/30 18-21 * * *" # every 30m 18:00-21:30 UTC (~2:00-5:30pm ET): afternoon line refresh
-    - cron: "30 22 * * *"      # 22:30 UTC (~6:30pm ET): re-price for closing-line value
-  workflow_dispatch: {}        # allow manual runs from the Actions tab
+  # Scheduling is handled EXTERNALLY by cron-job.org, which POSTs to the
+  # workflow_dispatch REST API on a reliable cadence (morning + every 30m
+  # through the afternoon/closing window). GitHub's own `schedule:` cron was
+  # too unreliable here (runs delayed up to ~3h, */30 ticks dropped), so it was
+  # removed -- this workflow now runs ONLY on dispatch (cron-job.org + manual).
+  workflow_dispatch: {}
 
 # Never let two runs clobber each other (they share the Supabase tables).
 concurrency:
