@@ -28,7 +28,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from mlb_value_bot.pipeline import GameAnalysis, analyze_slate, save_value_bets
+from mlb_value_bot.pipeline import GameAnalysis, analyze_slate, save_slate, save_value_bets  # save_value_bets kept for back-compat imports
 from mlb_value_bot.tracking import performance as perf
 from mlb_value_bot.tracking import results as results_mod
 from mlb_value_bot.utils import get_bankroll, get_logger, load_config, setup_logging
@@ -108,11 +108,14 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
             "and bullpen/park sit out. Run `data-status` for how to add it.[/]"
         )
 
-    if save and value_bets:
-        saved = save_value_bets(value_bets, game_date)
-        console.print(f"[green]Saved/updated {saved} recommendation(s) to the tracking DB.[/]")
+    if save and evaluable:
+        total, n_value = save_slate(evaluable, threshold, game_date)
+        console.print(
+            f"[green]Saved/updated {total} slate row(s) "
+            f"({n_value} flagged +EV) to the tracking DB.[/]"
+        )
     elif save:
-        console.print("[dim]Nothing to save (no +EV bets).[/]")
+        console.print("[dim]Nothing to save (no evaluable games).[/]")
 
 
 def _render_slate_table(analyses: list[GameAnalysis], threshold: float, bankroll: float, game_date: str) -> None:

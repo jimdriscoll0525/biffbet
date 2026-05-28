@@ -30,13 +30,22 @@ create table if not exists public.recommendations (
     clv_pct               double precision,             -- open->close CLV, %
     result                text             not null default 'pending',  -- pending|win|loss|push|void
     profit_loss           double precision,             -- realized, bankroll-fraction units
+    -- TRUE = an actual bet (>= EV threshold); FALSE = an analysis breadcrumb
+    -- kept so the home page can show the full slate even on quiet days.
+    -- Only is_value=TRUE rows count toward performance / grading.
+    is_value              boolean          not null default true,
     created_at            timestamptz      not null default now(),
     updated_at            timestamptz      not null default now(),
     unique (date, game_id, recommended_side)
 );
 
-create index if not exists recommendations_date_idx   on public.recommendations (date desc);
-create index if not exists recommendations_result_idx on public.recommendations (result);
+create index if not exists recommendations_date_idx     on public.recommendations (date desc);
+create index if not exists recommendations_result_idx   on public.recommendations (result);
+create index if not exists recommendations_is_value_idx on public.recommendations (is_value);
+
+-- Migration for existing projects (no-op once applied; safe to re-run):
+alter table public.recommendations
+    add column if not exists is_value boolean not null default true;
 
 -- ---------------------------------------------------------------------------
 -- performance_snapshot — precomputed analytics so the site never recomputes.

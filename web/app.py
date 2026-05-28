@@ -25,7 +25,7 @@ import pandas as pd
 import streamlit as st
 
 from mlb_value_bot.data.fangraphs_csv import status as fg_status
-from mlb_value_bot.pipeline import analyze_slate, save_value_bets
+from mlb_value_bot.pipeline import analyze_slate, save_slate
 from mlb_value_bot.tracking import performance as perf
 from mlb_value_bot.tracking import recommendations as recs
 from mlb_value_bot.tracking import results as results_mod
@@ -86,11 +86,12 @@ def page_today() -> None:
             try:
                 analyses = analyze_slate(date_str, config=CFG)
                 st.session_state[f"analyses_{date_str}"] = analyses
-                value = [a for a in analyses if a.best_eval is not None and a.is_value(THRESHOLD)]
-                saved = save_value_bets(value, date_str)
-                st.session_state[f"saved_{date_str}"] = saved
-                st.success(f"Analyzed {len([a for a in analyses if a.best_eval])} games · "
-                           f"{len(value)} +EV · saved {saved} to the tracking DB.")
+                evaluable = [a for a in analyses if a.best_eval is not None]
+                value = [a for a in evaluable if a.is_value(THRESHOLD)]
+                total, n_value = save_slate(evaluable, THRESHOLD, date_str)
+                st.session_state[f"saved_{date_str}"] = total
+                st.success(f"Analyzed {len(evaluable)} games · "
+                           f"{n_value} +EV · saved {total} rows ({n_value} bets) to the tracking DB.")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Analysis failed: {exc}")
 

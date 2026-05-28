@@ -117,6 +117,15 @@ def compute_performance(since: str | None = None) -> PerformanceReport:
     if df.empty:
         return PerformanceReport(overall={"bets": 0, "settled": 0}, segments={})
 
+    # Only actual bets (is_value=1) count toward performance. Non-value rows
+    # exist on the site to show "the full slate we looked at today" but they
+    # are analyses, not bets -- including them would inflate `bets` and drag
+    # every ROI / hit-rate / CLV figure with non-action games.
+    if "is_value" in df.columns:
+        df = df[df["is_value"].fillna(1).astype(int) == 1]
+    if df.empty:
+        return PerformanceReport(overall={"bets": 0, "settled": 0}, segments={})
+
     df = _prepare(df)
     overall = _stats(df)
 

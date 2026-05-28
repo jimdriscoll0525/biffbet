@@ -43,7 +43,8 @@ _REC_COLUMNS = (
     "date", "game_id", "home_team", "away_team", "recommended_side",
     "model_prob", "market_prob_devigged", "american_odds", "decimal_odds",
     "ev_pct", "kelly_stake", "confidence", "opening_line", "closing_line",
-    "clv_pct", "result", "profit_loss", "created_at", "updated_at",
+    "clv_pct", "result", "profit_loss", "is_value",
+    "created_at", "updated_at",
 )
 
 
@@ -146,6 +147,12 @@ def _rec_rows(since: str | None) -> list[dict]:
         for col in int_cols:
             if row.get(col) is not None:
                 row[col] = int(row[col])
+        # SQLite stores is_value as 0/1; Postgres column is boolean.
+        if row.get("is_value") is not None:
+            row["is_value"] = bool(int(row["is_value"]))
+        else:
+            # Old rows synced before the column existed -> treat as bets.
+            row["is_value"] = True
         # reasoning_json (TEXT) -> reasoning (jsonb)
         raw = r.get("reasoning_json")
         if isinstance(raw, str) and raw:
@@ -242,14 +249,18 @@ def pull_recommendations() -> int:
         for r in rows:
             reasoning = r.get("reasoning")
             reasoning_json = json.dumps(reasoning) if reasoning is not None else None
+            # Supabase returns boolean true/false; SQLite needs 0/1. Default to
+            # 1 (treat as bet) for rows synced before the column existed.
+            is_value_raw = r.get("is_value")
+            is_value = 1 if is_value_raw is None else (1 if bool(is_value_raw) else 0)
             conn.execute(
                 """
                 INSERT INTO recommendations
                   (date, game_id, home_team, away_team, recommended_side, model_prob,
                    market_prob_devigged, american_odds, decimal_odds, ev_pct, kelly_stake,
                    confidence, reasoning_json, opening_line, closing_line, clv_pct, result,
-                   profit_loss, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   profit_loss, is_value, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(date, game_id, recommended_side) DO UPDATE SET
                   home_team=excluded.home_team, away_team=excluded.away_team,
                   model_prob=excluded.model_prob,
@@ -259,14 +270,15 @@ def pull_recommendations() -> int:
                   confidence=excluded.confidence, reasoning_json=excluded.reasoning_json,
                   opening_line=excluded.opening_line, closing_line=excluded.closing_line,
                   clv_pct=excluded.clv_pct, result=excluded.result,
-                  profit_loss=excluded.profit_loss, updated_at=excluded.updated_at
+                  profit_loss=excluded.profit_loss, is_value=excluded.is_value,
+                  updated_at=excluded.updated_at
                 """,
                 (
                     r["date"], r["game_id"], r["home_team"], r["away_team"], r["recommended_side"],
                     r["model_prob"], r["market_prob_devigged"], r["american_odds"], r["decimal_odds"],
                     r["ev_pct"], r["kelly_stake"], r["confidence"], reasoning_json,
                     r.get("opening_line"), r.get("closing_line"), r.get("clv_pct"),
-                    r.get("result", "pending"), r.get("profit_loss"),
+                    r.get("result", "pending"), r.get("profit_loss"), is_value,
                     r.get("created_at"), r.get("updated_at"),
                 ),
             )

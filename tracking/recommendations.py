@@ -47,11 +47,29 @@ CREATE TABLE IF NOT EXISTS recommendations (
     clv_pct               REAL,                   -- open->close CLV, %
     result                TEXT DEFAULT 'pending', -- pending|win|loss|push|void
     profit_loss           REAL,                   -- realized, bankroll-fraction units
+    is_value              INTEGER NOT NULL DEFAULT 1,  -- 1 = actual bet (>= EV threshold);
+                                                       -- 0 = analyzed but didn't clear threshold,
+                                                       -- kept so the site can show full slates.
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
     UNIQUE(date, game_id, recommended_side)
 );
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the original schema. SQLite can only ADD,
+    never DROP/RENAME via ALTER, so each migration is an idempotent ADD COLUMN.
+
+    Order matters: we check pragma_table_info BEFORE the ADD, so re-running is
+    a no-op on already-migrated DBs (no IF NOT EXISTS on ADD COLUMN in SQLite).
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(recommendations)")}
+    if "is_value" not in cols:
+        # Existing rows predate this column and were ALL +EV (only +EV picks were
+        # saved by the old save_value_bets); default to 1 backfills them correctly.
+        conn.execute("ALTER TABLE recommendations ADD COLUMN is_value INTEGER NOT NULL DEFAULT 1")
+        log.info("Migrated recommendations: added is_value column (existing rows -> 1).")
 
 
 @dataclass
@@ -74,6 +92,7 @@ class RecommendationRecord:
     clv_pct: float | None = None
     result: str = "pending"
     profit_loss: float | None = None
+    is_value: bool = True
     id: int | None = None
 
 
@@ -91,6 +110,7 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
     log.debug("DB initialized at %s", DB_PATH)
 
 
@@ -108,30 +128,82 @@ def _compute_clv(opening: int | None, closing: int | None) -> float | None:
 
 
 def upsert_recommendation(rec: RecommendationRecord) -> int:
-    """Insert a new recommendation, or update lines/CLV if it already exists.
+    """Insert a new recommendation, or update it if (date, game_id) already exists.
 
-    On a repeat sighting of the same (date, game, side) we keep the original
-    bet price + opening_line, but refresh `closing_line` to the latest American
-    odds and recompute CLV. Returns the row id.
+    Semantics depend on is_value (the actual bet vs. an analysis breadcrumb):
+
+    * Existing is_value=1 (already a committed bet): we NEVER downgrade. Even if
+      the new analysis no longer clears EV, the bet stands. We only refresh
+      closing_line + CLV.
+    * Existing is_value=0, new is_value=1: an analysis-only row has been
+      promoted to a real bet on this run. Reset opening_line to the bet price,
+      flip is_value, and refresh model fields (this is the first "real" snapshot
+      of this bet).
+    * Existing is_value=0, new is_value=0: still just an analysis. Refresh ALL
+      model fields with the latest run; opening_line/closing_line track the
+      latest prices.
+
+    We match by (date, game_id) — at most one row per game per date — so if the
+    favored side flips between runs while still a non-bet analysis, we update
+    the side in place rather than creating a duplicate row.
     """
     init_db()
     now = _now()
     with connect() as conn:
         existing = conn.execute(
-            "SELECT id, opening_line FROM recommendations WHERE date=? AND game_id=? AND recommended_side=?",
-            (rec.date, rec.game_id, rec.recommended_side),
+            """
+            SELECT id, opening_line, is_value FROM recommendations
+            WHERE date=? AND game_id=?
+            """,
+            (rec.date, rec.game_id),
         ).fetchone()
 
         if existing:
-            opening = existing["opening_line"]
-            closing = rec.american_odds  # latest price seen becomes the closing line
-            clv = _compute_clv(opening, closing)
+            was_bet = bool(existing["is_value"])
+            now_bet = bool(rec.is_value)
+
+            if was_bet:
+                # Already a committed bet -> keep opening_line, only update close + CLV.
+                opening = existing["opening_line"]
+                closing = rec.american_odds
+                clv = _compute_clv(opening, closing)
+                conn.execute(
+                    "UPDATE recommendations SET closing_line=?, clv_pct=?, updated_at=? WHERE id=?",
+                    (closing, clv, now, existing["id"]),
+                )
+                log.info("Refreshed closing line for game %s (%s): %s (CLV %.2f%%)",
+                         rec.game_id, rec.recommended_side, closing,
+                         clv if clv is not None else 0.0)
+                return int(existing["id"])
+
+            # Was a non-bet analysis: refresh everything. If it's now a bet, this
+            # run is the first "real" snapshot -> the current price becomes
+            # opening_line and is_value flips to 1.
+            opening = rec.american_odds if now_bet else (existing["opening_line"] or rec.american_odds)
+            closing = rec.american_odds
+            clv = _compute_clv(opening, closing) if now_bet else None
             conn.execute(
-                "UPDATE recommendations SET closing_line=?, clv_pct=?, updated_at=? WHERE id=?",
-                (closing, clv, now, existing["id"]),
+                """
+                UPDATE recommendations SET
+                    home_team=?, away_team=?, recommended_side=?,
+                    model_prob=?, market_prob_devigged=?,
+                    american_odds=?, decimal_odds=?, ev_pct=?, kelly_stake=?,
+                    confidence=?, reasoning_json=?,
+                    opening_line=?, closing_line=?, clv_pct=?, is_value=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    rec.home_team, rec.away_team, rec.recommended_side,
+                    rec.model_prob, rec.market_prob_devigged,
+                    rec.american_odds, rec.decimal_odds, rec.ev_pct, rec.kelly_stake,
+                    rec.confidence, json.dumps(rec.reasoning),
+                    opening, closing, clv, 1 if now_bet else 0, now,
+                    existing["id"],
+                ),
             )
-            log.info("Updated closing line for game %s (%s): %s (CLV %.2f%%)",
-                     rec.game_id, rec.recommended_side, closing, clv if clv is not None else 0.0)
+            if now_bet:
+                log.info("Promoted game %s (%s) to a bet @ %+d (EV %.1f%%)",
+                         rec.game_id, rec.recommended_side, rec.american_odds, rec.ev_pct * 100)
             return int(existing["id"])
 
         opening = rec.opening_line if rec.opening_line is not None else rec.american_odds
@@ -141,20 +213,23 @@ def upsert_recommendation(rec: RecommendationRecord) -> int:
                 date, game_id, home_team, away_team, recommended_side,
                 model_prob, market_prob_devigged, american_odds, decimal_odds,
                 ev_pct, kelly_stake, confidence, reasoning_json,
-                opening_line, closing_line, clv_pct, result, profit_loss,
+                opening_line, closing_line, clv_pct, result, profit_loss, is_value,
                 created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 rec.date, rec.game_id, rec.home_team, rec.away_team, rec.recommended_side,
                 rec.model_prob, rec.market_prob_devigged, rec.american_odds, rec.decimal_odds,
                 rec.ev_pct, rec.kelly_stake, rec.confidence, json.dumps(rec.reasoning),
                 opening, rec.closing_line, rec.clv_pct, rec.result, rec.profit_loss,
+                1 if rec.is_value else 0,
                 now, now,
             ),
         )
-        log.info("Saved recommendation: %s %s @ %+d (EV %.1f%%)",
-                 rec.recommended_side, rec.home_team if rec.recommended_side == "home" else rec.away_team,
+        tag = "bet" if rec.is_value else "analysis"
+        log.info("Saved %s: %s %s @ %+d (EV %.1f%%)",
+                 tag, rec.recommended_side,
+                 rec.home_team if rec.recommended_side == "home" else rec.away_team,
                  rec.american_odds, rec.ev_pct * 100)
         return int(cur.lastrowid)
 
@@ -169,11 +244,15 @@ def update_result(rec_id: int, result: str, profit_loss: float) -> None:
 
 
 def get_open_for_date(game_date: str) -> list[sqlite3.Row]:
-    """Pending recommendations for a given game date."""
+    """Pending BET recommendations for a given game date (is_value=1 only).
+
+    Non-value analysis rows aren't bets; they don't get graded and don't count
+    toward W/L or P&L.
+    """
     init_db()
     with connect() as conn:
         return conn.execute(
-            "SELECT * FROM recommendations WHERE date=? AND result='pending'",
+            "SELECT * FROM recommendations WHERE date=? AND result='pending' AND is_value=1",
             (game_date,),
         ).fetchall()
 

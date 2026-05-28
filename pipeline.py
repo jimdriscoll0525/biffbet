@@ -244,11 +244,60 @@ def analyze_slate(
     return analyses
 
 
-def save_value_bets(value_bets: list[GameAnalysis], game_date: str) -> int:
-    """Persist +EV analyses as recommendations (upsert). Shared by CLI + web.
+def save_slate(analyses: list[GameAnalysis], threshold: float, game_date: str) -> tuple[int, int]:
+    """Persist the FULL evaluable slate (upsert). Returns (total, n_value).
 
-    `value_bets` should already be filtered to +EV picks. Returns the count
-    saved/updated. Re-saving the same game updates its closing line + CLV.
+    Every analysis with a `best_eval` and a `wp` (i.e. evaluable -- has odds +
+    a runnable model) is persisted. Picks that clear `threshold` AND have a
+    positive Kelly stake are marked is_value=True (real bets); the rest are
+    persisted as is_value=False analyses so the site can render the whole
+    slate even on quiet days. Skipped games (no odds / postponed / no model)
+    are dropped, since they have nothing meaningful to display.
+
+    Upsert is keyed on (date, game_id): one row per game per date. Re-running
+    refreshes prices/CLV on bets and overwrites analyses with the latest.
+    """
+    from mlb_value_bot.tracking.recommendations import (
+        RecommendationRecord,
+        upsert_recommendation,
+    )
+
+    total = 0
+    n_value = 0
+    for a in analyses:
+        be = a.best_eval
+        if be is None or a.wp is None:
+            continue
+        is_value = be.ev_pct >= threshold and be.kelly_stake > 0
+        rec = RecommendationRecord(
+            date=game_date,
+            game_id=a.game_id,
+            home_team=a.home_team,
+            away_team=a.away_team,
+            recommended_side=a.best_side or "",
+            model_prob=be.model_prob,
+            market_prob_devigged=be.market_prob_devigged,
+            american_odds=be.american_odds,
+            decimal_odds=be.decimal_odds,
+            ev_pct=be.ev_pct,
+            kelly_stake=be.kelly_stake,
+            confidence=a.confidence,
+            reasoning=a.reasoning(),
+            is_value=is_value,
+        )
+        upsert_recommendation(rec)
+        total += 1
+        if is_value:
+            n_value += 1
+    return total, n_value
+
+
+def save_value_bets(value_bets: list[GameAnalysis], game_date: str) -> int:
+    """Backward-compat wrapper: persist a pre-filtered list of +EV bets.
+
+    Prefer `save_slate(analyses, threshold, date)` directly so the full slate
+    (including passes) lands in the DB and the public site can show it. This
+    wrapper marks every input as is_value=True, matching the old behavior.
     """
     from mlb_value_bot.tracking.recommendations import (
         RecommendationRecord,
@@ -274,6 +323,7 @@ def save_value_bets(value_bets: list[GameAnalysis], game_date: str) -> int:
             kelly_stake=be.kelly_stake,
             confidence=a.confidence,
             reasoning=a.reasoning(),
+            is_value=True,
         )
         upsert_recommendation(rec)
         count += 1
