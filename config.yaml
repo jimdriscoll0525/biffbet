@@ -104,12 +104,25 @@ model:
   #   final_prob = market_blend * model_prob + (1 - market_blend) * market_prob
   # 0.0 = trust the market entirely (no bets ever); 1.0 = ignore the market
   # (overconfident, flags everything). Keep this LOW — the model should express
-  # a bounded tilt off the market, not replace it. Raise it only once backtests
-  # show the model's raw edges are real. Lower it in degraded data modes.
-  # Raised 0.25 -> 0.35 on 2026-05-27; validate with
-  #   `python -m mlb_value_bot backtest --market-blend 0.35 ...`
-  # before trusting it. Override per-run with the --market-blend CLI flag.
-  market_blend: 0.35
+  # a bounded tilt off the market, not replace it.
+  #
+  # As of 2026-05-28 this is a tiered table driven by DATA confidence (the
+  # confidence sub-components that don't depend on EV: data completeness,
+  # sample size, component agreement). The model earns more weight when its
+  # inputs are trustworthy, and stays anchored to the market when they're not.
+  # The thresholds and weights are intentionally CONSERVATIVE — even the
+  # high-conf tier (0.45) keeps the market as the primary anchor. Raise the
+  # tier values only after CLV proves out at that confidence level.
+  #
+  # To revert to the old fixed behavior, set `market_blend: 0.35` (a scalar).
+  # The pipeline handles both shapes (see resolve_market_blend).
+  # Override per-run with the --market-blend CLI flag (still scalar-only).
+  market_blend:
+    high_conf: 0.45          # data confidence >= high_threshold
+    mid_conf: 0.35           # data confidence in [mid_threshold, high_threshold)
+    low_conf: 0.25           # data confidence < mid_threshold
+    high_threshold: 85.0     # 0..100 scale
+    mid_threshold: 70.0
 
   # Sample-size regression for the Statcast-derived rate (statcast_rate). Until a
   # pitcher has faced this many batters, his xwOBA-against is shrunk toward
@@ -170,6 +183,22 @@ sanity:
 kelly:
   fraction: 0.25          # quarter-Kelly
   max_bankroll_fraction: 0.02   # never stake more than 2% of bankroll
+
+# -----------------------------------------------------------------------------
+# Bet sizing tiers — classify each pick into Pass/Small/Standard/Strong and
+# scale Kelly accordingly. This bakes the "reduce Kelly when confidence is low
+# or edge is modest" guardrail into the persisted stake. The unscaled Kelly is
+# preserved in reasoning_json so we can audit later. See pipeline._classify_bet_tier.
+# -----------------------------------------------------------------------------
+bet_sizing:
+  # EV thresholds (decimal fractions, e.g. 0.05 = 5%).
+  standard_ev: 0.05            # below this -> "small" (a lean, not action)
+  strong_ev: 0.10              # at/above this AND confidence >= strong -> "strong"
+  # Confidence thresholds (0..100).
+  min_standard_confidence: 60  # below this -> "small" even if EV is in range
+  strong_confidence: 75        # required (alongside strong_ev) for "strong"
+  # Stake multipliers.
+  small_multiplier: 0.5        # halve Kelly on "small" picks
 
 # -----------------------------------------------------------------------------
 # Confidence score weights (0-100). Components are each normalized to [0,1] and

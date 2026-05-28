@@ -320,3 +320,96 @@ def compute_confidence(
     confidence = 100.0 * score / total_weight if total_weight else 0.0
     result.confidence = round(confidence, 1)
     return result.confidence
+
+
+# --- Data confidence (no EV dependency) --------------------------------------
+def compute_data_confidence(
+    result: WinProbabilityResult,
+    home_pitcher: PitcherProfile,
+    away_pitcher: PitcherProfile,
+    home_team: TeamProfile,
+    away_team: TeamProfile,
+    config: dict | None = None,
+) -> float:
+    """0-100 confidence in the DATA INPUTS, with no EV dependency.
+
+    The dynamic market blend needs to be picked BEFORE the EV is computed, so
+    we can't use `compute_confidence` (which folds in edge_magnitude). This
+    helper returns the same composite minus the edge term, renormalized over
+    the remaining three weights. The full `compute_confidence` is still the
+    public score shown to the user; this exists only to choose the blend.
+
+    Why no edge term: letting EV drive the blend would create a fragile
+    feedback loop (a tiny edge -> tiny blend boost -> slightly bigger edge
+    -> larger blend...). Anchoring the blend on data quality instead means
+    the model only earns market-overruling weight when its inputs are good.
+    """
+    config = config or load_config()
+    cw = config["confidence"]
+    weights = cw["weights"]
+
+    pitcher_dc = (home_pitcher.data_completeness + away_pitcher.data_completeness) / 2.0
+    team_flags = [
+        home_team.has_record, away_team.has_record,
+        home_team.offense_wrc_plus is not None, away_team.offense_wrc_plus is not None,
+        home_team.bullpen_fip is not None, away_team.bullpen_fip is not None,
+    ]
+    team_dc = sum(team_flags) / len(team_flags)
+    data_completeness = 0.6 * pitcher_dc + 0.4 * team_dc
+
+    ips = [ip for ip in (home_pitcher.ip, away_pitcher.ip) if ip is not None]
+    sample_size = clamp(min(ips) / float(cw.get("ip_full_confidence", 60.0)), 0.0, 1.0) if ips else 0.0
+
+    skill = [c for c in result.components if c.name in {"starter", "bullpen", "park", "form"} and c.weighted_delta != 0.0]
+    if skill:
+        net = sum(c.weighted_delta for c in skill)
+        total_abs = sum(abs(c.weighted_delta) for c in skill)
+        if total_abs > 0 and net != 0:
+            sign = 1.0 if net > 0 else -1.0
+            agreeing = sum(abs(c.weighted_delta) for c in skill if (c.weighted_delta > 0) == (sign > 0))
+            component_agreement = agreeing / total_abs
+        else:
+            component_agreement = 0.5
+    else:
+        component_agreement = 0.5
+
+    # Renormalize over the three non-EV weights so this stays comparable in
+    # magnitude to the full confidence score (same 0-100 scale, same units).
+    w_data = weights["data_completeness"]
+    w_samp = weights["sample_size"]
+    w_agree = weights["component_agreement"]
+    denom = w_data + w_samp + w_agree
+    if denom <= 0:
+        return 0.0
+    score = (w_data * data_completeness + w_samp * sample_size + w_agree * component_agreement) / denom
+    return round(100.0 * score, 1)
+
+
+def resolve_market_blend(data_confidence: float, model_config: dict) -> tuple[float, str]:
+    """Pick the market-blend weight from a confidence tier table.
+
+    `model_config["market_blend"]` is either:
+      * a scalar  -> legacy fixed blend (used for every game) -> tier="fixed"
+      * a dict    -> tiered: {low_conf, mid_conf, high_conf,
+                              mid_threshold, high_threshold}
+
+    Returns (blend_weight, tier_label). `blend_weight` is the MODEL side of
+    `blended = blend*model + (1-blend)*market`, so higher = more model.
+
+    Conservative default: even the high-confidence tier keeps the market as
+    the primary anchor (blend <= 0.5). The model only earns more weight than
+    the market once CLV proves out at that confidence level. Re-tune upward
+    in config once that's true.
+    """
+    mb = model_config.get("market_blend", 0.35)
+    if not isinstance(mb, dict):
+        # Legacy scalar config: same blend for every game.
+        return float(mb), "fixed"
+
+    high_t = float(mb.get("high_threshold", 85.0))
+    mid_t = float(mb.get("mid_threshold", 70.0))
+    if data_confidence >= high_t:
+        return float(mb.get("high_conf", 0.45)), "high"
+    if data_confidence >= mid_t:
+        return float(mb.get("mid_conf", 0.35)), "mid"
+    return float(mb.get("low_conf", 0.25)), "low"

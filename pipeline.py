@@ -19,7 +19,9 @@ from mlb_value_bot.analysis.team_metrics import TeamMetricsProvider
 from mlb_value_bot.analysis.win_probability import (
     WinProbabilityResult,
     compute_confidence,
+    compute_data_confidence,
     compute_win_probability,
+    resolve_market_blend,
 )
 from mlb_value_bot.data.mlb_client import MLBClient, ScheduledGame
 from mlb_value_bot.data.odds_client import GameOdds, OddsClient
@@ -44,9 +46,15 @@ class GameAnalysis:
     confidence: float = 0.0
     skipped_reason: str | None = None
     # Market-anchoring: the EV uses `blended_home_prob`, not the raw model prob.
-    market_home_prob: float | None = None   # de-vigged "fair" market prob (home)
-    blend: float = 1.0                       # market_blend weight applied
-    blended_home_prob: float | None = None   # blend*model + (1-blend)*market
+    market_home_prob: float | None = None    # de-vigged "fair" market prob (home)
+    blend: float = 1.0                        # market_blend weight applied
+    blend_tier: str = "fixed"                 # "high"/"mid"/"low"/"fixed"
+    data_confidence: float = 0.0              # 0..100, drives blend tier
+    blended_home_prob: float | None = None    # blend*model + (1-blend)*market
+    # Bet sizing tier (independent of blend): "pass" | "small" | "standard" | "strong"
+    tier: str = "pass"
+    tier_multiplier: float = 0.0
+    tier_reasons: list[str] = field(default_factory=list)
 
     @property
     def best_eval(self) -> SideEvaluation | None:
@@ -59,13 +67,22 @@ class GameAnalysis:
         return be is not None and be.ev_pct >= threshold and be.kelly_stake > 0
 
     def reasoning(self) -> dict:
-        """Full JSON-able breakdown (model components + market-blend) for the DB."""
+        """Full JSON-able breakdown (model components + market-blend + sizing) for the DB."""
         data = self.wp.reasoning() if self.wp else {}
         data["market_anchor"] = {
             "raw_model_home_prob": round(self.wp.home_win_prob, 4) if self.wp else None,
             "market_devig_home_prob": round(self.market_home_prob, 4) if self.market_home_prob is not None else None,
-            "blend_weight": self.blend,
+            "blend_weight": round(self.blend, 3),
+            "blend_tier": self.blend_tier,
+            "data_confidence": self.data_confidence,
             "blended_home_prob": round(self.blended_home_prob, 4) if self.blended_home_prob is not None else None,
+        }
+        data["bet_sizing"] = {
+            "tier": self.tier,
+            "multiplier": self.tier_multiplier,
+            "reasons": self.tier_reasons,
+            # Raw Kelly before the tier multiplier was applied (only set when scaled).
+            "raw_kelly": getattr(self, "_tier_original_kelly", None),
         }
         data["pitchers"] = {"home": self.home_pitcher, "away": self.away_pitcher}
         data["game_datetime"] = self.game_datetime
@@ -176,7 +193,15 @@ def evaluate_game(
     # overconfidence (a standalone heuristic otherwise "finds" edges everywhere).
     devig_method = config["ev"].get("devig_method", "power")
     market_home, _market_away = devigged_market_probs(home_odds, away_odds, devig_method)
-    blend = float(config["model"].get("market_blend", 0.35))
+
+    # Dynamic blend: the model earns more weight when the underlying DATA is
+    # trustworthy (good pitcher samples, team data complete, components in
+    # agreement). EV is deliberately NOT part of this -- letting EV drive the
+    # blend would create a feedback loop where the model talks itself into
+    # bigger edges. Falls back to a fixed blend if config.model.market_blend is
+    # still a scalar.
+    data_conf = compute_data_confidence(wp, home_pp, away_pp, home_tp, away_tp, config)
+    blend, blend_tier = resolve_market_blend(data_conf, config["model"])
     blended_home = blend * wp.home_win_prob + (1.0 - blend) * market_home
 
     evals = evaluate_sides(
@@ -203,14 +228,81 @@ def evaluate_game(
         wp, home_pp, away_pp, home_tp, away_tp, evals[best_side].ev_pct, config
     )
 
+    # Bet sizing tiers: classify the pick into Pass/Small/Standard/Strong and
+    # apply a stake multiplier to the raw Kelly stake. This bakes our
+    # "reduce Kelly when confidence is low / edge is modest" guardrails into
+    # the persisted stake instead of leaving them to the user. The unscaled
+    # Kelly is preserved in reasoning_json for transparency.
+    tier, tier_mult, tier_reasons = _classify_bet_tier(
+        evals[best_side].ev_pct, confidence, config
+    )
+    if tier_mult != 1.0:
+        # Mutate in place: the consumer only ever uses evals[best_side].
+        original_kelly = evals[best_side].kelly_stake
+        evals[best_side].kelly_stake = round(original_kelly * tier_mult, 6)
+        analysis._tier_original_kelly = original_kelly  # type: ignore[attr-defined]
+
     analysis.wp = wp
     analysis.evals = evals
     analysis.best_side = best_side
     analysis.confidence = confidence
     analysis.market_home_prob = market_home
     analysis.blend = blend
+    analysis.blend_tier = blend_tier
+    analysis.data_confidence = data_conf
     analysis.blended_home_prob = blended_home
+    analysis.tier = tier
+    analysis.tier_multiplier = tier_mult
+    analysis.tier_reasons = tier_reasons
     return analysis
+
+
+# --- Bet sizing tiers --------------------------------------------------------
+def _classify_bet_tier(
+    ev_pct: float, confidence: float, config: dict
+) -> tuple[str, float, list[str]]:
+    """Classify a recommendation into Pass / Small / Standard / Strong.
+
+    Returns (tier_name, kelly_multiplier, reasons). The multiplier scales the
+    raw Kelly stake -- always <= 1.0 today (we only ever reduce, never grow).
+
+    Rules (intentionally simple and readable):
+      * EV below threshold              -> "pass"     0.0x
+      * EV below 5% or confidence < 60  -> "small"    0.5x  (lean, not action)
+      * EV >= 10% AND confidence >= 75  -> "strong"   1.0x  (full quarter-Kelly)
+      * else                            -> "standard" 1.0x
+
+    "Strong" and "Standard" use the same multiplier today -- the distinction
+    is informational so the UI can show a separate badge. We may dial Strong
+    UP (e.g. 1.25x within the cap) once CLV evidence supports it; we will not
+    dial it up speculatively.
+    """
+    ev_cfg = config.get("ev", {})
+    sizing = config.get("bet_sizing", {})
+    threshold = float(ev_cfg.get("threshold", 0.03))
+    strong_ev = float(sizing.get("strong_ev", 0.10))
+    standard_ev = float(sizing.get("standard_ev", 0.05))
+    strong_conf = float(sizing.get("strong_confidence", 75.0))
+    min_conf = float(sizing.get("min_standard_confidence", 60.0))
+    small_mult = float(sizing.get("small_multiplier", 0.5))
+
+    reasons: list[str] = []
+    if ev_pct < threshold:
+        reasons.append(f"EV {ev_pct * 100:.1f}% below {threshold * 100:.1f}% threshold")
+        return "pass", 0.0, reasons
+
+    if ev_pct < standard_ev:
+        reasons.append(f"EV {ev_pct * 100:.1f}% in lean range (< {standard_ev * 100:.1f}%)")
+        return "small", small_mult, reasons
+    if confidence < min_conf:
+        reasons.append(f"confidence {confidence:.0f} below {min_conf:.0f}")
+        return "small", small_mult, reasons
+
+    if ev_pct >= strong_ev and confidence >= strong_conf:
+        reasons.append(f"EV {ev_pct * 100:.1f}% & conf {confidence:.0f} both clear strong thresholds")
+        return "strong", 1.0, reasons
+
+    return "standard", 1.0, reasons
 
 
 def analyze_slate(

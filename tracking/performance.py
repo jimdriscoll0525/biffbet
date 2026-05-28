@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -61,13 +63,44 @@ def _prepare(df: pd.DataFrame) -> pd.DataFrame:
         df["ev_pct"], bins=[-np.inf, 0.03, 0.05, 0.08, 0.12, np.inf],
         labels=["<3%", "3-5%", "5-8%", "8-12%", "12%+"],
     )
+    # Kelly buckets reveal whether bigger stakes actually pay off (a real edge
+    # signal) or just amplify variance. Edges in bp of bankroll: 0..50, 50..100,
+    # 100..150, 150..200 (the cap).
+    df["kelly_bucket"] = pd.cut(
+        df["kelly_stake"], bins=[-np.inf, 0.005, 0.01, 0.015, np.inf],
+        labels=["<0.5%", "0.5-1%", "1-1.5%", "1.5%+"],
+    )
     df["side_type"] = np.where(df["american_odds"] < 0, "favorite", "underdog")
     df["venue_side"] = np.where(df["recommended_side"] == "home", "home", "road")
     df["clv_sign"] = np.where(
         df["clv_pct"].isna(), "unknown",
         np.where(df["clv_pct"] > 0, "CLV+", "CLV-"),
     )
+
+    # Bet sizing tier + dynamic blend tier come from reasoning_json (only set
+    # on rows synced after 2026-05-28; older rows fall to "n/a"). Tells us
+    # which of our newer guardrails are actually predictive.
+    df["bet_tier"] = df["reasoning_json"].apply(_extract_bet_tier).astype("string")
+    df["blend_tier"] = df["reasoning_json"].apply(_extract_blend_tier).astype("string")
     return df
+
+
+def _extract_bet_tier(raw: str | None) -> str:
+    if not isinstance(raw, str) or not raw:
+        return "n/a"
+    try:
+        return json.loads(raw).get("bet_sizing", {}).get("tier") or "n/a"
+    except (json.JSONDecodeError, AttributeError):
+        return "n/a"
+
+
+def _extract_blend_tier(raw: str | None) -> str:
+    if not isinstance(raw, str) or not raw:
+        return "n/a"
+    try:
+        return json.loads(raw).get("market_anchor", {}).get("blend_tier") or "n/a"
+    except (json.JSONDecodeError, AttributeError):
+        return "n/a"
 
 
 def _stats(df: pd.DataFrame) -> dict:
@@ -132,6 +165,9 @@ def compute_performance(since: str | None = None) -> PerformanceReport:
     segments = {
         "By confidence bucket": _segment(df, "confidence_bucket"),
         "By EV bucket": _segment(df, "ev_bucket"),
+        "By Kelly bucket": _segment(df, "kelly_bucket"),
+        "By bet tier": _segment(df, "bet_tier"),
+        "By blend tier": _segment(df, "blend_tier"),
         "Favorite vs underdog": _segment(df, "side_type"),
         "Home vs road": _segment(df, "venue_side"),
         "CLV positive vs negative": _segment(df, "clv_sign"),

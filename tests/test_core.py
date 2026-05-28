@@ -292,6 +292,73 @@ def test_match_odds_picks_correct_day_in_a_series():
     assert _match_odds(sched, []) is None
 
 
+# --- Dynamic blend + bet tiers (2026-05-28) ---------------------------------
+def test_resolve_market_blend_tiered():
+    """Tiered config picks high/mid/low blend based on data confidence."""
+    from mlb_value_bot.analysis.win_probability import resolve_market_blend
+    tiered = {
+        "market_blend": {
+            "high_conf": 0.45, "mid_conf": 0.35, "low_conf": 0.25,
+            "high_threshold": 85.0, "mid_threshold": 70.0,
+        }
+    }
+    assert resolve_market_blend(90.0, tiered) == (0.45, "high")
+    assert resolve_market_blend(85.0, tiered) == (0.45, "high")
+    assert resolve_market_blend(80.0, tiered) == (0.35, "mid")
+    assert resolve_market_blend(70.0, tiered) == (0.35, "mid")
+    assert resolve_market_blend(50.0, tiered) == (0.25, "low")
+
+
+def test_resolve_market_blend_scalar_legacy():
+    """Scalar config still works -> fixed blend for every game (back-compat)."""
+    from mlb_value_bot.analysis.win_probability import resolve_market_blend
+    fixed = {"market_blend": 0.35}
+    assert resolve_market_blend(95.0, fixed) == (0.35, "fixed")
+    assert resolve_market_blend(40.0, fixed) == (0.35, "fixed")
+
+
+def test_data_confidence_excludes_ev():
+    """Data confidence is the non-EV portion of the full confidence score.
+
+    It should be deterministic given the inputs (no EV dependency) and stay
+    in [0, 100].
+    """
+    from mlb_value_bot.analysis.win_probability import compute_data_confidence
+    ht = _mk_team("H", 0.5, 60, 100, 4.0)
+    at = _mk_team("A", 0.5, 60, 100, 4.0)
+    hp = _mk_pitcher("H SP", 4.0)
+    ap = _mk_pitcher("A SP", 4.0)
+    res = compute_win_probability(ht, at, hp, ap)
+    dc1 = compute_data_confidence(res, hp, ap, ht, at)
+    # Same inputs -> same output. EV doesn't enter the function signature at all.
+    dc2 = compute_data_confidence(res, hp, ap, ht, at)
+    assert dc1 == dc2
+    assert 0.0 <= dc1 <= 100.0
+
+
+def test_classify_bet_tier():
+    """Pass / Small / Standard / Strong assigned by EV + confidence."""
+    from mlb_value_bot.pipeline import _classify_bet_tier
+    from mlb_value_bot.utils import load_config
+    cfg = load_config()
+
+    # Below EV threshold -> Pass, 0x.
+    tier, mult, _ = _classify_bet_tier(0.01, 80.0, cfg)
+    assert tier == "pass" and mult == 0.0
+    # EV in [threshold, standard_ev) -> Small (halved).
+    tier, mult, _ = _classify_bet_tier(0.035, 80.0, cfg)
+    assert tier == "small" and mult == 0.5
+    # EV high but confidence < min_standard -> Small.
+    tier, mult, _ = _classify_bet_tier(0.08, 55.0, cfg)
+    assert tier == "small" and mult == 0.5
+    # EV in [standard, strong) with adequate confidence -> Standard, 1x.
+    tier, mult, _ = _classify_bet_tier(0.06, 70.0, cfg)
+    assert tier == "standard" and mult == 1.0
+    # EV >= strong AND confidence >= strong -> Strong, 1x (today).
+    tier, mult, _ = _classify_bet_tier(0.12, 80.0, cfg)
+    assert tier == "strong" and mult == 1.0
+
+
 # --- Manual runner -----------------------------------------------------------
 def _run_all() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
