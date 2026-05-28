@@ -295,6 +295,81 @@ def test_match_odds_picks_correct_day_in_a_series():
     assert _match_odds(sched, []) is None
 
 
+# --- Sharp/square market intel (2026-05-28) ---------------------------------
+def test_market_intel_sharp_minus_square_signed():
+    """sharp_minus_square is + when sharps' home prob > squares' home prob."""
+    from mlb_value_bot.data.market_intel import compute_market_intel
+    from mlb_value_bot.data.odds_client import GameOdds
+    # Square books price home as ~63% (DK -175 / +144 fair ~63%). Sharps
+    # price home at ~62% (-162 / +149). So sharp_minus_square should be NEG.
+    odds = GameOdds(
+        event_id="e1", commence_time="2026-05-28T22:41:00Z",
+        home_team="Pittsburgh Pirates", away_team="Chicago Cubs",
+        all_books=[
+            {"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [
+                {"name": "Pittsburgh Pirates", "price": -175},
+                {"name": "Chicago Cubs", "price": 144},
+            ]}]},
+            {"key": "fanduel", "markets": [{"key": "h2h", "outcomes": [
+                {"name": "Pittsburgh Pirates", "price": -174},
+                {"name": "Chicago Cubs", "price": 146},
+            ]}]},
+            {"key": "pinnacle", "markets": [{"key": "h2h", "outcomes": [
+                {"name": "Pittsburgh Pirates", "price": -162},
+                {"name": "Chicago Cubs", "price": 149},
+            ]}]},
+            {"key": "lowvig", "markets": [{"key": "h2h", "outcomes": [
+                {"name": "Pittsburgh Pirates", "price": -163},
+                {"name": "Chicago Cubs", "price": 147},
+            ]}]},
+        ],
+    )
+    mi = compute_market_intel(
+        odds,
+        sharp_books=["pinnacle", "lowvig"],
+        square_books=["draftkings", "fanduel"],
+    )
+    assert mi.available
+    assert mi.n_sharp_books == 2 and mi.n_square_books == 2 and mi.n_total_books == 4
+    # Sharps less bullish on home -> sharp - square is negative.
+    assert mi.sharp_minus_square is not None and mi.sharp_minus_square < 0
+    # Sharp consensus around 0.61 (Pinnacle -162), square around 0.62 (DK -175).
+    # Tight bounds without locking the exact devig math.
+    assert 0.58 < mi.sharp_devig_home < 0.64
+    assert 0.60 < mi.square_devig_home < 0.66
+    assert mi.square_devig_home > mi.sharp_devig_home  # squares more bullish here
+    assert mi.dispersion_pp is not None and mi.dispersion_pp > 0
+
+
+def test_market_intel_unavailable_when_no_sharp_books():
+    """No sharp books quoted -> available=False, model degrades cleanly."""
+    from mlb_value_bot.data.market_intel import compute_market_intel
+    from mlb_value_bot.data.odds_client import GameOdds
+    odds = GameOdds(
+        event_id="e1", commence_time="2026-05-28T22:41:00Z",
+        home_team="Pirates", away_team="Cubs",
+        all_books=[{"key": "draftkings", "markets": [{"key": "h2h", "outcomes": [
+            {"name": "Pirates", "price": -175}, {"name": "Cubs", "price": 144},
+        ]}]}],
+    )
+    mi = compute_market_intel(odds, sharp_books=["pinnacle"], square_books=["draftkings"])
+    assert not mi.available
+    assert mi.sharp_devig_home is None
+    assert mi.disagreement_with(0.5) is None
+
+
+def test_market_intel_disagreement_signed():
+    """disagreement_with returns positive when our blended is HIGHER than sharps."""
+    from mlb_value_bot.data.market_intel import MarketIntelligence
+    mi = MarketIntelligence(
+        sharp_devig_home=0.55, square_devig_home=0.58,
+        sharp_minus_square=-0.03, dispersion_pp=0.5,
+        n_sharp_books=2, n_square_books=2, n_total_books=4,
+    )
+    # We say home 0.65, sharps say 0.55 -> we're fading by +0.10.
+    assert approx(mi.disagreement_with(0.65), 0.10, tol=1e-9)
+
+
 # --- In-progress games are not bettable (2026-05-28) -----------------------
 def test_in_progress_games_are_not_playable():
     """A game whose detailedState is 'In Progress' (or Final, etc.) must NOT

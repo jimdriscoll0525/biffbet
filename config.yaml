@@ -14,16 +14,38 @@
 odds_api:
   base_url: "https://api.the-odds-api.com/v4"
   sport_key: "baseball_mlb"
-  regions: "us"            # us | us2 | uk | eu | au (comma-separated allowed)
+  # us + uk gets us DraftKings/FanDuel/BetMGM (squares for bet price) plus
+  # Pinnacle (sharp consensus). Adding more regions costs no quota.
+  regions: "us,uk"
   markets: "h2h"           # moneyline
   odds_format: "american"
-  # Which sportsbooks to consider. Empty list = all books the API returns.
-  # The bot picks the BEST (highest) price available across these books per side.
-  # Pinned to DraftKings ONLY so the displayed line == the price you'll actually
-  # bet, and EV is accurate for a DK bettor. To line-shop instead, add more books
-  # back here (fanduel, betmgm, caesars, pointsbetus) and it'll show the best.
+  # Books we ASK the API for. Books not actually returned by your tier are
+  # silently skipped (e.g. caesars/bookmaker/circa weren't on this tier on
+  # 2026-05-28). The engine uses `bet_bookmaker` for the actual bet price
+  # and `sharp_bookmakers` / `square_bookmakers` for the sharp/square signal.
   bookmakers:
+    - "draftkings"         # bet price (also a square)
+    - "fanduel"            # square consensus
+    - "betmgm"             # square consensus
+    - "pinnacle"           # GOLD-STANDARD sharp consensus (uk region)
+    - "betonlineag"        # sharp offshore
+    - "lowvig"             # sharp (Bookmaker.eu operator)
+  # The bot extracts THIS book's price for actual betting decisions. Keeps the
+  # displayed line == the price you'll bet, even when other listed books offer
+  # better numbers. Must be one of the bookmakers above.
+  bet_bookmaker: "draftkings"
+  # Used by the market-intelligence signal (#5): we compare the de-vigged
+  # probability across each group and surface "sharp vs square" divergence
+  # plus dispersion. A pick that the sharps fade gets a confidence haircut
+  # and (if extreme) the divergence sanity guard skips it outright.
+  sharp_bookmakers:
+    - "pinnacle"
+    - "betonlineag"
+    - "lowvig"
+  square_bookmakers:
     - "draftkings"
+    - "fanduel"
+    - "betmgm"
   request_timeout_seconds: 20
 
 mlb_api:
@@ -217,6 +239,12 @@ sanity:
   # is still on the announced starter -- that gap manufactured a fake 12.6%
   # EV on Sox/Braves 2026-05-28. 0.15 is conservative; tune via backtest.
   max_model_market_divergence: 0.15
+  # Sharp-fade skip threshold (#5). If our blended pick disagrees with the
+  # sharp consensus on the side we're recommending by MORE than this many
+  # probability points, skip the game -- the sharps know something we don't.
+  # 5pp is conservative; tune via backtest. Set to a very large number to
+  # disable while leaving the rest of the sharp/square signal active.
+  max_sharp_disagreement_pp: 5.0
 
 kelly:
   fraction: 0.25          # quarter-Kelly
@@ -237,6 +265,10 @@ bet_sizing:
   strong_confidence: 75        # required (alongside strong_ev) for "strong"
   # Stake multipliers.
   small_multiplier: 0.5        # halve Kelly on "small" picks
+  # Drop a Strong tier to Standard when we're fading sharp consensus by more
+  # than this many pp (but less than max_sharp_disagreement_pp, which would
+  # skip outright). Sharps disagreeing with our top conviction is a smell test.
+  sharp_fade_downgrade_pp: 2.5
 
 # -----------------------------------------------------------------------------
 # Confidence score weights (0-100). Components are each normalized to [0,1] and

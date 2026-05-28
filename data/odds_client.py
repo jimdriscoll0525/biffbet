@@ -144,10 +144,18 @@ class OddsClient:
             all_books=ev.get("bookmakers", []),
         )
 
+        # bet_bookmaker pins the bet-price decision to a single book (so the
+        # displayed line is the price you'll actually bet). When unset we fall
+        # back to the old "best price across all listed books" line-shopping
+        # behavior. Other books still populate all_books for sharp/square intel.
+        bet_book = (self._odds_cfg.get("bet_bookmaker") or "").strip().lower() or None
+
         best_home: SidePrice | None = None
         best_away: SidePrice | None = None
         for book in ev.get("bookmakers", []):
             book_key = book.get("key", "?")
+            if bet_book is not None and book_key != bet_book:
+                continue
             for market in book.get("markets", []):
                 if market.get("key") != "h2h":
                     continue

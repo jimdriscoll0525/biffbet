@@ -58,6 +58,9 @@ class GameAnalysis:
     # Lineup snapshots used to populate reasoning["lineup"] (UI chips + breakdown).
     home_lineup_status: "object | None" = None
     away_lineup_status: "object | None" = None
+    # Sharp/square market intelligence (added 2026-05-28). Used to populate
+    # reasoning["market_intel"] (UI agree/fade chip + breakdown).
+    market_intel: "object | None" = None
 
     @property
     def best_eval(self) -> SideEvaluation | None:
@@ -96,6 +99,24 @@ class GameAnalysis:
             data["lineup"] = {
                 "home": _lineup_to_dict(self.home_lineup_status),
                 "away": _lineup_to_dict(self.away_lineup_status),
+            }
+        # Sharp/square market intel: sharp consensus, square consensus, the
+        # gap between them, and dispersion. UI uses this for the "Sharps
+        # agree/fade" chip and the breakdown line. Omitted when the API
+        # returned no usable sharp books (legacy + degraded configs).
+        if self.market_intel is not None:
+            mi = self.market_intel
+            data["market_intel"] = {
+                "sharp_devig_home": mi.sharp_devig_home,
+                "square_devig_home": mi.square_devig_home,
+                "sharp_minus_square_pp": (
+                    round(mi.sharp_minus_square * 100, 2)
+                    if mi.sharp_minus_square is not None else None
+                ),
+                "dispersion_pp": round(mi.dispersion_pp, 2) if mi.dispersion_pp is not None else None,
+                "n_sharp_books": mi.n_sharp_books,
+                "n_square_books": mi.n_square_books,
+                "n_total_books": mi.n_total_books,
             }
         return data
 
@@ -258,6 +279,19 @@ def evaluate_game(
     devig_method = config["ev"].get("devig_method", "power")
     market_home, _market_away = devigged_market_probs(home_odds, away_odds, devig_method)
 
+    # Sharp/square market intelligence (#5). Built from the per-book pricing
+    # already returned by The Odds API in `game_odds.all_books`. No extra
+    # quota cost. Used below as: (a) sharp-fade sanity guard, (b) confidence
+    # penalty, (c) tier downgrade. Degrades to None on missing config / no
+    # sharp books returned today.
+    from mlb_value_bot.data.market_intel import compute_market_intel
+    market_intel = compute_market_intel(
+        game_odds,
+        sharp_books=config.get("odds_api", {}).get("sharp_bookmakers") or [],
+        square_books=config.get("odds_api", {}).get("square_bookmakers") or [],
+        devig_method=devig_method,
+    )
+
     # Dynamic blend: the model earns more weight when the underlying DATA is
     # trustworthy (good pitcher samples, team data complete, components in
     # agreement). EV is deliberately NOT part of this -- letting EV drive the
@@ -321,6 +355,36 @@ def evaluate_game(
         lineup_penalty=lineup_penalty,
     )
 
+    # Market-intel disagreement: compute how much we're "fading the sharps"
+    # on the side we're recommending. Used by both the sanity guard
+    # (skip on extreme fade) and the tier downgrade (Strong -> Standard when
+    # mildly fading sharps).
+    our_pick_home_prob = blended_home if best_side == "home" else 1.0 - blended_home
+    sharp_fade_pp: float | None = None
+    if market_intel.available:
+        gap_home = market_intel.disagreement_with(blended_home)  # +ve = we more bullish on home than sharps
+        if gap_home is not None:
+            sharp_fade_pp = gap_home if best_side == "home" else -gap_home
+
+    # Sanity guard: if we'd be fading sharp consensus by more than this many
+    # probability points on the side we're recommending, skip the game. The
+    # sharps are the smartest counterparty on the board; betting hard against
+    # them when they disagree by 5pp+ is essentially betting we know more.
+    # PRODUCTION INCIDENT 2026-05-28: would have been a second line of
+    # defense against the Sox/Braves live-line fake +EV (sharps would have
+    # priced the in-play moneyline similarly, but the divergence guard
+    # already catches that one. This guard catches DIFFERENT failure modes:
+    # market reading a news headline, weather, lineup change we missed.)
+    max_sharp_fade = float(config.get("sanity", {}).get("max_sharp_disagreement_pp", 5.0))
+    if sharp_fade_pp is not None and sharp_fade_pp * 100 > max_sharp_fade:
+        analysis.skipped_reason = (
+            f"fading sharp consensus by {sharp_fade_pp * 100:.1f}pp on {best_side} "
+            f"(blended {our_pick_home_prob:.3f} vs sharps {market_intel.sharp_devig_home:.3f}) "
+            f"> {max_sharp_fade:.1f}pp"
+        )
+        analysis.market_intel = market_intel
+        return analysis
+
     # Bet sizing tiers: classify the pick into Pass/Small/Standard/Strong and
     # apply a stake multiplier to the raw Kelly stake. This bakes our
     # "reduce Kelly when confidence is low / edge is modest" guardrails into
@@ -329,11 +393,37 @@ def evaluate_game(
     tier, tier_mult, tier_reasons = _classify_bet_tier(
         evals[best_side].ev_pct, confidence, config
     )
+
+    # Tier downgrade when mildly fading sharps: even below the skip threshold,
+    # a Strong pick that contradicts sharp consensus is suspicious. Drop it
+    # one tier (Strong -> Standard) and record the reason. Tunable in
+    # config.bet_sizing.sharp_fade_downgrade_pp.
+    downgrade_thr_pp = float(config.get("bet_sizing", {}).get("sharp_fade_downgrade_pp", 2.5))
+    if (
+        tier == "strong"
+        and sharp_fade_pp is not None
+        and sharp_fade_pp * 100 > downgrade_thr_pp
+    ):
+        tier = "standard"
+        tier_reasons.append(
+            f"downgraded Strong -> Standard: fading sharps by {sharp_fade_pp * 100:.1f}pp"
+        )
     if tier_mult != 1.0:
         # Mutate in place: the consumer only ever uses evals[best_side].
         original_kelly = evals[best_side].kelly_stake
         evals[best_side].kelly_stake = round(original_kelly * tier_mult, 6)
         analysis._tier_original_kelly = original_kelly  # type: ignore[attr-defined]
+
+    # Confidence penalty for mild sharp fade (below the skip threshold but
+    # still negative). Half a point per pp of fade, capped at 10. Surfaces as
+    # a lower data_confidence -> looser blend tier -> more market anchoring.
+    # We DON'T re-blend after the fact (that would invalidate the EV already
+    # computed); we just lower the score the UI shows.
+    if sharp_fade_pp is not None and sharp_fade_pp > 0:
+        penalty = min(10.0, sharp_fade_pp * 100 * 0.5)
+        confidence = max(0.0, confidence - penalty)
+        if penalty >= 1.0:
+            tier_reasons.append(f"confidence -{penalty:.1f} for {sharp_fade_pp * 100:.1f}pp sharp fade")
 
     analysis.wp = wp
     analysis.evals = evals
@@ -349,6 +439,7 @@ def evaluate_game(
     analysis.tier_reasons = tier_reasons
     analysis.home_lineup_status = home_lu
     analysis.away_lineup_status = away_lu
+    analysis.market_intel = market_intel
     return analysis
 
 
