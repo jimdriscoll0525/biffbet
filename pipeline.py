@@ -140,8 +140,17 @@ def evaluate_game(
     season: int,
     as_of: date_cls,
     config: dict | None = None,
+    bullpen_status_provider=None,  # callable: (team_name, team_id) -> BullpenStatus | None
 ) -> GameAnalysis:
-    """Run the full model + EV evaluation for a single game."""
+    """Run the full model + EV evaluation for a single game.
+
+    `bullpen_status_provider` is an optional callable that returns a
+    `BullpenStatus` for a given (team_name, team_id). The provider pattern
+    keeps the expensive per-pitcher reliever-stats fetch a one-time slate
+    cost (built in analyze_slate) while still letting each game evaluate
+    in isolation. Pass None to fall back to the old behavior (no fatigue
+    component); the breakdown will show "bullpen status unavailable".
+    """
     config = config or load_config()
     analysis = GameAnalysis(
         game_id=scheduled.game_id,
@@ -186,7 +195,20 @@ def evaluate_game(
     home_tp = team_provider.build_team_profile(scheduled.home_team, is_home=True)
     away_tp = team_provider.build_team_profile(scheduled.away_team, is_home=False)
 
-    wp = compute_win_probability(home_tp, away_tp, home_pp, away_pp, config)
+    # Bullpen fatigue: optional, never fatal. Missing -> component contributes 0.
+    home_bp = None
+    away_bp = None
+    if bullpen_status_provider is not None:
+        try:
+            home_bp = bullpen_status_provider(scheduled.home_team, scheduled.home_team_id)
+            away_bp = bullpen_status_provider(scheduled.away_team, scheduled.away_team_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bullpen status provider failed for game %s (%s)", scheduled.game_id, exc)
+
+    wp = compute_win_probability(
+        home_tp, away_tp, home_pp, away_pp, config,
+        home_bullpen_status=home_bp, away_bullpen_status=away_bp,
+    )
 
     # Market anchoring: blend the raw model toward the de-vigged market so EV
     # reflects a *bounded tilt* off the sharp consensus, not raw model
@@ -305,6 +327,53 @@ def _classify_bet_tier(
     return "standard", 1.0, reasons
 
 
+def _build_bullpen_status_provider(
+    mlb_client: MLBClient,
+    season: int,
+    as_of: date_cls,
+    config: dict,
+):
+    """Factory: per-slate cached BullpenStatus provider.
+
+    The per-pitcher reliever stats are fetched ONCE per slate run (one API
+    call). Per-team status is then computed on demand and memoized so the
+    same team's bullpen isn't re-derived for its second matchup of a
+    doubleheader. Returns None (disabled) if the pre-fetch comes back empty
+    or if the feature is config-disabled -- in which case the model
+    component just contributes 0 with "data unavailable".
+    """
+    from mlb_value_bot.data.bullpen_status import BullpenStatus, get_bullpen_status
+
+    if not config.get("bullpen_fatigue", {}).get("enabled", True):
+        return None
+
+    try:
+        per_pitcher = mlb_client.get_per_pitcher_reliever_stats(season)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bullpen fatigue: per-pitcher pull failed (%s); disabling", exc)
+        return None
+    if not per_pitcher:
+        log.info("bullpen fatigue: no per-pitcher reliever data; disabling")
+        return None
+
+    cache: dict[tuple[str, int], BullpenStatus] = {}
+
+    def provider(team_name: str, team_id: int) -> BullpenStatus | None:
+        if not team_name:
+            return None
+        key = (team_name, team_id)
+        if key in cache:
+            return cache[key]
+        status = get_bullpen_status(
+            team_name=team_name, team_id=team_id, as_of=as_of,
+            mlb=mlb_client, per_pitcher_relievers=per_pitcher, config=config,
+        )
+        cache[key] = status
+        return status
+
+    return provider
+
+
 def analyze_slate(
     game_date: str,
     odds_client: OddsClient | None = None,
@@ -322,10 +391,19 @@ def analyze_slate(
     as_of = date_cls.fromisoformat(game_date)
     provider = TeamMetricsProvider(season=season, config=config, mlb_client=mlb_client)
 
+    # Bullpen fatigue (optional): one slate-wide pull of per-pitcher reliever
+    # stats; per-team boxscore lookups are memoized within this run so two
+    # teams sharing the same recent matchup don't re-fetch the same boxscore.
+    # Disable via config.bullpen_fatigue.enabled=false (e.g. for fast backtests).
+    bp_provider = _build_bullpen_status_provider(mlb_client, season, as_of, config)
+
     analyses: list[GameAnalysis] = []
     for sched in schedule:
         matched = _match_odds(sched, odds)
-        analyses.append(evaluate_game(sched, matched, provider, season, as_of, config))
+        analyses.append(evaluate_game(
+            sched, matched, provider, season, as_of, config,
+            bullpen_status_provider=bp_provider,
+        ))
 
     # Rank: evaluable games by EV desc, skipped games last.
     def _sort_key(a: GameAnalysis) -> float:

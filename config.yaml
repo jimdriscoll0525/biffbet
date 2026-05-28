@@ -90,6 +90,13 @@ model:
   # throw ~1/3 of innings, so the per-run effect is smaller than the starter's.
   bullpen_run_to_winpct: 0.022
 
+  # --- Bullpen fatigue (additive on top of bullpen FIP) ---------------------
+  # Each "leverage arm unavailable" tilts the win prob by this much. Net delta
+  # = (away_down - home_down) * scale, clamped to +/- bullpen_fatigue_clamp.
+  # Tiny on purpose -- this is a tilt, not a takeover. Tune via backtest.
+  bullpen_fatigue_scale: 0.012
+  bullpen_fatigue_clamp: 0.03
+
   # Recent-form scaling (see analysis/win_probability.py).
   form_scale: 0.5
   # Recent xwOBA/CSW is regressed toward the pitcher's SEASON value to damp
@@ -137,6 +144,7 @@ model:
   weights:
     starter: 1.0          # SP matchup (log5 of pitcher win-equivalents)
     bullpen: 1.0          # relief corps FIP differential
+    bullpen_fatigue: 1.0  # leverage-arm availability today (added 2026-05-28)
     park: 0.25            # ballpark run environment (mostly a totals factor;
                           # small ML effect, kept low + tunable on purpose)
     home_field: 1.0       # constant home-field edge
@@ -255,6 +263,21 @@ park_factors:
 
 # Default park factor when a team isn't in the table above.
 default_park_factor: 100
+
+# -----------------------------------------------------------------------------
+# Bullpen fatigue (added 2026-05-28)
+# Per-team availability of leverage arms (each team's top-N relievers by season
+# ERA). Pulled from the MLB Stats API: per-pitcher reliever stats are fetched
+# once per slate; each team's last few finalized games are boxscored to figure
+# out who pitched and how heavily. See data/bullpen_status.py.
+# -----------------------------------------------------------------------------
+bullpen_fatigue:
+  enabled: true
+  leverage_top_n: 3                    # per team, by lowest season ERA
+  min_appearances_for_leverage: 8      # sample-size floor for the leverage list
+  pitch_threshold_unavailable: 35      # pitches yesterday -> unavailable today
+  appearance_threshold: 3              # games in last 3 days -> unavailable
+  lookback_days: 5                     # window to find the last 3 finalized games
 
 logging:
   level: "INFO"

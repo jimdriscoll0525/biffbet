@@ -44,6 +44,10 @@ class ScheduledGame:
     away_pitcher: ProbablePitcher
     venue: str | None = None
     game_datetime: str | None = None   # ISO UTC first-pitch time (MLB API `gameDate`)
+    # MLB team IDs (needed for follow-up calls like recent-games / boxscores).
+    # 0 = couldn't resolve (degrades to "no bullpen fatigue data" on this game).
+    home_team_id: int = 0
+    away_team_id: int = 0
 
     @property
     def is_playable(self) -> bool:
@@ -138,6 +142,8 @@ class MLBClient:
             away_pitcher=self._parse_pitcher(away.get("probablePitcher")),
             venue=g.get("venue", {}).get("name"),
             game_datetime=g.get("gameDate"),
+            home_team_id=int(home.get("team", {}).get("id") or 0),
+            away_team_id=int(away.get("team", {}).get("id") or 0),
         )
 
     @staticmethod
@@ -249,6 +255,142 @@ class MLBClient:
                     }
                 except (KeyError, TypeError, ValueError):
                     continue
+        return out
+
+    # -- Per-pitcher reliever stats (for leverage-arm ranking) -----------------
+    def get_per_pitcher_reliever_stats(
+        self, season: int
+    ) -> dict[str, list[dict]]:
+        """Per-team list of relievers with their season stats.
+
+        Same source as `get_team_bullpen_era` (one all-pitchers call) but we
+        keep the per-pitcher rows instead of aggregating to a team ERA. Used to
+        identify each team's high-leverage arms (lowest-ERA relievers with
+        enough sample). Returns {} on failure.
+
+        Output shape: {canonical_team: [{player_id, name, era, ip, appearances}, ...]}
+        sorted by ERA ascending (best arms first).
+        """
+        try:
+            data = self._get(
+                "/v1/stats",
+                {"stats": "season", "group": "pitching", "season": int(season),
+                 "sportId": 1, "gameType": "R", "playerPool": "all", "limit": 3000},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("per-pitcher reliever stats fetch failed (%s)", exc)
+            return {}
+
+        by_team: dict[str, list[dict]] = {}
+        for grp in data.get("stats", []):
+            for sp in grp.get("splits", []):
+                team = normalize_team(sp.get("team", {}).get("name"))
+                st = sp.get("stat", {})
+                player = sp.get("player") or {}
+                g = st.get("gamesPlayed") or 0
+                gs = st.get("gamesStarted") or 0
+                if not team or not g or gs / g >= 0.5:  # starters excluded
+                    continue
+                try:
+                    era = float(st.get("era"))
+                except (TypeError, ValueError):
+                    continue
+                ip = self._parse_ip(st.get("inningsPitched"))
+                if ip <= 0:
+                    continue
+                by_team.setdefault(team, []).append({
+                    "player_id": int(player.get("id")) if player.get("id") else None,
+                    "name": player.get("fullName") or "?",
+                    "era": era,
+                    "ip": ip,
+                    "appearances": int(g),
+                })
+        # Sort each team's relievers by ERA ascending (best first).
+        for team in by_team:
+            by_team[team].sort(key=lambda r: r["era"])
+        return by_team
+
+    # -- Recent game pitching logs (for bullpen fatigue) ----------------------
+    def get_recent_games_for_team(
+        self,
+        team_id: int,
+        end_date: date_cls,
+        days_back: int = 5,
+    ) -> list[dict]:
+        """Team's recently-completed games over a sliding window.
+
+        Returns a list of {gamePk, date, status} sorted newest-first, filtered
+        to games that are actually final (so the boxscore is meaningful). We
+        pull a wider window than we strictly need (default 5d to find 3 games)
+        because off-days and rainouts mean "yesterday's game" isn't always
+        literally yesterday.
+        """
+        from datetime import timedelta
+        start_date = end_date - timedelta(days=days_back)
+        try:
+            data = self._get(
+                "/v1/schedule",
+                {
+                    "sportId": 1,
+                    "teamId": int(team_id),
+                    "startDate": start_date.isoformat(),
+                    "endDate": (end_date).isoformat(),
+                    "gameType": "R",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("recent games fetch failed for team %s (%s)", team_id, exc)
+            return []
+        games: list[dict] = []
+        for d in data.get("dates", []):
+            for g in d.get("games", []):
+                status = g.get("status", {}).get("detailedState", "")
+                if status not in {"Final", "Game Over", "Completed Early"}:
+                    continue
+                games.append({
+                    "gamePk": int(g.get("gamePk")),
+                    "date": d.get("date"),
+                    "status": status,
+                })
+        games.sort(key=lambda x: x["date"], reverse=True)
+        return games
+
+    def get_pitching_log(self, game_pk: int) -> dict[str, list[dict]]:
+        """Per-game pitching log: who pitched, in order, with pitches thrown.
+
+        Returns {"home": [...], "away": [...]} where each entry is
+        {player_id, name, pitches, ip, is_starter}. The starter is the FIRST
+        pitcher in MLB's `teams.<side>.pitchers` order-of-appearance list.
+        Final/in-progress games only -- partial data is returned as-is. {} on
+        failure (transient API errors should not break a slate).
+        """
+        try:
+            data = self._get(f"/v1/game/{int(game_pk)}/boxscore")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("boxscore fetch failed for game %s (%s)", game_pk, exc)
+            return {}
+
+        out: dict[str, list[dict]] = {"home": [], "away": []}
+        for side in ("home", "away"):
+            team = data.get("teams", {}).get(side, {}) or {}
+            order = team.get("pitchers") or []  # order of appearance
+            players = team.get("players") or {}
+            for i, pid in enumerate(order):
+                p = players.get(f"ID{pid}") or {}
+                person = p.get("person") or {}
+                stats = (p.get("stats") or {}).get("pitching") or {}
+                try:
+                    pitches = int(stats.get("pitchesThrown") or 0)
+                except (TypeError, ValueError):
+                    pitches = 0
+                ip = self._parse_ip(stats.get("inningsPitched"))
+                out[side].append({
+                    "player_id": int(person.get("id")) if person.get("id") else None,
+                    "name": person.get("fullName") or "?",
+                    "pitches": pitches,
+                    "ip": ip,
+                    "is_starter": i == 0,
+                })
         return out
 
     def get_team_bullpen_era(self, season: int) -> dict[str, float]:

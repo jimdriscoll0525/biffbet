@@ -112,9 +112,11 @@ def test_model_favors_better_pitcher_and_breaks_down():
     scrub = _mk_pitcher("Scrub", 4.80)    # away weak starter
     res = compute_win_probability(home_t, away_t, ace, scrub)
 
-    # Components present and named.
+    # Components present and named. (`bullpen_fatigue` added 2026-05-28;
+    # it contributes 0 when no BullpenStatus is supplied, which is this test's
+    # path -- so the count grows by one but no math drift.)
     names = {c.name for c in res.components}
-    assert names == {"starter", "bullpen", "park", "home_field", "form"}
+    assert names == {"starter", "bullpen", "bullpen_fatigue", "park", "home_field", "form"}
     # Big pitching edge + HFA -> home clearly favored.
     assert res.home_win_prob > res.base_prob
     assert res.home_win_prob > 0.55
@@ -290,6 +292,87 @@ def test_match_odds_picks_correct_day_in_a_series():
     assert _match_odds(sched, [tomorrow]) is None
     # No matchup at all -> None.
     assert _match_odds(sched, []) is None
+
+
+# --- Bullpen fatigue component (2026-05-28) ---------------------------------
+def test_reliever_usage_unavailable_rules():
+    """Each fatigue rule independently flags a reliever as unavailable."""
+    from mlb_value_bot.data.bullpen_status import RelieverUsage
+    # Heavy pitch count yesterday alone -> unavailable.
+    r = RelieverUsage(player_id=1, name="A", pitches_by_day=[40, 0, 0])
+    assert r.is_unavailable(pitch_threshold=35, appearance_threshold=3)
+    # Back-to-back (yesterday + day before) alone -> unavailable.
+    r = RelieverUsage(player_id=2, name="B", pitches_by_day=[15, 12, 0], consecutive_days=2)
+    assert r.is_unavailable(35, 3)
+    # 3 appearances in 3 days alone -> unavailable.
+    r = RelieverUsage(player_id=3, name="C", pitches_by_day=[10, 10, 10], appearances_3d=3)
+    assert r.is_unavailable(35, 3)
+    # Single light outing two days ago -> available.
+    r = RelieverUsage(player_id=4, name="D", pitches_by_day=[0, 12, 0], appearances_3d=1)
+    assert not r.is_unavailable(35, 3)
+
+
+def test_bullpen_status_short_label_and_score():
+    """Status surfaces leverage counts and a clean UI label."""
+    from mlb_value_bot.data.bullpen_status import BullpenStatus, RelieverUsage
+    relievers = [
+        RelieverUsage(player_id=1, name="Closer", is_leverage=True, pitches_by_day=[40, 0, 0]),
+        RelieverUsage(player_id=2, name="Setup", is_leverage=True),
+        RelieverUsage(player_id=3, name="HighLev", is_leverage=True),
+        RelieverUsage(player_id=4, name="Mop-up", is_leverage=False),
+    ]
+    leverage_total = sum(1 for r in relievers if r.is_leverage)
+    leverage_unavailable = sum(
+        1 for r in relievers
+        if r.is_leverage and r.is_unavailable(35, 3)
+    )
+    s = BullpenStatus(team="X", available=True, relievers=relievers,
+                     leverage_total=leverage_total,
+                     leverage_unavailable=leverage_unavailable)
+    assert s.leverage_total == 3
+    assert s.leverage_available == 2
+    assert s.fatigue_score == 1
+    assert "2/3" in s.short_label()
+
+
+def test_bullpen_fatigue_delta_clamped_and_signed():
+    """The fatigue delta favors the team whose opponent has more arms down."""
+    from mlb_value_bot.analysis.win_probability import compute_win_probability
+    from mlb_value_bot.data.bullpen_status import BullpenStatus
+    ht = _mk_team("H", 0.5, 60, 100, 4.0)
+    at = _mk_team("A", 0.5, 60, 100, 4.0)
+    hp = _mk_pitcher("H SP", 4.0)
+    ap = _mk_pitcher("A SP", 4.0)
+    # Home has 0 leverage down; away has 2 down -> + favors home.
+    home_bp = BullpenStatus(team="H", available=True, leverage_total=3, leverage_unavailable=0)
+    away_bp = BullpenStatus(team="A", available=True, leverage_total=3, leverage_unavailable=2)
+    res = compute_win_probability(ht, at, hp, ap,
+                                  home_bullpen_status=home_bp,
+                                  away_bullpen_status=away_bp)
+    bf = next(c for c in res.components if c.name == "bullpen_fatigue")
+    assert bf.available
+    # (2 - 0) * 0.012 = 0.024, within +/- 0.03 clamp.
+    assert approx(bf.raw_delta, 0.024, tol=1e-6)
+    # Sign check: swap roles -> negative.
+    res2 = compute_win_probability(ht, at, hp, ap,
+                                   home_bullpen_status=away_bp,
+                                   away_bullpen_status=home_bp)
+    bf2 = next(c for c in res2.components if c.name == "bullpen_fatigue")
+    assert approx(bf2.raw_delta, -0.024, tol=1e-6)
+
+
+def test_bullpen_fatigue_missing_status_degrades_cleanly():
+    """No bullpen status -> component contributes 0 with 'unavailable' note."""
+    from mlb_value_bot.analysis.win_probability import compute_win_probability
+    ht = _mk_team("H", 0.5, 60, 100, 4.0)
+    at = _mk_team("A", 0.5, 60, 100, 4.0)
+    hp = _mk_pitcher("H SP", 4.0)
+    ap = _mk_pitcher("A SP", 4.0)
+    res = compute_win_probability(ht, at, hp, ap)  # no bullpen status passed
+    bf = next(c for c in res.components if c.name == "bullpen_fatigue")
+    assert not bf.available
+    assert bf.raw_delta == 0.0
+    assert "unavailable" in bf.note
 
 
 # --- Dynamic blend + bet tiers (2026-05-28) ---------------------------------

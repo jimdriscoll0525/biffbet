@@ -116,8 +116,17 @@ def compute_win_probability(
     home_pitcher: PitcherProfile,
     away_pitcher: PitcherProfile,
     config: dict | None = None,
+    home_bullpen_status: "BullpenStatus | None" = None,
+    away_bullpen_status: "BullpenStatus | None" = None,
 ) -> WinProbabilityResult:
-    """Run the model and return the home win probability with full breakdown."""
+    """Run the model and return the home win probability with full breakdown.
+
+    `home_bullpen_status` / `away_bullpen_status` are the optional fatigue
+    snapshots from data.bullpen_status. When provided, an additional
+    `bullpen_fatigue` component is added on top of the existing season-FIP
+    bullpen component. When missing, the component contributes 0 with the
+    note "data unavailable" -- existing behavior is preserved exactly.
+    """
     config = config or load_config()
     m = config["model"]
     lg = config["league"]
@@ -162,6 +171,34 @@ def compute_win_probability(
         note = "missing bullpen FIP"
         bp_avail = False
     components.append(_mk("bullpen", bullpen_delta, weights["bullpen"], note, bp_avail))
+
+    # 3b) BULLPEN FATIGUE — additive tilt on top of (3) using today's
+    # availability of each team's leverage arms (see data/bullpen_status.py).
+    # Each "down" leverage arm contributes a configurable per-arm tilt; the
+    # net is (away_down - home_down) * scale, clamped tight (default +/-0.03).
+    # If either side's status is unavailable we contribute 0 and label it --
+    # never crash the slate on a transient API hiccup.
+    bp_scale = float(m.get("bullpen_fatigue_scale", 0.012))
+    bp_clamp = float(m.get("bullpen_fatigue_clamp", 0.03))
+    bp_weight = float(weights.get("bullpen_fatigue", 1.0))
+    if (
+        home_bullpen_status is not None and home_bullpen_status.available
+        and away_bullpen_status is not None and away_bullpen_status.available
+    ):
+        h_down = home_bullpen_status.leverage_unavailable
+        a_down = away_bullpen_status.leverage_unavailable
+        # + favors home (away more tired).
+        bp_fatigue_delta = clamp((a_down - h_down) * bp_scale, -bp_clamp, bp_clamp)
+        bp_fatigue_note = (
+            f"H {home_bullpen_status.short_label()}; "
+            f"A {away_bullpen_status.short_label()}"
+        )
+        bp_fatigue_avail = True
+    else:
+        bp_fatigue_delta = 0.0
+        bp_fatigue_note = "bullpen status unavailable"
+        bp_fatigue_avail = False
+    components.append(_mk("bullpen_fatigue", bp_fatigue_delta, bp_weight, bp_fatigue_note, bp_fatigue_avail))
 
     # 4) PARK — run environment x offense gap. Small, mostly a totals factor.
     off_home = home_team.offense_wrc_plus
