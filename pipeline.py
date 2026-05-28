@@ -55,6 +55,9 @@ class GameAnalysis:
     tier: str = "pass"
     tier_multiplier: float = 0.0
     tier_reasons: list[str] = field(default_factory=list)
+    # Lineup snapshots used to populate reasoning["lineup"] (UI chips + breakdown).
+    home_lineup_status: "object | None" = None
+    away_lineup_status: "object | None" = None
 
     @property
     def best_eval(self) -> SideEvaluation | None:
@@ -86,7 +89,28 @@ class GameAnalysis:
         }
         data["pitchers"] = {"home": self.home_pitcher, "away": self.away_pitcher}
         data["game_datetime"] = self.game_datetime
+        # Lineup status block: lets the UI render a "Projected lineup" chip,
+        # show missing key bats per side, and segment performance by status.
+        # Omitted when neither side has a status (legacy reasoning shape).
+        if self.home_lineup_status is not None or self.away_lineup_status is not None:
+            data["lineup"] = {
+                "home": _lineup_to_dict(self.home_lineup_status),
+                "away": _lineup_to_dict(self.away_lineup_status),
+            }
         return data
+
+
+def _lineup_to_dict(status) -> dict | None:
+    """Project a LineupStatus into the reasoning_json shape (or None if absent)."""
+    if status is None:
+        return None
+    return {
+        "status": status.status,
+        "key_bats_total": status.key_bats_total,
+        "key_bats_present": status.key_bats_present,
+        "missing_key_bats": list(status.missing_key_bats),
+        "notes": list(status.notes),
+    }
 
 
 def _odds_by_team(game: GameOdds) -> dict[str, int]:
@@ -141,15 +165,17 @@ def evaluate_game(
     as_of: date_cls,
     config: dict | None = None,
     bullpen_status_provider=None,  # callable: (team_name, team_id) -> BullpenStatus | None
+    lineup_status_provider=None,   # callable: (team_name, game_pk, side, first_pitch_iso) -> LineupStatus | None
 ) -> GameAnalysis:
     """Run the full model + EV evaluation for a single game.
 
-    `bullpen_status_provider` is an optional callable that returns a
-    `BullpenStatus` for a given (team_name, team_id). The provider pattern
-    keeps the expensive per-pitcher reliever-stats fetch a one-time slate
-    cost (built in analyze_slate) while still letting each game evaluate
-    in isolation. Pass None to fall back to the old behavior (no fatigue
-    component); the breakdown will show "bullpen status unavailable".
+    `bullpen_status_provider` and `lineup_status_provider` are optional
+    callables that return per-team status snapshots. Both follow the same
+    provider pattern: the slate-wide pulls (per-pitcher reliever stats,
+    per-player hitting stats) happen ONCE in analyze_slate; per-team /
+    per-game status is computed on demand and memoized. Pass None for
+    either to fall back to the pre-feature behavior (component contributes
+    0 with "data unavailable").
     """
     config = config or load_config()
     analysis = GameAnalysis(
@@ -205,9 +231,25 @@ def evaluate_game(
         except Exception as exc:  # noqa: BLE001
             log.warning("bullpen status provider failed for game %s (%s)", scheduled.game_id, exc)
 
+    # Lineup status: optional, same shape. Drives the `lineup` component AND
+    # a confidence penalty when lineups are projected (not yet confirmed).
+    home_lu = None
+    away_lu = None
+    if lineup_status_provider is not None:
+        try:
+            home_lu = lineup_status_provider(
+                scheduled.home_team, scheduled.game_id, "home", scheduled.game_datetime,
+            )
+            away_lu = lineup_status_provider(
+                scheduled.away_team, scheduled.game_id, "away", scheduled.game_datetime,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("lineup status provider failed for game %s (%s)", scheduled.game_id, exc)
+
     wp = compute_win_probability(
         home_tp, away_tp, home_pp, away_pp, config,
         home_bullpen_status=home_bp, away_bullpen_status=away_bp,
+        home_lineup_status=home_lu, away_lineup_status=away_lu,
     )
 
     # Market anchoring: blend the raw model toward the de-vigged market so EV
@@ -222,7 +264,15 @@ def evaluate_game(
     # blend would create a feedback loop where the model talks itself into
     # bigger edges. Falls back to a fixed blend if config.model.market_blend is
     # still a scalar.
-    data_conf = compute_data_confidence(wp, home_pp, away_pp, home_tp, away_tp, config)
+    #
+    # `lineup_penalty` shaves confidence when either team's lineup is still
+    # projected at run time. We're betting on a roster guess in that case, so
+    # the model should defer more to the market -- which is exactly what a
+    # lower data confidence achieves through the blend tier table.
+    lineup_penalty = _lineup_confidence_penalty(home_lu, away_lu, config)
+    data_conf = compute_data_confidence(
+        wp, home_pp, away_pp, home_tp, away_tp, config, lineup_penalty=lineup_penalty,
+    )
     blend, blend_tier = resolve_market_blend(data_conf, config["model"])
     blended_home = blend * wp.home_win_prob + (1.0 - blend) * market_home
 
@@ -247,7 +297,8 @@ def evaluate_game(
         return analysis
 
     confidence = compute_confidence(
-        wp, home_pp, away_pp, home_tp, away_tp, evals[best_side].ev_pct, config
+        wp, home_pp, away_pp, home_tp, away_tp, evals[best_side].ev_pct, config,
+        lineup_penalty=lineup_penalty,
     )
 
     # Bet sizing tiers: classify the pick into Pass/Small/Standard/Strong and
@@ -276,6 +327,8 @@ def evaluate_game(
     analysis.tier = tier
     analysis.tier_multiplier = tier_mult
     analysis.tier_reasons = tier_reasons
+    analysis.home_lineup_status = home_lu
+    analysis.away_lineup_status = away_lu
     return analysis
 
 
@@ -325,6 +378,71 @@ def _classify_bet_tier(
         return "strong", 1.0, reasons
 
     return "standard", 1.0, reasons
+
+
+def _lineup_confidence_penalty(home_lu, away_lu, config: dict) -> float:
+    """Confidence points to subtract for projected lineups.
+
+    Counts one penalty unit per team whose lineup is projected (or
+    unavailable). Confirmed on both sides = 0 penalty.
+    """
+    cfg = config.get("lineup", {})
+    per_team = float(cfg.get("projected_confidence_penalty_per_team", 3.0))
+    n = 0
+    for lu in (home_lu, away_lu):
+        if lu is None or lu.status != "confirmed":
+            n += 1
+    return per_team * n
+
+
+def _build_lineup_status_provider(
+    mlb_client: MLBClient,
+    season: int,
+    config: dict,
+):
+    """Factory: per-slate cached LineupStatus provider.
+
+    One slate-wide pull of per-player season hitting stats (for the key-bats
+    list), then per-team lineup lookups are memoized -- and the underlying
+    feed-live call is itself game-keyed so each game's lineup is fetched
+    once for both sides. Returns None (disabled) if the pre-fetch is empty
+    or the feature is config-disabled.
+    """
+    from datetime import datetime, timezone
+    from mlb_value_bot.data.lineup_status import LineupStatus, get_lineup_status
+
+    if not config.get("lineup", {}).get("enabled", True):
+        return None
+
+    try:
+        per_player = mlb_client.get_per_player_hitting(season)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("lineup: per-player hitting pull failed (%s); disabling", exc)
+        return None
+    if not per_player:
+        log.info("lineup: no per-player hitting data; disabling")
+        return None
+
+    lineup_cache: dict[int, dict[str, list[int]]] = {}    # game_pk -> {home/away: [pids]}
+    status_cache: dict[tuple, LineupStatus] = {}          # (team, game_pk, side) -> status
+    now_utc = datetime.now(timezone.utc)
+
+    def provider(team_name: str, game_pk: int, side: str, first_pitch_iso: str | None) -> LineupStatus | None:
+        if not team_name or not game_pk or side not in ("home", "away"):
+            return None
+        key = (team_name, int(game_pk), side)
+        if key in status_cache:
+            return status_cache[key]
+        status = get_lineup_status(
+            team_name=team_name, game_pk=int(game_pk), side=side,
+            first_pitch_iso=first_pitch_iso, mlb=mlb_client,
+            per_player_hitting=per_player, config=config,
+            now_utc=now_utc, _lineup_cache=lineup_cache,
+        )
+        status_cache[key] = status
+        return status
+
+    return provider
 
 
 def _build_bullpen_status_provider(
@@ -396,6 +514,9 @@ def analyze_slate(
     # teams sharing the same recent matchup don't re-fetch the same boxscore.
     # Disable via config.bullpen_fatigue.enabled=false (e.g. for fast backtests).
     bp_provider = _build_bullpen_status_provider(mlb_client, season, as_of, config)
+    # Lineup status: one slate-wide pull of per-player hitting; per-game
+    # feed-live calls memoized so both sides share one fetch.
+    lu_provider = _build_lineup_status_provider(mlb_client, season, config)
 
     analyses: list[GameAnalysis] = []
     for sched in schedule:
@@ -403,6 +524,7 @@ def analyze_slate(
         analyses.append(evaluate_game(
             sched, matched, provider, season, as_of, config,
             bullpen_status_provider=bp_provider,
+            lineup_status_provider=lu_provider,
         ))
 
     # Rank: evaluable games by EV desc, skipped games last.

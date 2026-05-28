@@ -112,11 +112,12 @@ def test_model_favors_better_pitcher_and_breaks_down():
     scrub = _mk_pitcher("Scrub", 4.80)    # away weak starter
     res = compute_win_probability(home_t, away_t, ace, scrub)
 
-    # Components present and named. (`bullpen_fatigue` added 2026-05-28;
-    # it contributes 0 when no BullpenStatus is supplied, which is this test's
-    # path -- so the count grows by one but no math drift.)
+    # Components present and named. `bullpen_fatigue` and `lineup` were
+    # added 2026-05-28; both contribute 0 when no status is supplied (this
+    # test's path), so the count grows but no math drifts.
     names = {c.name for c in res.components}
-    assert names == {"starter", "bullpen", "bullpen_fatigue", "park", "home_field", "form"}
+    assert names == {"starter", "bullpen", "bullpen_fatigue", "lineup",
+                     "park", "home_field", "form"}
     # Big pitching edge + HFA -> home clearly favored.
     assert res.home_win_prob > res.base_prob
     assert res.home_win_prob > 0.55
@@ -292,6 +293,77 @@ def test_match_odds_picks_correct_day_in_a_series():
     assert _match_odds(sched, [tomorrow]) is None
     # No matchup at all -> None.
     assert _match_odds(sched, []) is None
+
+
+# --- Lineup confirmation component (2026-05-28) -----------------------------
+def test_lineup_status_short_label():
+    """short_label() reflects status + key bats present."""
+    from mlb_value_bot.data.lineup_status import (
+        LineupStatus, STATUS_CONFIRMED, STATUS_PROJECTED, STATUS_UNAVAILABLE,
+    )
+    s = LineupStatus(team="X", status=STATUS_UNAVAILABLE)
+    assert "unavailable" in s.short_label()
+    s = LineupStatus(team="X", status=STATUS_PROJECTED)
+    assert "projected" in s.short_label()
+    s = LineupStatus(team="X", status=STATUS_CONFIRMED,
+                     key_bats_total=3, key_bats_present=2)
+    assert "2/3" in s.short_label()
+
+
+def test_lineup_delta_only_when_both_confirmed():
+    """The lineup component is signed by missing-bats diff and clamped tight.
+
+    + favors home when AWAY has more key bats missing.
+    """
+    from mlb_value_bot.analysis.win_probability import compute_win_probability
+    from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED, STATUS_PROJECTED
+    ht = _mk_team("H", 0.5, 60, 100, 4.0)
+    at = _mk_team("A", 0.5, 60, 100, 4.0)
+    hp = _mk_pitcher("H SP", 4.0)
+    ap = _mk_pitcher("A SP", 4.0)
+
+    # Home all in (0 missing); Away 2 of 3 key bats missing -> tilts toward home.
+    home_lu = LineupStatus(team="H", status=STATUS_CONFIRMED,
+                           key_bats_total=3, key_bats_present=3)
+    away_lu = LineupStatus(team="A", status=STATUS_CONFIRMED,
+                           key_bats_total=3, key_bats_present=1,
+                           missing_key_bats=["Star1", "Star2"])
+    res = compute_win_probability(ht, at, hp, ap,
+                                  home_lineup_status=home_lu,
+                                  away_lineup_status=away_lu)
+    lu = next(c for c in res.components if c.name == "lineup")
+    assert lu.available
+    # (2 - 0) * 0.005 = 0.010, within +/- 0.02 clamp.
+    assert approx(lu.raw_delta, 0.010, tol=1e-6)
+
+    # Projected on either side -> component contributes 0.
+    proj_lu = LineupStatus(team="A", status=STATUS_PROJECTED, key_bats_total=3)
+    res2 = compute_win_probability(ht, at, hp, ap,
+                                   home_lineup_status=home_lu,
+                                   away_lineup_status=proj_lu)
+    lu2 = next(c for c in res2.components if c.name == "lineup")
+    assert not lu2.available
+    assert lu2.raw_delta == 0.0
+
+
+def test_lineup_penalty_drops_data_confidence():
+    """A non-zero lineup_penalty subtracts confidence points (data + full)."""
+    from mlb_value_bot.analysis.win_probability import (
+        compute_data_confidence, compute_confidence,
+    )
+    ht = _mk_team("H", 0.5, 60, 100, 4.0)
+    at = _mk_team("A", 0.5, 60, 100, 4.0)
+    hp = _mk_pitcher("H SP", 4.0)
+    ap = _mk_pitcher("A SP", 4.0)
+    res = compute_win_probability(ht, at, hp, ap)
+
+    base = compute_data_confidence(res, hp, ap, ht, at)
+    penalized = compute_data_confidence(res, hp, ap, ht, at, lineup_penalty=8.0)
+    assert penalized == round(max(0.0, base - 8.0), 1)
+
+    base_full = compute_confidence(res, hp, ap, ht, at, recommended_ev=0.05)
+    pen_full = compute_confidence(res, hp, ap, ht, at, recommended_ev=0.05, lineup_penalty=8.0)
+    assert pen_full == round(max(0.0, base_full - 8.0), 1)
 
 
 # --- Bullpen fatigue component (2026-05-28) ---------------------------------

@@ -393,6 +393,75 @@ class MLBClient:
                 })
         return out
 
+    # -- Lineups + per-player hitting (for lineup confirmation) ---------------
+    def get_game_lineup(self, game_pk: int) -> dict[str, list[int]]:
+        """Confirmed batting order for one game from the v1.1 live feed.
+
+        Returns {"home": [player_id, ...], "away": [player_id, ...]} where each
+        list is the 9-deep batting order in the order MLB published it. Empty
+        list = lineup not yet posted (typical for games still > 2h from first
+        pitch). {} on a hard API failure -- callers degrade to "projected".
+        """
+        try:
+            data = self._get(f"/v1.1/game/{int(game_pk)}/feed/live")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("lineup feed fetch failed for game %s (%s)", game_pk, exc)
+            return {}
+
+        boxscore = (data.get("liveData") or {}).get("boxscore") or {}
+        out: dict[str, list[int]] = {}
+        for side in ("home", "away"):
+            team = (boxscore.get("teams") or {}).get(side) or {}
+            order = team.get("battingOrder") or []
+            out[side] = [int(pid) for pid in order if pid]
+        return out
+
+    def get_per_player_hitting(self, season: int) -> dict[str, list[dict]]:
+        """Per-team list of hitters with their season stats.
+
+        Same shape as get_per_pitcher_reliever_stats but for hitting. Used to
+        identify each team's "key bats" (top N by OPS, with a PA floor so a
+        cup-of-coffee hot stretch can't elevate a fringe player). Returns {}
+        on failure.
+
+        Output: {canonical_team: [{player_id, name, ops, pa, ab}, ...]}
+        sorted by OPS descending (best bats first).
+        """
+        try:
+            data = self._get(
+                "/v1/stats",
+                {"stats": "season", "group": "hitting", "season": int(season),
+                 "sportId": 1, "gameType": "R", "playerPool": "all", "limit": 3000},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("per-player hitting stats fetch failed (%s)", exc)
+            return {}
+
+        by_team: dict[str, list[dict]] = {}
+        for grp in data.get("stats", []):
+            for sp in grp.get("splits", []):
+                team = normalize_team(sp.get("team", {}).get("name"))
+                st = sp.get("stat", {})
+                player = sp.get("player") or {}
+                try:
+                    pa = int(st.get("plateAppearances") or 0)
+                    ops = float(st.get("ops"))
+                except (TypeError, ValueError):
+                    continue
+                if not team or pa <= 0:
+                    continue
+                by_team.setdefault(team, []).append({
+                    "player_id": int(player.get("id")) if player.get("id") else None,
+                    "name": player.get("fullName") or "?",
+                    "ops": ops,
+                    "pa": pa,
+                    "ab": int(st.get("atBats") or 0),
+                })
+        # Sort each team's hitters by OPS descending.
+        for team in by_team:
+            by_team[team].sort(key=lambda r: r["ops"], reverse=True)
+        return by_team
+
     def get_team_bullpen_era(self, season: int) -> dict[str, float]:
         """{canonical_team: IP-weighted reliever ERA}, relievers := GS/G < 0.5.
 

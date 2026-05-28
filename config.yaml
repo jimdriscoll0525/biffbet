@@ -97,6 +97,14 @@ model:
   bullpen_fatigue_scale: 0.012
   bullpen_fatigue_clamp: 0.03
 
+  # --- Lineup (key bats in / out of today's confirmed batting order) --------
+  # Each missing key bat tilts toward the opponent by this much; net delta is
+  # (away_missing - home_missing) * scale, clamped to +/- lineup_clamp. Only
+  # applied when BOTH teams' lineups are confirmed -- projected -> 0 + a
+  # confidence penalty instead (config.lineup.*).
+  lineup_per_missing_bat_scale: 0.005
+  lineup_clamp: 0.02
+
   # Recent-form scaling (see analysis/win_probability.py).
   form_scale: 0.5
   # Recent xwOBA/CSW is regressed toward the pitcher's SEASON value to damp
@@ -145,6 +153,7 @@ model:
     starter: 1.0          # SP matchup (log5 of pitcher win-equivalents)
     bullpen: 1.0          # relief corps FIP differential
     bullpen_fatigue: 1.0  # leverage-arm availability today (added 2026-05-28)
+    lineup: 1.0           # key bats in / out of today's confirmed lineup
     park: 0.25            # ballpark run environment (mostly a totals factor;
                           # small ML effect, kept low + tunable on purpose)
     home_field: 1.0       # constant home-field edge
@@ -278,6 +287,23 @@ bullpen_fatigue:
   pitch_threshold_unavailable: 35      # pitches yesterday -> unavailable today
   appearance_threshold: 3              # games in last 3 days -> unavailable
   lookback_days: 5                     # window to find the last 3 finalized games
+
+# -----------------------------------------------------------------------------
+# Lineup confirmation (added 2026-05-28)
+# Pulls each team's published batting order from the MLB v1.1 game feed once
+# it's posted (~2h before first pitch). Identifies each team's "key bats"
+# (top N by season OPS, with a PA floor) and tilts the win prob toward the
+# team with fewer key bats missing. See data/lineup_status.py.
+# -----------------------------------------------------------------------------
+lineup:
+  enabled: true
+  hours_before_first_pitch_to_check: 3.0   # before this, mark projected, save API calls
+  key_bats_top_n: 3                        # per team, by highest season OPS
+  min_pa_for_key_bats: 100                 # sample-size floor (e.g. ~25 games of starts)
+  # Confidence penalty (subtracted from data + full confidence) applied per
+  # team whose lineup isn't yet confirmed. Two projected sides = penalty x 2.
+  # Conservative: a projected lineup is real info loss but not catastrophic.
+  projected_confidence_penalty_per_team: 3.0
 
 logging:
   level: "INFO"

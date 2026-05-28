@@ -118,6 +118,8 @@ def compute_win_probability(
     config: dict | None = None,
     home_bullpen_status: "BullpenStatus | None" = None,
     away_bullpen_status: "BullpenStatus | None" = None,
+    home_lineup_status: "LineupStatus | None" = None,
+    away_lineup_status: "LineupStatus | None" = None,
 ) -> WinProbabilityResult:
     """Run the model and return the home win probability with full breakdown.
 
@@ -199,6 +201,35 @@ def compute_win_probability(
         bp_fatigue_note = "bullpen status unavailable"
         bp_fatigue_avail = False
     components.append(_mk("bullpen_fatigue", bp_fatigue_delta, bp_weight, bp_fatigue_note, bp_fatigue_avail))
+
+    # 3c) LINEUP — confirmed-vs-projected lineup status and key-bats out.
+    # Tilts toward whichever team has FEWER key bats missing from today's
+    # confirmed lineup. Returns 0 with note "lineup projected" when either
+    # side isn't confirmed yet; the projected-state confidence penalty is
+    # applied separately in compute_data_confidence / compute_confidence.
+    lu_scale = float(m.get("lineup_per_missing_bat_scale", 0.005))
+    lu_clamp = float(m.get("lineup_clamp", 0.02))
+    lu_weight = float(weights.get("lineup", 1.0))
+    if (
+        home_lineup_status is not None and home_lineup_status.is_confirmed
+        and away_lineup_status is not None and away_lineup_status.is_confirmed
+    ):
+        h_missing = home_lineup_status.missing_count
+        a_missing = away_lineup_status.missing_count
+        lu_delta = clamp((a_missing - h_missing) * lu_scale, -lu_clamp, lu_clamp)
+        lu_note = (
+            f"H {home_lineup_status.short_label()}; "
+            f"A {away_lineup_status.short_label()}"
+        )
+        lu_avail = True
+    else:
+        lu_delta = 0.0
+        if home_lineup_status is not None and away_lineup_status is not None:
+            lu_note = f"H {home_lineup_status.short_label()}; A {away_lineup_status.short_label()}"
+        else:
+            lu_note = "lineup status unavailable"
+        lu_avail = False
+    components.append(_mk("lineup", lu_delta, lu_weight, lu_note, lu_avail))
 
     # 4) PARK — run environment x offense gap. Small, mostly a totals factor.
     off_home = home_team.offense_wrc_plus
@@ -290,6 +321,7 @@ def compute_confidence(
     away_team: TeamProfile,
     recommended_ev: float,
     config: dict | None = None,
+    lineup_penalty: float = 0.0,
 ) -> float:
     """Composite 0-100 confidence in the recommendation.
 
@@ -355,6 +387,10 @@ def compute_confidence(
     )
     total_weight = sum(weights.values())
     confidence = 100.0 * score / total_weight if total_weight else 0.0
+    # Same lineup-penalty mechanic as compute_data_confidence: a projected
+    # lineup is a measurable confidence gap regardless of EV magnitude. Floor
+    # at 0 so we never report a negative score.
+    confidence = max(0.0, confidence - lineup_penalty)
     result.confidence = round(confidence, 1)
     return result.confidence
 
@@ -367,6 +403,7 @@ def compute_data_confidence(
     home_team: TeamProfile,
     away_team: TeamProfile,
     config: dict | None = None,
+    lineup_penalty: float = 0.0,
 ) -> float:
     """0-100 confidence in the DATA INPUTS, with no EV dependency.
 
@@ -419,7 +456,10 @@ def compute_data_confidence(
     if denom <= 0:
         return 0.0
     score = (w_data * data_completeness + w_samp * sample_size + w_agree * component_agreement) / denom
-    return round(100.0 * score, 1)
+    # `lineup_penalty` subtracts confidence points when today's lineups
+    # haven't been confirmed yet (we're effectively betting on a projected
+    # roster). Floored at 0 so a heavy penalty + low base doesn't go negative.
+    return round(max(0.0, 100.0 * score - lineup_penalty), 1)
 
 
 def resolve_market_blend(data_confidence: float, model_config: dict) -> tuple[float, str]:
