@@ -295,6 +295,70 @@ def test_match_odds_picks_correct_day_in_a_series():
     assert _match_odds(sched, []) is None
 
 
+# --- Multi-window recent form (2026-05-28) ----------------------------------
+def test_blended_form_uses_all_windows_when_present():
+    """All three windows present + above sample-size floor -> weighted blend."""
+    from mlb_value_bot.analysis.win_probability import _blended_form_xwoba
+    p = PitcherProfile(player_id=1, name="P",
+                       recent_xwoba_con_14d=0.300, recent_bip_14d=40,
+                       recent_xwoba_con_30d=0.320, recent_bip_30d=80,
+                       xwoba_con=0.340)
+    cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
+                     "form_min_bip": {"d14": 25, "d30": 60}}}
+    blended, note = _blended_form_xwoba(p, cfg)
+    # 0.5*0.300 + 0.3*0.320 + 0.2*0.340 = 0.150 + 0.096 + 0.068 = 0.314
+    assert approx(blended, 0.314, tol=1e-6)
+    assert "14d=" in note and "30d=" in note and "season=" in note
+
+
+def test_blended_form_drops_undersample_windows_and_renormalizes():
+    """A window below its BIP floor is dropped; remaining weights renormalize."""
+    from mlb_value_bot.analysis.win_probability import _blended_form_xwoba
+    p = PitcherProfile(player_id=1, name="P",
+                       recent_xwoba_con_14d=0.300, recent_bip_14d=5,   # below 25 floor
+                       recent_xwoba_con_30d=0.320, recent_bip_30d=80,
+                       xwoba_con=0.340)
+    cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
+                     "form_min_bip": {"d14": 25, "d30": 60}}}
+    blended, note = _blended_form_xwoba(p, cfg)
+    # 14d dropped; 30d (0.3) + season (0.2) renormalize to (0.6, 0.4):
+    # 0.6*0.320 + 0.4*0.340 = 0.192 + 0.136 = 0.328
+    assert approx(blended, 0.328, tol=1e-6)
+    assert "14d" not in note  # 14d not in label since it was dropped
+
+
+def test_blended_form_returns_none_when_nothing_available():
+    from mlb_value_bot.analysis.win_probability import _blended_form_xwoba
+    p = PitcherProfile(player_id=1, name="P")  # all None
+    cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
+                     "form_min_bip": {"d14": 25, "d30": 60}}}
+    blended, _ = _blended_form_xwoba(p, cfg)
+    assert blended is None
+
+
+def test_form_delta_prefers_multi_window_when_available():
+    """When the new per-window fields are present, _form_delta uses them
+    instead of the legacy recent_xwoba_con + season blend."""
+    from mlb_value_bot.analysis.win_probability import _form_delta
+    home = PitcherProfile(player_id=1, name="H",
+                          recent_xwoba_con=0.999,             # legacy field (would dominate)
+                          recent_xwoba_con_14d=0.290, recent_bip_14d=40,
+                          recent_xwoba_con_30d=0.310, recent_bip_30d=80,
+                          xwoba_con=0.330)
+    away = PitcherProfile(player_id=2, name="A",
+                          recent_xwoba_con=0.001,             # legacy field
+                          recent_xwoba_con_14d=0.360, recent_bip_14d=40,
+                          recent_xwoba_con_30d=0.345, recent_bip_30d=80,
+                          xwoba_con=0.340)
+    cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
+                     "form_min_bip": {"d14": 25, "d30": 60}}}
+    delta, note, avail = _form_delta(home, away, scale=0.5, config=cfg)
+    # Multi-window blend favors HOME (lower xwOBA). Legacy fields would flip it.
+    assert avail
+    assert delta > 0
+    assert "xwOBAcon H" in note and "14d=0.290" in note
+
+
 # --- Lineup confirmation component (2026-05-28) -----------------------------
 def test_lineup_status_short_label():
     """short_label() reflects status + key bats present."""

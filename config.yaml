@@ -109,8 +109,23 @@ model:
   form_scale: 0.5
   # Recent xwOBA/CSW is regressed toward the pitcher's SEASON value to damp
   # hot/cold-streak noise: blended = form_recent_weight*recent + (1-w)*season.
-  # Falls back to recent-only when the season value is unavailable.
+  # Used as the legacy fallback when the multi-window fields aren't populated.
   form_recent_weight: 0.6
+  # Multi-window form blend (added 2026-05-28). Slices the same 30d Statcast
+  # pull at 14 days, 30 days, and uses the season xwOBA-on-contact as anchor.
+  # Weights are NORMALIZED at use time, so missing windows redistribute weight
+  # to the available ones (rotation skips / IL stints don't break form).
+  #   14d 50% / 30d 30% / season 20%  -- recent matters more, season prevents drift.
+  form_windows:
+    d14: 0.5
+    d30: 0.3
+    season: 0.2
+  # Sample-size floors: BIP (batted balls in play) required for the window to
+  # contribute. Below this, the window is dropped and weight redistributes.
+  # 14d default ~25 BIP (one start of contact); 30d default ~60 BIP (~3 starts).
+  form_min_bip:
+    d14: 25
+    d30: 60
 
   # --- Market anchoring (calibration) ---------------------------------------
   # The betting market is the sharpest public probability estimate. Rather than

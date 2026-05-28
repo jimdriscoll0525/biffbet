@@ -257,6 +257,7 @@ def compute_win_probability(
     form_delta, form_note, form_avail = _form_delta(
         home_pitcher, away_pitcher,
         float(m.get("form_scale", 0.5)), float(m.get("form_recent_weight", 0.6)),
+        config=config,
     )
     components.append(_mk("form", form_delta, weights["form"], form_note, form_avail))
 
@@ -291,16 +292,77 @@ def _regress_recent(recent: float | None, season: float | None, w_recent: float)
     return w_recent * recent + (1.0 - w_recent) * season
 
 
+def _blended_form_xwoba(p: PitcherProfile, config: dict) -> tuple[float | None, str]:
+    """Weighted 14d / 30d / season blend of xwOBA-on-contact for one pitcher.
+
+    Each window only contributes if it has enough sample (BIP floor for the
+    two recent windows; season is always trusted if present). Missing windows
+    have their weight redistributed to the available ones, so the blend stays
+    well-formed even when a pitcher is fresh off the IL or skipped a turn.
+
+    Returns (None, note) when no window has usable data -- caller falls back
+    to the legacy single-window logic.
+    """
+    m = config["model"]
+    fw = m.get("form_windows", {})
+    min_bip = m.get("form_min_bip", {})
+
+    candidates: list[tuple[str, float, float]] = []  # (label, value, weight)
+    w14 = float(fw.get("d14", 0.5))
+    w30 = float(fw.get("d30", 0.3))
+    wseason = float(fw.get("season", 0.2))
+    bip14_min = int(min_bip.get("d14", 25))
+    bip30_min = int(min_bip.get("d30", 60))
+
+    if p.recent_xwoba_con_14d is not None and p.recent_bip_14d >= bip14_min:
+        candidates.append(("14d", p.recent_xwoba_con_14d, w14))
+    if p.recent_xwoba_con_30d is not None and p.recent_bip_30d >= bip30_min:
+        candidates.append(("30d", p.recent_xwoba_con_30d, w30))
+    if p.xwoba_con is not None:
+        candidates.append(("season", p.xwoba_con, wseason))
+
+    if not candidates:
+        return None, ""
+    total_w = sum(w for _, _, w in candidates)
+    if total_w <= 0:
+        return None, ""
+    blended = sum(v * w for _, v, w in candidates) / total_w
+    # Compact note: which windows fed the blend, with their values.
+    label = "/".join(f"{name}={val:.3f}" for name, val, _ in candidates)
+    return blended, label
+
+
 def _form_delta(home: PitcherProfile, away: PitcherProfile, scale: float,
-                recent_weight: float = 0.6) -> tuple[float, str, bool]:
-    """Recent-form delta from pitchers' last-5-start Statcast, each regressed
-    toward the pitcher's season rate (+ favors home)."""
-    # Prefer xwOBA-on-contact (lower = better); home advantage when home's
-    # (season-regressed) recent xwOBA is lower than away's.
+                recent_weight: float = 0.6,
+                config: dict | None = None) -> tuple[float, str, bool]:
+    """Recent-form delta. Prefers the multi-window xwOBA-on-contact blend
+    (14d / 30d / season, configurable in model.form_windows); falls back to
+    the legacy `recent_xwoba_con` + season blend when the new per-window
+    fields aren't populated (e.g. tests that construct PitcherProfile by
+    hand, or older cached pulls). + favors home (away's xwOBA is higher).
+    """
+    config = config or load_config()
+
+    # Multi-window path (added 2026-05-28): only take it when BOTH sides have
+    # at least one of the new per-window fields populated. Otherwise fall
+    # through to the legacy single-window path so old call sites (and tests
+    # that hand-build PitcherProfile with only the legacy fields) behave
+    # exactly as they used to.
+    h_has_window = home.recent_xwoba_con_14d is not None or home.recent_xwoba_con_30d is not None
+    a_has_window = away.recent_xwoba_con_14d is not None or away.recent_xwoba_con_30d is not None
+    if h_has_window and a_has_window:
+        h_xw_mw, h_note_mw = _blended_form_xwoba(home, config)
+        a_xw_mw, a_note_mw = _blended_form_xwoba(away, config)
+        if h_xw_mw is not None and a_xw_mw is not None:
+            diff = a_xw_mw - h_xw_mw  # + favors home
+            delta = clamp(diff * scale, -0.05, 0.05)
+            return delta, f"xwOBAcon H {h_note_mw} | A {a_note_mw}", True
+
+    # Legacy path: single-window recent regressed toward season.
     h_xw = _regress_recent(home.recent_xwoba_con, home.xwoba_con, recent_weight)
     a_xw = _regress_recent(away.recent_xwoba_con, away.xwoba_con, recent_weight)
     if h_xw is not None and a_xw is not None:
-        diff = a_xw - h_xw  # + favors home
+        diff = a_xw - h_xw
         delta = clamp(diff * scale, -0.05, 0.05)
         return delta, f"recent xwOBAcon(reg) H={h_xw:.3f} A={a_xw:.3f}", True
     h_csw = _regress_recent(home.recent_csw_pct, home.csw_pct, recent_weight)

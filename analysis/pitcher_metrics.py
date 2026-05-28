@@ -76,10 +76,18 @@ class PitcherProfile:
     statcast_rate: float | None = None  # runs/9 derived from xwoba_against (xFIP fallback)
     ip_is_estimated: bool = False       # True if IP was inferred from pitch count
 
-    # Recent form
+    # Recent form (legacy single-window: last N starts within ~30 days)
     recent_csw_pct: float | None = None
     recent_xwoba_con: float | None = None
     recent_starts: int = 0
+
+    # Recent form, time-window split (added 2026-05-28). Two windows sliced
+    # off the same 30d Statcast pull -- no extra API cost. Used by the
+    # win-probability model's multi-window form blend (14d / 30d / season).
+    recent_xwoba_con_14d: float | None = None
+    recent_bip_14d: int = 0    # batted balls in play (sample-size guard)
+    recent_xwoba_con_30d: float | None = None
+    recent_bip_30d: int = 0
 
     has_season_stats: bool = False
     has_statcast: bool = False
@@ -262,6 +270,26 @@ def _xwoba_against(df: pd.DataFrame) -> tuple[float | None, int]:
     return float(num[mask].sum() / total_denom), pa
 
 
+def _window_stats(df: pd.DataFrame, days: int, as_of: date) -> tuple[float | None, int]:
+    """xwOBA-on-contact + BIP count over the last `days` days ending `as_of`.
+
+    Slices the already-fetched 30d (or larger) dataframe by `game_date`. Returns
+    (xwoba_con, bip_count); xwoba_con is None when there's no batted-ball data
+    in the window. bip_count doubles as the sample-size guard upstream.
+    """
+    if df.empty or "game_date" not in df.columns:
+        return None, 0
+    cutoff = as_of - timedelta(days=days)
+    dates = pd.to_datetime(df["game_date"], errors="coerce")
+    window = df[dates.dt.date >= cutoff]
+    if window.empty:
+        return None, 0
+    rates = _statcast_rates(window)
+    xwoba = rates.get("xwoba_con")
+    bip = int((window["description"].astype(str) == "hit_into_play").sum())
+    return xwoba, bip
+
+
 def _recent_form(df: pd.DataFrame, last_n_starts: int = 5) -> dict[str, float | int | None]:
     """CSW% / xwOBA-on-contact over the pitcher's most recent N start dates."""
     if df.empty or "game_date" not in df.columns:
@@ -348,6 +376,16 @@ def build_pitcher_profile(
             profile.recent_csw_pct = form["recent_csw_pct"]
             profile.recent_xwoba_con = form["recent_xwoba_con"]
             profile.recent_starts = int(form["recent_starts"] or 0)
+
+            # Multi-window form (added 2026-05-28): slice the same 30d pull at
+            # 14 and 30 days for the weighted-window blend in win_probability.
+            # No extra API hit; the data is already in `sc_recent`.
+            xw14, bip14 = _window_stats(sc_recent, 14, as_of)
+            xw30, bip30 = _window_stats(sc_recent, 30, as_of)
+            profile.recent_xwoba_con_14d = xw14
+            profile.recent_bip_14d = bip14
+            profile.recent_xwoba_con_30d = xw30
+            profile.recent_bip_30d = bip30
 
     log.debug(
         "Pitcher %s: season=%s statcast=%s completeness=%.2f",
