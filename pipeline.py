@@ -61,6 +61,10 @@ class GameAnalysis:
     # Sharp/square market intelligence (added 2026-05-28). Used to populate
     # reasoning["market_intel"] (UI agree/fade chip + breakdown).
     market_intel: "object | None" = None
+    # Projected score (display-only middle-ground from #6, added 2026-05-28).
+    # The win-prob model is UNCHANGED -- this is purely an additional output
+    # so users can see the run-environment tilt in concrete terms.
+    projected_score: "object | None" = None
 
     @property
     def best_eval(self) -> SideEvaluation | None:
@@ -99,6 +103,17 @@ class GameAnalysis:
             data["lineup"] = {
                 "home": _lineup_to_dict(self.home_lineup_status),
                 "away": _lineup_to_dict(self.away_lineup_status),
+            }
+        # Projected score (run-environment display): home_runs / away_runs /
+        # total / pitcher basis. Pure additional output; the win-prob model
+        # is unchanged. Omitted when any input was missing.
+        if self.projected_score is not None and self.projected_score.available:
+            ps = self.projected_score
+            data["projected_score"] = {
+                "home_runs": ps.home_runs,
+                "away_runs": ps.away_runs,
+                "total": ps.total,
+                "pitcher_basis": ps.pitcher_basis,
             }
         # Sharp/square market intel: sharp consensus, square consensus, the
         # gap between them, and dispersion. UI uses this for the "Sharps
@@ -273,6 +288,11 @@ def evaluate_game(
         home_lineup_status=home_lu, away_lineup_status=away_lu,
     )
 
+    # Projected score (display-only -- the moneyline EV below is computed off
+    # `wp.home_win_prob` exactly as before, this is purely additional output).
+    from mlb_value_bot.analysis.run_environment import projected_score as _proj_score
+    proj_score = _proj_score(home_tp, away_tp, home_pp, away_pp, config)
+
     # Market anchoring: blend the raw model toward the de-vigged market so EV
     # reflects a *bounded tilt* off the sharp consensus, not raw model
     # overconfidence (a standalone heuristic otherwise "finds" edges everywhere).
@@ -440,6 +460,7 @@ def evaluate_game(
     analysis.home_lineup_status = home_lu
     analysis.away_lineup_status = away_lu
     analysis.market_intel = market_intel
+    analysis.projected_score = proj_score
     return analysis
 
 

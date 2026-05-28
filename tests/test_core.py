@@ -295,6 +295,64 @@ def test_match_odds_picks_correct_day_in_a_series():
     assert _match_odds(sched, []) is None
 
 
+# --- Projected score (run-environment display, 2026-05-28) -----------------
+def test_projected_score_basic():
+    """Ace pitcher reduces opposing team's projected runs."""
+    from mlb_value_bot.analysis.run_environment import projected_score
+
+    ht = _mk_team("H", 0.5, 60, 100, 4.0, pf=100)   # avg offense, avg bullpen, avg park
+    at = _mk_team("A", 0.5, 60, 100, 4.0, pf=100)   # same
+    cfg = {"league": {"runs_per_game": 4.5, "avg_xfip": 4.0}, "model": {}}
+
+    # Both pitchers league average -> ~4.5 each (regression to mean).
+    even_h = _mk_pitcher("H_avg", 4.0)
+    even_a = _mk_pitcher("A_avg", 4.0)
+    ps = projected_score(ht, at, even_h, even_a, cfg)
+    assert ps.available
+    assert approx(ps.home_runs, 4.5, tol=0.5)
+    assert approx(ps.away_runs, 4.5, tol=0.5)
+
+    # Home faces an ace (away SP rate 3.0) -> home RS drops.
+    ace_a = _mk_pitcher("A_ace", 3.0)
+    ps_vs_ace = projected_score(ht, at, even_h, ace_a, cfg)
+    assert ps_vs_ace.home_runs < ps.home_runs
+    # Away faces an average SP (home), so its RS unchanged.
+    assert approx(ps_vs_ace.away_runs, ps.away_runs, tol=1e-6)
+
+
+def test_projected_score_park_factor_lifts_both_teams():
+    """Coors-like park (factor 112) bumps RS for both teams."""
+    from mlb_value_bot.analysis.run_environment import projected_score
+
+    neutral_h = _mk_team("H", 0.5, 60, 100, 4.0, pf=100)
+    coors_h = _mk_team("H", 0.5, 60, 100, 4.0, pf=112)
+    at = _mk_team("A", 0.5, 60, 100, 4.0, pf=100)
+    even_h = _mk_pitcher("H_avg", 4.0)
+    even_a = _mk_pitcher("A_avg", 4.0)
+    cfg = {"league": {"runs_per_game": 4.5, "avg_xfip": 4.0}, "model": {}}
+
+    neutral = projected_score(neutral_h, at, even_h, even_a, cfg)
+    coors = projected_score(coors_h, at, even_h, even_a, cfg)
+    assert coors.home_runs > neutral.home_runs
+    assert coors.away_runs > neutral.away_runs
+
+
+def test_projected_score_degrades_when_inputs_missing():
+    """Missing offense / pitcher rate -> available=False, no crash."""
+    from mlb_value_bot.analysis.run_environment import projected_score
+    from mlb_value_bot.analysis.team_metrics import TeamProfile
+
+    no_offense = TeamProfile(team="H", raw_winpct=0.5, games=60,
+                             offense_wrc_plus=None, bullpen_fip=4.0, park_factor=100)
+    at = _mk_team("A", 0.5, 60, 100, 4.0, pf=100)
+    even_h = _mk_pitcher("H_avg", 4.0)
+    even_a = _mk_pitcher("A_avg", 4.0)
+    cfg = {"league": {"runs_per_game": 4.5, "avg_xfip": 4.0}, "model": {}}
+    ps = projected_score(no_offense, at, even_h, even_a, cfg)
+    assert not ps.available
+    assert ps.home_runs is None and ps.away_runs is None
+
+
 # --- Sharp/square market intel (2026-05-28) ---------------------------------
 def test_market_intel_sharp_minus_square_signed():
     """sharp_minus_square is + when sharps' home prob > squares' home prob."""
