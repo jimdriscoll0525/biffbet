@@ -169,8 +169,12 @@ def _rec_rows(since: str | None) -> list[dict]:
 def push_recommendations(url: str, key: str, since: str | None = None) -> int:
     rows = _rec_rows(since)
     for start in range(0, len(rows), _BATCH):
+        # on_conflict=date,game_id matches the unique constraint
+        # `recommendations_date_game_id_key`. Previously this used the per-side
+        # key which created duplicate rows whenever the engine's best side
+        # flipped between runs (see supabase/schema.sql 2026-05-28 migration).
         _post(url, key, "recommendations", rows[start:start + _BATCH],
-              on_conflict="date,game_id,recommended_side")
+              on_conflict="date,game_id")
     log.info("Synced %d recommendation(s) to Supabase.", len(rows))
     return len(rows)
 
@@ -261,8 +265,9 @@ def pull_recommendations() -> int:
                    confidence, reasoning_json, opening_line, closing_line, clv_pct, result,
                    profit_loss, is_value, created_at, updated_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(date, game_id, recommended_side) DO UPDATE SET
+                ON CONFLICT(date, game_id) DO UPDATE SET
                   home_team=excluded.home_team, away_team=excluded.away_team,
+                  recommended_side=excluded.recommended_side,
                   model_prob=excluded.model_prob,
                   market_prob_devigged=excluded.market_prob_devigged,
                   american_odds=excluded.american_odds, decimal_odds=excluded.decimal_odds,

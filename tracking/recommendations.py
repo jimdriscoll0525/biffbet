@@ -58,11 +58,10 @@ CREATE TABLE IF NOT EXISTS recommendations (
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Add columns introduced after the original schema. SQLite can only ADD,
-    never DROP/RENAME via ALTER, so each migration is an idempotent ADD COLUMN.
-
-    Order matters: we check pragma_table_info BEFORE the ADD, so re-running is
-    a no-op on already-migrated DBs (no IF NOT EXISTS on ADD COLUMN in SQLite).
+    """Add columns / indexes introduced after the original schema. SQLite can
+    only ADD COLUMN via ALTER (no DROP/RENAME), so each migration is an
+    idempotent ADD; constraint-shaped migrations use CREATE UNIQUE INDEX IF
+    NOT EXISTS, which acts as a unique constraint for ON CONFLICT purposes.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(recommendations)")}
     if "is_value" not in cols:
@@ -70,6 +69,34 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # saved by the old save_value_bets); default to 1 backfills them correctly.
         conn.execute("ALTER TABLE recommendations ADD COLUMN is_value INTEGER NOT NULL DEFAULT 1")
         log.info("Migrated recommendations: added is_value column (existing rows -> 1).")
+
+    # 2026-05-28: dedupe + tighten unique key to (date, game_id). One row per
+    # game per date. The original schema's UNIQUE(date, game_id, side) let the
+    # sync push create duplicate rows when the engine's best side flipped
+    # between runs. We dedupe by keeping the most authoritative row per game
+    # (bets before analyses; most-recently updated within a tier), then add
+    # the new unique index. The OLD UNIQUE constraint stays in the CREATE TABLE
+    # definition but is now a strict superset of the new one (never violated).
+    indexes = {row["name"] for row in conn.execute("PRAGMA index_list(recommendations)")}
+    if "recommendations_date_game_uidx" not in indexes:
+        conn.execute(
+            """
+            DELETE FROM recommendations
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY date, game_id
+                        ORDER BY is_value DESC, updated_at DESC, id DESC
+                    ) AS rn FROM recommendations
+                ) WHERE rn > 1
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS recommendations_date_game_uidx "
+            "ON recommendations(date, game_id)"
+        )
+        log.info("Migrated recommendations: deduped + added (date, game_id) unique index.")
 
 
 @dataclass
