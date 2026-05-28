@@ -295,6 +295,86 @@ def test_match_odds_picks_correct_day_in_a_series():
     assert _match_odds(sched, []) is None
 
 
+# --- In-progress games are not bettable (2026-05-28) -----------------------
+def test_in_progress_games_are_not_playable():
+    """A game whose detailedState is 'In Progress' (or Final, etc.) must NOT
+    be treated as playable -- live moneyline prices reflect the in-game
+    score, not the pre-game matchup, and the model is pre-game only.
+    """
+    from mlb_value_bot.data.mlb_client import ScheduledGame, ProbablePitcher
+
+    def _mk(status):
+        return ScheduledGame(
+            game_id=1, game_date="2026-05-28", status=status,
+            home_team="H", away_team="A",
+            home_pitcher=ProbablePitcher(player_id=None, name=None),
+            away_pitcher=ProbablePitcher(player_id=None, name=None),
+        )
+
+    # Bettable: hasn't started yet.
+    assert _mk("Scheduled").is_playable
+    assert _mk("Pre-Game").is_playable
+    assert _mk("Warmup").is_playable
+    # NOT bettable: in progress -- live prices reflect score, not matchup.
+    assert not _mk("In Progress").is_playable
+    assert not _mk("Manager Challenge").is_playable
+    assert not _mk("Delayed").is_playable
+    # NOT bettable: already finished.
+    assert not _mk("Final").is_playable
+    assert not _mk("Game Over").is_playable
+    assert not _mk("Completed Early").is_playable
+    # NOT bettable: won't happen today.
+    assert not _mk("Postponed").is_playable
+    assert not _mk("Cancelled").is_playable
+    assert not _mk("Suspended").is_playable
+
+
+# --- Model/market divergence guard (2026-05-28) -----------------------------
+def test_evaluate_game_skips_on_extreme_model_market_divergence():
+    """A raw model vs market gap > max_model_market_divergence -> skip.
+
+    Catches the "late-scratch fake +EV" failure mode we hit in production:
+    market moved from -149 to +295 on a bullpen-game scratch the model didn't
+    know about; the mid blend produced +12.6% fake EV. The new guard refuses
+    to bet whenever the model and market disagree more than the configured
+    threshold, on the principle that the market knows something we don't.
+    """
+    from types import SimpleNamespace
+    from mlb_value_bot.pipeline import evaluate_game
+    from mlb_value_bot.data.mlb_client import ScheduledGame, ProbablePitcher
+    from mlb_value_bot.data.odds_client import GameOdds, SidePrice
+    from mlb_value_bot.analysis.team_metrics import TeamMetricsProvider
+    from datetime import date
+
+    # Build a config where the model produces a HIGH home win prob (good
+    # pitcher, good lineup) but the market prices the home team as a heavy
+    # underdog -- the divergence guard should fire.
+    sched = ScheduledGame(
+        game_id=1, game_date="2026-05-28", status="Scheduled",
+        home_team="Home", away_team="Away",
+        home_pitcher=ProbablePitcher(player_id=None, name=None),
+        away_pitcher=ProbablePitcher(player_id=None, name=None),
+        game_datetime=None,
+    )
+    odds = GameOdds(
+        event_id="e1", commence_time="2026-05-28T20:00:00Z",
+        home_team="Home", away_team="Away",
+        home=SidePrice(team="Home", american_odds=400, bookmaker="dk"),   # market: home is heavy underdog
+        away=SidePrice(team="Away", american_odds=-500, bookmaker="dk"),
+    )
+
+    # Stub the team metrics so the model produces a roughly 50/50 prob.
+    class _Stub:
+        def build_team_profile(self, name, is_home):
+            from mlb_value_bot.analysis.team_metrics import TeamProfile
+            return TeamProfile(team=name, raw_winpct=0.55, games=60, wins=33, losses=27,
+                              offense_wrc_plus=100, bullpen_fip=4.0, park_factor=100)
+
+    result = evaluate_game(sched, odds, _Stub(), 2026, date(2026, 5, 28))
+    assert result.skipped_reason is not None
+    assert "diverge" in result.skipped_reason
+
+
 # --- Multi-window recent form (2026-05-28) ----------------------------------
 def test_blended_form_uses_all_windows_when_present():
     """All three windows present + above sample-size floor -> weighted blend."""

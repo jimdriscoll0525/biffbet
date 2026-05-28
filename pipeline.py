@@ -276,6 +276,25 @@ def evaluate_game(
     blend, blend_tier = resolve_market_blend(data_conf, config["model"])
     blended_home = blend * wp.home_win_prob + (1.0 - blend) * market_home
 
+    # Sanity guard (model/market divergence): if the RAW model and the
+    # de-vigged market disagree by more than `max_model_market_divergence`,
+    # the market is almost certainly reacting to information the model
+    # doesn't have -- late starter scratch, lineup change, weather, etc.
+    # PRODUCTION INCIDENT 2026-05-28: Sox/Braves flipped from -149 to +295
+    # in minutes (Sox went to a bullpen game). Our probable-pitcher data was
+    # still on the announced starter, so the model said ~49% home while
+    # market said ~27%. Mid-tier blend pulled only partway -> fake +12.6% EV.
+    # We check BEFORE evaluating EV because the blended prob masks the
+    # underlying disagreement. Tunable in config.sanity.
+    max_div = float(config.get("sanity", {}).get("max_model_market_divergence", 0.15))
+    divergence = abs(wp.home_win_prob - market_home)
+    if divergence > max_div:
+        analysis.skipped_reason = (
+            f"raw model ({wp.home_win_prob:.3f}) vs market ({market_home:.3f}) "
+            f"diverge by {divergence:.3f} > {max_div:.2f} - market likely on news the model doesn't see"
+        )
+        return analysis
+
     evals = evaluate_sides(
         blended_home,
         home_odds,
@@ -288,7 +307,8 @@ def evaluate_game(
     best_side = max(evals, key=lambda s: evals[s].ev_pct)
 
     # Sanity guard (EV): an implausibly large EV is a data error, not real edge.
-    # Catches anything that slips past the odds-band check. Tunable in config.sanity.
+    # Catches anything that slips past the odds-band and divergence checks.
+    # Tunable in config.sanity.
     max_ev = float(config.get("sanity", {}).get("max_ev", 0.30))
     if evals[best_side].ev_pct > max_ev:
         analysis.skipped_reason = (

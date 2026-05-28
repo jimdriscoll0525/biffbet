@@ -211,6 +211,12 @@ ev:
 sanity:
   max_abs_odds: 800     # skip if either side's American moneyline exceeds +/-800
   max_ev: 0.30          # skip a pick whose EV exceeds 30% (almost surely bad odds)
+  # If the RAW model and de-vigged market disagree by more than this many
+  # probability points, skip the game. We've observed real cases where a late
+  # starter scratch moves the market 25-30pp while our probable-pitcher data
+  # is still on the announced starter -- that gap manufactured a fake 12.6%
+  # EV on Sox/Braves 2026-05-28. 0.15 is conservative; tune via backtest.
+  max_model_market_divergence: 0.15
 
 kelly:
   fraction: 0.25          # quarter-Kelly

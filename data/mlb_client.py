@@ -23,8 +23,21 @@ from mlb_value_bot.utils import get_logger, load_config
 
 log = get_logger("data.mlb_client")
 
-# Statuses that mean "don't bet / don't grade as a real game".
-NON_PLAYED_STATES = {"Postponed", "Cancelled", "Canceled", "Suspended"}
+# Statuses that mean "we shouldn't analyze this for a moneyline bet".
+# Splits into two groups for clarity (the union is what is_playable rejects):
+#   * Game won't happen on the scheduled day (postponed / cancelled).
+#   * Game is already underway or finished -- live moneyline prices reflect
+#     the in-game score, not the pre-game matchup. Our model is pre-game
+#     only and would be reading the wrong prices.
+# PRODUCTION INCIDENT 2026-05-28: a Braves @ Red Sox game in progress
+# (Braves up 2-0) returned a live "h2h" market with Sox at +295. Our model,
+# unaware the game had started, treated this as a pre-game line and fired a
+# fake +12.6% EV bet. Adding all in-progress / final states here closes that.
+NON_PLAYED_STATES = {
+    "Postponed", "Cancelled", "Canceled", "Suspended",
+    "In Progress", "Manager Challenge", "Delayed", "Delayed Start",
+    "Final", "Game Over", "Completed Early",
+}
 
 
 @dataclass
