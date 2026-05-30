@@ -647,6 +647,28 @@ def test_kelly_caps_per_tier():
     assert _kelly_cap_for_tier("strong", {}) == 0.020
 
 
+# --- Lineup confidence: projected vs unavailable (2026-05-30) --------------
+def test_lineup_confidence_penalty_distinguishes_projected_and_unavailable():
+    """0 / -3 / -5 / -6 scheme; data-unavailable (incl. None) is worst case."""
+    from mlb_value_bot.pipeline import _lineup_confidence_penalty
+    from mlb_value_bot.data.lineup_status import (
+        LineupStatus, STATUS_CONFIRMED, STATUS_PROJECTED, STATUS_UNAVAILABLE,
+    )
+    def lu(status):
+        return LineupStatus(team="X", status=status)
+    cfg = {}  # exercise defaults
+    # Both confirmed -> 0.
+    assert _lineup_confidence_penalty(lu(STATUS_CONFIRMED), lu(STATUS_CONFIRMED), cfg) == 0.0
+    # One projected -> -3.
+    assert _lineup_confidence_penalty(lu(STATUS_PROJECTED), lu(STATUS_CONFIRMED), cfg) == 3.0
+    # Both projected -> -5 (sub-additive, NOT 6).
+    assert _lineup_confidence_penalty(lu(STATUS_PROJECTED), lu(STATUS_PROJECTED), cfg) == 5.0
+    # Any unavailable -> -6 (dominates).
+    assert _lineup_confidence_penalty(lu(STATUS_UNAVAILABLE), lu(STATUS_PROJECTED), cfg) == 6.0
+    # None (feature disabled / no data) is treated as unavailable -> -6.
+    assert _lineup_confidence_penalty(None, lu(STATUS_CONFIRMED), cfg) == 6.0
+
+
 # --- In-progress games are not bettable (2026-05-28) -----------------------
 def test_in_progress_games_are_not_playable():
     """A game whose detailedState is 'In Progress' (or Final, etc.) must NOT

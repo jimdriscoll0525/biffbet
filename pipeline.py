@@ -655,18 +655,41 @@ def _kelly_cap_for_tier(tier: str, config: dict) -> float:
 
 
 def _lineup_confidence_penalty(home_lu, away_lu, config: dict) -> float:
-    """Confidence points to subtract for projected lineups.
+    """Confidence points to subtract based on lineup confirmation state.
 
-    Counts one penalty unit per team whose lineup is projected (or
-    unavailable). Confirmed on both sides = 0 penalty.
+    DISTINGUISHES 'projected' (lineups simply not posted yet -- a timing gap
+    that resolves as first pitch nears, since the engine re-runs through the
+    day) from 'unavailable' (a genuine feed/API failure, or the feature
+    disabled so lu is None). Both are real info loss, but an outright data
+    outage is strictly worse than "too early", so it draws the largest
+    penalty. This is the model-side half of "distinguish projected vs
+    unavailable" -- the reasoning_json already carries the per-side status
+    string for the UI chip.
+
+    Scheme (config.lineup.confidence_penalty; non-linear on purpose):
+        both confirmed        ->  0
+        one side projected    -> -3   (other side confirmed)
+        both sides projected  -> -5   (sub-additive: a quiet morning, not a gap)
+        any side unavailable  -> -6   (hard data gap dominates, worst case)
     """
     cfg = config.get("lineup", {})
-    per_team = float(cfg.get("projected_confidence_penalty_per_team", 3.0))
-    n = 0
-    for lu in (home_lu, away_lu):
-        if lu is None or lu.status != "confirmed":
-            n += 1
-    return per_team * n
+    pen = cfg.get("confidence_penalty", {})
+    p_one = float(pen.get("one_projected", 3.0))
+    p_both = float(pen.get("both_projected", 5.0))
+    p_unavail = float(pen.get("data_unavailable", 6.0))
+
+    # lu is None when the feature is disabled / provider returned nothing ->
+    # treat as a hard data gap (unavailable), same as an explicit API failure.
+    statuses = [getattr(lu, "status", "unavailable") if lu is not None else "unavailable"
+                for lu in (home_lu, away_lu)]
+    if any(s == "unavailable" for s in statuses):
+        return p_unavail
+    n_projected = sum(1 for s in statuses if s != "confirmed")
+    if n_projected >= 2:
+        return p_both
+    if n_projected == 1:
+        return p_one
+    return 0.0
 
 
 def _bullpen_confidence_penalty(home_bp, away_bp, config: dict) -> float:

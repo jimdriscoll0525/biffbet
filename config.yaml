@@ -447,10 +447,15 @@ lineup:
   hours_before_first_pitch_to_check: 3.0   # before this, mark projected, save API calls
   key_bats_top_n: 3                        # per team, by highest season OPS
   min_pa_for_key_bats: 100                 # sample-size floor (e.g. ~25 games of starts)
-  # Confidence penalty (subtracted from data + full confidence) applied per
-  # team whose lineup isn't yet confirmed. Two projected sides = penalty x 2.
-  # Conservative: a projected lineup is real info loss but not catastrophic.
-  projected_confidence_penalty_per_team: 3.0
+  # Confidence penalty by lineup state (subtracted from data + full confidence).
+  # DISTINGUISHES projected (not posted yet -- timing) from unavailable (a real
+  # feed/API gap). Non-linear: both-projected is sub-additive (a quiet morning,
+  # not an outage), while any unavailable side is the worst case. See
+  # pipeline._lineup_confidence_penalty.
+  confidence_penalty:
+    one_projected: 3.0     # one side projected, other confirmed
+    both_projected: 5.0    # both sides projected (still just "too early")
+    data_unavailable: 6.0  # any side's feed unavailable / feature disabled
 
 # -----------------------------------------------------------------------------
 # Edge stability classification (Step 3, 2026-05-30)
