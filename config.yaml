@@ -112,30 +112,16 @@ model:
   # throw ~1/3 of innings, so the per-run effect is smaller than the starter's.
   bullpen_run_to_winpct: 0.022
 
-  # --- Bullpen fatigue (additive on top of bullpen FIP) ---------------------
-  # 2026-05-30: replaced linear (a_down - h_down) * scale with an explicit
-  # NON-LINEAR tiered schedule. Rationale: one arm down on a 12-arm pen
-  # barely matters, but a fully gassed pen (0/3 leverage available) is a
-  # real signal. The old linear formula understated the bad-pen case.
-  #
-  # Schedule -- per-team probability penalty (<=0) indexed by # leverage
-  # arms unavailable: [0_down, 1_down, 2_down, 3_down].
-  #   0/3 (all up) -> 0.0%   |   2/3 -> -1.5%
-  #   1/3          -> -0.5%  |   3/3 -> -3.0%
-  # Net delta to home_win_prob = home_penalty - away_penalty (both <=0).
-  penalty_by_unavailable: [0.0, -0.005, -0.015, -0.030]
-  # Safety clamp on the net delta. Schedule max is -3pp so this only kicks
-  # in for hypothetical out-of-range inputs; kept as a defensive guard.
+  # --- Bullpen fatigue: the LIVE tiered schedule + missing-feed conf penalty
+  # live at the top-level `bullpen_fatigue:` section (end of file). The two
+  # model-scoped fields below are just (a) a defensive clamp on the net
+  # delta and (b) a deprecated knob kept for one-line rollback.
+  # Safety clamp on the NET fatigue delta. Schedule max is -3pp so this only
+  # kicks in for hypothetical out-of-range inputs; defensive guard only.
   bullpen_fatigue_clamp: 0.03
-  # Confidence reduction when the bullpen-availability feed is genuinely
-  # unavailable (API failure, no recent games, etc.) for a team. Distinct
-  # from "3/3 available" which is a real read of "everyone's rested" and
-  # gets no penalty. Counts ONE unit per team with no usable data.
-  unavailable_confidence_penalty_per_team: 2.0
-  # DEPRECATED 2026-05-30: superseded by penalty_by_unavailable above.
-  # Kept in config solely so a manual rollback to the linear formula is
-  # one-line; the new code path never reads this. Remove after a few
-  # weeks of data confirms the tiered schedule is the right shape.
+  # DEPRECATED 2026-05-30: superseded by bullpen_fatigue.penalty_by_unavailable.
+  # Kept so a manual rollback to the old linear formula is one line. The
+  # new code path doesn't read this.
   bullpen_fatigue_scale: 0.012
 
   # --- Lineup (key bats in / out of today's confirmed batting order) --------
@@ -389,6 +375,15 @@ bullpen_fatigue:
   pitch_threshold_unavailable: 35      # pitches yesterday -> unavailable today
   appearance_threshold: 3              # games in last 3 days -> unavailable
   lookback_days: 5                     # window to find the last 3 finalized games
+  # Tiered per-team probability penalty schedule (2026-05-30, Step 2).
+  # Indexed by # leverage arms unavailable: [0_down, 1_down, 2_down, 3_down].
+  # Non-linear on purpose: one arm down barely matters; a 0/3 pen is a real
+  # signal. Net delta on home_win_prob = home_penalty - away_penalty (<=0).
+  penalty_by_unavailable: [0.0, -0.005, -0.015, -0.030]
+  # Confidence reduction when the bullpen-availability feed is genuinely
+  # unavailable for a team (distinct from "3/3 available" -- that's a real
+  # read of "everyone's rested" and gets no penalty). One unit per team.
+  unavailable_confidence_penalty_per_team: 2.0
 
 # -----------------------------------------------------------------------------
 # Lineup confirmation (added 2026-05-28)
@@ -406,6 +401,29 @@ lineup:
   # team whose lineup isn't yet confirmed. Two projected sides = penalty x 2.
   # Conservative: a projected lineup is real info loss but not catastrophic.
   projected_confidence_penalty_per_team: 3.0
+
+# -----------------------------------------------------------------------------
+# Edge stability classification (Step 3, 2026-05-30)
+# Labels each pick STABLE / MODERATE / FRAGILE based on which components are
+# driving the edge plus a few hard fragility signals. The hard rule "never
+# Strong on a fragile edge" lives in pipeline.evaluate_game; the thresholds
+# below tune what counts as STABLE / FRAGILE.
+# -----------------------------------------------------------------------------
+stability:
+  # A pick is STABLE if no hard fragile signals AND >= this share of the
+  # positive (pick-aligned) component drive comes from STABLE drivers
+  # (starter, bullpen, confirmed lineup).
+  stable_share_min: 0.60
+  # A pick is FRAGILE if (a) any hard fragile signal is present OR (b) this
+  # share of the positive drive comes from FRAGILE drivers (fragile-flagged
+  # form, components with available=False).
+  fragile_share_min: 0.50
+  # Sharp fade above this many pp on the pick side is a HARD fragile signal.
+  # (Above 5pp the sanity guard SKIPS; this triggers in the 2-5pp range.)
+  sharp_fade_fragile_pp: 2.0
+  # >= this many model components with available=False is a HARD fragile
+  # signal regardless of which ones are driving the edge.
+  missing_component_fragile_n: 2
 
 logging:
   level: "INFO"

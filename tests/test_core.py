@@ -439,6 +439,120 @@ def test_market_intel_disagreement_signed():
     assert approx(mi.disagreement_with(0.65), 0.10, tol=1e-9)
 
 
+# --- Edge stability classification (Step 3, 2026-05-30) ---------------------
+def _mk_component(name, weighted, available=True, fragile=False):
+    """Test-only constructor: mirrors win_probability._mk shape."""
+    from mlb_value_bot.analysis.win_probability import Component
+    return Component(name=name, raw_delta=weighted, weight=1.0,
+                     weighted_delta=weighted, note="", available=available, fragile=fragile)
+
+
+def test_stability_stable_when_pitcher_and_bullpen_drive():
+    """Pick driven mostly by starter + bullpen (stable components) -> STABLE."""
+    from mlb_value_bot.analysis.stability import classify_edge_stability
+    from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED
+    components = [
+        _mk_component("starter", 0.040),      # pushes home, stable
+        _mk_component("bullpen", 0.020),      # pushes home, stable
+        _mk_component("home_field", 0.025),   # neutral
+        _mk_component("form", 0.005),         # tiny push, not fragile
+        _mk_component("park", 0.000),
+    ]
+    confirmed = LineupStatus(team="X", status=STATUS_CONFIRMED, key_bats_total=3, key_bats_present=3)
+    s = classify_edge_stability(components, "home", sharp_fade_pp=None,
+                                home_lineup_status=confirmed, away_lineup_status=confirmed)
+    assert s.label == "stable"
+    # starter + bullpen / total positive drive >= 60%.
+    assert s.stable_share >= 0.60
+    assert s.fragile_share < 0.10
+    assert not s.hard_fragile_signals
+
+
+def test_stability_fragile_when_form_fragile_dominates():
+    """Pick driven mostly by a fragile-flagged form component -> FRAGILE."""
+    from mlb_value_bot.analysis.stability import classify_edge_stability
+    from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED
+    components = [
+        _mk_component("starter", 0.002),                # tiny stable contribution
+        _mk_component("form", 0.030, fragile=True),     # fragile-flagged, ~71% of drive
+        _mk_component("home_field", 0.010),             # neutral
+    ]
+    confirmed = LineupStatus(team="X", status=STATUS_CONFIRMED, key_bats_total=3, key_bats_present=3)
+    s = classify_edge_stability(components, "home", sharp_fade_pp=None,
+                                home_lineup_status=confirmed, away_lineup_status=confirmed)
+    # fragile_share = 0.030 / 0.042 ~= 0.71 >= 0.50 threshold.
+    assert s.label == "fragile"
+    assert s.fragile_share >= 0.50
+
+
+def test_stability_fragile_on_hard_signal_projected_lineup():
+    """Even a stable-driver pick is FRAGILE when a lineup is projected."""
+    from mlb_value_bot.analysis.stability import classify_edge_stability
+    from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED, STATUS_PROJECTED
+    components = [
+        _mk_component("starter", 0.040),
+        _mk_component("bullpen", 0.020),
+        _mk_component("home_field", 0.025),
+    ]
+    confirmed = LineupStatus(team="H", status=STATUS_CONFIRMED, key_bats_total=3, key_bats_present=3)
+    projected = LineupStatus(team="A", status=STATUS_PROJECTED, key_bats_total=3)
+    s = classify_edge_stability(components, "home", sharp_fade_pp=None,
+                                home_lineup_status=confirmed, away_lineup_status=projected)
+    assert s.label == "fragile"
+    assert any("projected" in sig for sig in s.hard_fragile_signals)
+
+
+def test_stability_fragile_on_sharp_fade_hard_signal():
+    """A 2pp+ sharp fade on the pick side flags fragile regardless of drivers."""
+    from mlb_value_bot.analysis.stability import classify_edge_stability
+    from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED
+    components = [
+        _mk_component("starter", 0.040),
+        _mk_component("bullpen", 0.020),
+    ]
+    confirmed = LineupStatus(team="X", status=STATUS_CONFIRMED, key_bats_total=3, key_bats_present=3)
+    s = classify_edge_stability(components, "home", sharp_fade_pp=0.030,  # 3pp fade
+                                home_lineup_status=confirmed, away_lineup_status=confirmed)
+    assert s.label == "fragile"
+    assert any("sharps" in sig for sig in s.hard_fragile_signals)
+
+
+def test_stability_moderate_when_neither_dominant():
+    """Mixed stable + neutral drive, no fragile signals, but stable_share < 60%."""
+    from mlb_value_bot.analysis.stability import classify_edge_stability
+    from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED
+    # Stable drivers only contribute 35% of positive drive; rest is home_field
+    # (neutral). No fragile signals -> MODERATE.
+    components = [
+        _mk_component("starter", 0.010),
+        _mk_component("bullpen", 0.005),
+        _mk_component("home_field", 0.040),    # neutral driver
+        _mk_component("park", 0.010),          # neutral
+    ]
+    confirmed = LineupStatus(team="X", status=STATUS_CONFIRMED, key_bats_total=3, key_bats_present=3)
+    s = classify_edge_stability(components, "home", sharp_fade_pp=None,
+                                home_lineup_status=confirmed, away_lineup_status=confirmed)
+    assert s.label == "moderate"
+    assert s.stable_share < 0.60
+    assert not s.hard_fragile_signals
+
+
+def test_stability_drivers_sorted_for_ui():
+    """The `drivers` field is sorted by absolute aligned contribution desc."""
+    from mlb_value_bot.analysis.stability import classify_edge_stability
+    from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED
+    components = [
+        _mk_component("starter", 0.030),
+        _mk_component("home_field", 0.025),
+        _mk_component("form", 0.010),
+    ]
+    confirmed = LineupStatus(team="X", status=STATUS_CONFIRMED, key_bats_total=3, key_bats_present=3)
+    s = classify_edge_stability(components, "home", sharp_fade_pp=None,
+                                home_lineup_status=confirmed, away_lineup_status=confirmed)
+    names = [d["name"] for d in s.drivers]
+    assert names == ["starter", "home_field", "form"]
+
+
 # --- In-progress games are not bettable (2026-05-28) -----------------------
 def test_in_progress_games_are_not_playable():
     """A game whose detailedState is 'In Progress' (or Final, etc.) must NOT

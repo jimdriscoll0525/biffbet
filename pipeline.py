@@ -65,6 +65,10 @@ class GameAnalysis:
     # The win-prob model is UNCHANGED -- this is purely an additional output
     # so users can see the run-environment tilt in concrete terms.
     projected_score: "object | None" = None
+    # Edge stability classification (Step 3, 2026-05-30). One of
+    # "stable" / "moderate" / "fragile". Gates the "Strong" sizing tier
+    # via the hard rule below. Also feeds the UI badge + Edge Drivers list.
+    stability: "object | None" = None
 
     @property
     def best_eval(self) -> SideEvaluation | None:
@@ -103,6 +107,17 @@ class GameAnalysis:
             data["lineup"] = {
                 "home": _lineup_to_dict(self.home_lineup_status),
                 "away": _lineup_to_dict(self.away_lineup_status),
+            }
+        # Edge stability (Step 3): pick-level label + per-driver shares.
+        # Used by the UI badge / chip and by Step 5's tier downgrade rule.
+        if self.stability is not None:
+            s = self.stability
+            data["stability"] = {
+                "label": s.label,
+                "stable_share": s.stable_share,
+                "fragile_share": s.fragile_share,
+                "hard_fragile_signals": list(s.hard_fragile_signals),
+                "drivers": list(s.drivers),
             }
         # Projected score (run-environment display): home_runs / away_runs /
         # total / pitcher basis. Pure additional output; the win-prob model
@@ -411,6 +426,21 @@ def evaluate_game(
         analysis.market_intel = market_intel
         return analysis
 
+    # Edge stability (Step 3, 2026-05-30). Classify the pick as
+    # STABLE / MODERATE / FRAGILE based on WHICH components are driving the
+    # edge and whether sharp fade / projected lineups / missing data are in
+    # play. Computed BEFORE tier classification so the hard-rule downgrade
+    # below can demote Strong -> Standard on a fragile edge.
+    from mlb_value_bot.analysis.stability import classify_edge_stability
+    stability = classify_edge_stability(
+        components=wp.components,
+        best_side=best_side,
+        sharp_fade_pp=sharp_fade_pp,
+        home_lineup_status=home_lu,
+        away_lineup_status=away_lu,
+        config=config,
+    )
+
     # Bet sizing tiers: classify the pick into Pass/Small/Standard/Strong and
     # apply a stake multiplier to the raw Kelly stake. This bakes our
     # "reduce Kelly when confidence is low / edge is modest" guardrails into
@@ -419,6 +449,16 @@ def evaluate_game(
     tier, tier_mult, tier_reasons = _classify_bet_tier(
         evals[best_side].ev_pct, confidence, config
     )
+
+    # HARD RULE (Step 3): never display Strong sizing on a FRAGILE edge.
+    # A "Strong" pick is supposed to mean "high conviction + clean signal";
+    # fragile edges by definition lack the clean signal. Downgrade in place
+    # and record why. The fragile-edge downgrade is independent of the
+    # sharp-fade downgrade below (a pick can hit either or both reasons).
+    if tier == "strong" and stability.label == "fragile":
+        tier = "standard"
+        signals = "; ".join(stability.hard_fragile_signals) or f"fragile_share={stability.fragile_share}"
+        tier_reasons.append(f"downgraded Strong -> Standard: fragile edge ({signals})")
 
     # Tier downgrade when mildly fading sharps: even below the skip threshold,
     # a Strong pick that contradicts sharp consensus is suspicious. Drop it
@@ -467,6 +507,7 @@ def evaluate_game(
     analysis.away_lineup_status = away_lu
     analysis.market_intel = market_intel
     analysis.projected_score = proj_score
+    analysis.stability = stability
     return analysis
 
 
