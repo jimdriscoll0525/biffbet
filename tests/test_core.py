@@ -604,6 +604,49 @@ def test_adjusted_ev_projected_lineup_and_fragile_stack():
     assert len(reasons) == 2
 
 
+# --- Bet sizing tiers + Kelly caps (Step 5, 2026-05-30) --------------------
+def test_bet_tier_bands_on_adjusted_ev():
+    """Pass/Small/Standard/Strong bands at 2/5/8% on Adjusted EV."""
+    from mlb_value_bot.pipeline import _classify_bet_tier
+    hi = 80.0  # high confidence so no spurious downgrade
+    assert _classify_bet_tier(0.015, hi, "moderate", False, {})[0] == "pass"
+    assert _classify_bet_tier(0.030, hi, "moderate", False, {})[0] == "small"
+    assert _classify_bet_tier(0.060, hi, "moderate", False, {})[0] == "standard"
+    tier, reasons = _classify_bet_tier(0.100, hi, "moderate", False, {})
+    assert tier == "strong"
+    assert any("MANUAL REVIEW" in r for r in reasons)
+
+
+def test_bet_tier_downgrade_one_step_each_trigger():
+    """Fragile, unconfirmed lineup, or low confidence each drop exactly one tier."""
+    from mlb_value_bot.pipeline import _classify_bet_tier
+    assert _classify_bet_tier(0.100, 80, "fragile", False, {})[0] == "standard"   # fragile
+    assert _classify_bet_tier(0.060, 80, "stable", True, {})[0] == "small"        # lineup
+    assert _classify_bet_tier(0.060, 60, "stable", False, {})[0] == "small"       # conf<65
+
+
+def test_bet_tier_downgrade_is_single_step_even_with_multiple_triggers():
+    """Several triggers at once still move only ONE tier (strong -> standard)."""
+    from mlb_value_bot.pipeline import _classify_bet_tier
+    tier, _ = _classify_bet_tier(0.100, 50, "fragile", True, {})
+    assert tier == "standard"  # not small
+
+
+def test_bet_tier_never_strong_on_fragile():
+    """Step 3 hard rule preserved as a special case of the unified downgrade."""
+    from mlb_value_bot.pipeline import _classify_bet_tier
+    assert _classify_bet_tier(0.20, 90, "fragile", False, {})[0] != "strong"
+
+
+def test_kelly_caps_per_tier():
+    """Per-tier Kelly caps: small 0.5% / standard 1.0% / strong 2.0% / pass 0."""
+    from mlb_value_bot.pipeline import _kelly_cap_for_tier
+    assert _kelly_cap_for_tier("pass", {}) == 0.0
+    assert _kelly_cap_for_tier("small", {}) == 0.005
+    assert _kelly_cap_for_tier("standard", {}) == 0.010
+    assert _kelly_cap_for_tier("strong", {}) == 0.020
+
+
 # --- In-progress games are not bettable (2026-05-28) -----------------------
 def test_in_progress_games_are_not_playable():
     """A game whose detailedState is 'In Progress' (or Final, etc.) must NOT
@@ -1065,26 +1108,22 @@ def test_data_confidence_excludes_ev():
 
 
 def test_classify_bet_tier():
-    """Pass / Small / Standard / Strong assigned by EV + confidence."""
+    """Pass / Small / Standard / Strong on Adjusted EV against the real config
+    (Step 5: 2/5/8% bands, one-tier downgrade on quality flags)."""
     from mlb_value_bot.pipeline import _classify_bet_tier
     from mlb_value_bot.utils import load_config
     cfg = load_config()
 
-    # Below EV threshold -> Pass, 0x.
-    tier, mult, _ = _classify_bet_tier(0.01, 80.0, cfg)
-    assert tier == "pass" and mult == 0.0
-    # EV in [threshold, standard_ev) -> Small (halved).
-    tier, mult, _ = _classify_bet_tier(0.035, 80.0, cfg)
-    assert tier == "small" and mult == 0.5
-    # EV high but confidence < min_standard -> Small.
-    tier, mult, _ = _classify_bet_tier(0.08, 55.0, cfg)
-    assert tier == "small" and mult == 0.5
-    # EV in [standard, strong) with adequate confidence -> Standard, 1x.
-    tier, mult, _ = _classify_bet_tier(0.06, 70.0, cfg)
-    assert tier == "standard" and mult == 1.0
-    # EV >= strong AND confidence >= strong -> Strong, 1x (today).
-    tier, mult, _ = _classify_bet_tier(0.12, 80.0, cfg)
-    assert tier == "strong" and mult == 1.0
+    # Below 2% adjusted EV -> Pass.
+    assert _classify_bet_tier(0.01, 80.0, "moderate", False, cfg)[0] == "pass"
+    # [2%, 5%) -> Small.
+    assert _classify_bet_tier(0.035, 80.0, "moderate", False, cfg)[0] == "small"
+    # [5%, 8%) with good confidence + clean flags -> Standard.
+    assert _classify_bet_tier(0.06, 80.0, "moderate", False, cfg)[0] == "standard"
+    # >= 8% -> Strong.
+    assert _classify_bet_tier(0.10, 80.0, "moderate", False, cfg)[0] == "strong"
+    # Confidence < 65 downgrades Standard -> Small.
+    assert _classify_bet_tier(0.06, 60.0, "moderate", False, cfg)[0] == "small"
 
 
 # --- Manual runner -----------------------------------------------------------

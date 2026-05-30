@@ -53,7 +53,7 @@ class GameAnalysis:
     blended_home_prob: float | None = None    # blend*model + (1-blend)*market
     # Bet sizing tier (independent of blend): "pass" | "small" | "standard" | "strong"
     tier: str = "pass"
-    tier_multiplier: float = 0.0
+    tier_kelly_cap: float = 0.0               # per-tier Kelly cap applied (fraction of bankroll)
     tier_reasons: list[str] = field(default_factory=list)
     # Lineup snapshots used to populate reasoning["lineup"] (UI chips + breakdown).
     home_lineup_status: "object | None" = None
@@ -99,9 +99,10 @@ class GameAnalysis:
         }
         data["bet_sizing"] = {
             "tier": self.tier,
-            "multiplier": self.tier_multiplier,
+            "kelly_cap": self.tier_kelly_cap,
             "reasons": self.tier_reasons,
-            # Raw Kelly before the tier multiplier was applied (only set when scaled).
+            # Raw quarter-Kelly before the per-tier cap was applied (only set
+            # when the cap actually bound the stake).
             "raw_kelly": getattr(self, "_tier_original_kelly", None),
         }
         # Adjusted EV (Step 4): raw vs adjusted side by side + the per-line
@@ -471,34 +472,26 @@ def evaluate_game(
         raw_ev, sharp_fade_pp, lineup_unconfirmed, stability.label == "fragile", config
     )
 
-    # Bet sizing tiers: classify the pick into Pass/Small/Standard/Strong and
-    # apply a stake multiplier to the raw Kelly stake. Reads ADJUSTED EV (not
-    # raw) so the context haircuts flow through to the stake. The unscaled
-    # Kelly is preserved in reasoning_json for transparency.
-    tier, tier_mult, tier_reasons = _classify_bet_tier(
-        adjusted_ev, confidence, config
+    # Bet sizing tiers (Step 5): classify the pick into Pass/Small/Standard/
+    # Strong on ADJUSTED EV, apply the unified one-tier downgrade guardrail
+    # (fragile / lineup unconfirmed / low confidence -- the Step 3 "never
+    # Strong on fragile" hard rule is now a special case of this), then cap
+    # the Kelly stake per tier. Reads ADJUSTED EV (not raw) so the Step 4
+    # context haircuts flow through to the stake.
+    tier, tier_reasons = _classify_bet_tier(
+        adjusted_ev, confidence, stability.label, lineup_unconfirmed, config
     )
-
-    # HARD RULE (Step 3): never display Strong sizing on a FRAGILE edge.
-    # A "Strong" pick is supposed to mean "high conviction + clean signal";
-    # fragile edges by definition lack the clean signal. Downgrade in place
-    # and record why. (Step 4 removed the separate sharp-fade tier downgrade
-    # that used to live here -- sharp fade now lives only in Adjusted EV, and
-    # a 2-5pp fade already marks the edge fragile via Step 3, so this rule
-    # subsumes it.)
-    if tier == "strong" and stability.label == "fragile":
-        tier = "standard"
-        signals = "; ".join(stability.hard_fragile_signals) or f"fragile_share={stability.fragile_share}"
-        tier_reasons.append(f"downgraded Strong -> Standard: fragile edge ({signals})")
-
-    if tier_mult != 1.0:
-        # Mutate in place: the consumer only ever uses evals[best_side].
-        original_kelly = evals[best_side].kelly_stake
-        evals[best_side].kelly_stake = round(original_kelly * tier_mult, 6)
+    kelly_cap = _kelly_cap_for_tier(tier, config)
+    original_kelly = evals[best_side].kelly_stake
+    capped_kelly = round(min(original_kelly, kelly_cap), 6)
+    if capped_kelly != original_kelly:
+        # Preserve the raw quarter-Kelly for the audit trail in reasoning_json.
         analysis._tier_original_kelly = original_kelly  # type: ignore[attr-defined]
+    evals[best_side].kelly_stake = capped_kelly
 
     analysis.adjusted_ev_pct = adjusted_ev
     analysis.adjusted_ev_reasons = adjusted_ev_reasons
+    analysis.tier_kelly_cap = kelly_cap
     analysis.wp = wp
     analysis.evals = evals
     analysis.best_side = best_side
@@ -509,7 +502,6 @@ def evaluate_game(
     analysis.data_confidence = data_conf
     analysis.blended_home_prob = blended_home
     analysis.tier = tier
-    analysis.tier_multiplier = tier_mult
     analysis.tier_reasons = tier_reasons
     analysis.home_lineup_status = home_lu
     analysis.away_lineup_status = away_lu
@@ -577,51 +569,89 @@ def _compute_adjusted_ev(
 
 
 # --- Bet sizing tiers --------------------------------------------------------
+# Tier order, lowest -> highest, for single-step downgrades.
+_TIER_ORDER = ("pass", "small", "standard", "strong")
+
+
 def _classify_bet_tier(
-    ev_pct: float, confidence: float, config: dict
-) -> tuple[str, float, list[str]]:
-    """Classify a recommendation into Pass / Small / Standard / Strong.
+    adjusted_ev: float,
+    confidence: float,
+    stability_label: str,
+    lineup_unconfirmed: bool,
+    config: dict,
+) -> tuple[str, list[str]]:
+    """Classify a pick into Pass/Small/Standard/Strong on ADJUSTED EV, then
+    apply a single one-tier downgrade guardrail. Returns (tier, reasons).
 
-    Returns (tier_name, kelly_multiplier, reasons). The multiplier scales the
-    raw Kelly stake -- always <= 1.0 today (we only ever reduce, never grow).
+    Tier bands (config.bet_sizing.*_ev, decimal fractions):
+        adj EV < small_ev    (2%) -> pass        (not action)
+        [small_ev, standard_ev)   -> small/lean
+        [standard_ev, strong_ev)  -> standard
+        adj EV >= strong_ev  (8%) -> strong
 
-    Rules (intentionally simple and readable):
-      * EV below threshold              -> "pass"     0.0x
-      * EV below 5% or confidence < 60  -> "small"    0.5x  (lean, not action)
-      * EV >= 10% AND confidence >= 75  -> "strong"   1.0x  (full quarter-Kelly)
-      * else                            -> "standard" 1.0x
+    NOTE on STRONG: 8%+ EV on an MLB moneyline is RARE and far more often a
+    model/data error (stale line, scratched starter, bad de-vig) than a real
+    edge. Treat a Strong pick as "FLAG FOR MANUAL REVIEW", not "auto-trust" --
+    the sanity guards in evaluate_game skip the most egregious cases, but a
+    clean-looking 8%+ still deserves a human glance before sizing up.
 
-    "Strong" and "Standard" use the same multiplier today -- the distinction
-    is informational so the UI can show a separate badge. We may dial Strong
-    UP (e.g. 1.25x within the cap) once CLV evidence supports it; we will not
-    dial it up speculatively.
+    Downgrade ONE tier (a single step, never below pass) if ANY of: edge is
+    FRAGILE, lineups are unconfirmed, or confidence < downgrade_confidence.
+    These are the non-sharp guardrails; the sharp-fade penalty already lives
+    in Adjusted EV (Step 4), so we deliberately do NOT add a sharp-fade
+    downgrade here (that would double-count it). The Step 3 "never Strong on
+    a fragile edge" hard rule is the fragile case of this same downgrade.
     """
-    ev_cfg = config.get("ev", {})
     sizing = config.get("bet_sizing", {})
-    threshold = float(ev_cfg.get("threshold", 0.03))
-    strong_ev = float(sizing.get("strong_ev", 0.10))
+    small_ev = float(sizing.get("small_ev", 0.02))
     standard_ev = float(sizing.get("standard_ev", 0.05))
-    strong_conf = float(sizing.get("strong_confidence", 75.0))
-    min_conf = float(sizing.get("min_standard_confidence", 60.0))
-    small_mult = float(sizing.get("small_multiplier", 0.5))
+    strong_ev = float(sizing.get("strong_ev", 0.08))
+    min_conf = float(sizing.get("downgrade_confidence", 65.0))
 
     reasons: list[str] = []
-    if ev_pct < threshold:
-        reasons.append(f"EV {ev_pct * 100:.1f}% below {threshold * 100:.1f}% threshold")
-        return "pass", 0.0, reasons
+    if adjusted_ev < small_ev:
+        return "pass", [f"adj EV {adjusted_ev * 100:.1f}% below {small_ev * 100:.1f}% threshold"]
+    if adjusted_ev < standard_ev:
+        tier = "small"
+        reasons.append(f"adj EV {adjusted_ev * 100:.1f}% in lean range [{small_ev * 100:.0f}%, {standard_ev * 100:.0f}%)")
+    elif adjusted_ev < strong_ev:
+        tier = "standard"
+        reasons.append(f"adj EV {adjusted_ev * 100:.1f}% in standard range [{standard_ev * 100:.0f}%, {strong_ev * 100:.0f}%)")
+    else:
+        tier = "strong"
+        reasons.append(
+            f"adj EV {adjusted_ev * 100:.1f}% >= {strong_ev * 100:.0f}% -- FLAG FOR MANUAL REVIEW "
+            f"(8%+ MLB ML edge is rare; suspect model/data error before trusting)"
+        )
 
-    if ev_pct < standard_ev:
-        reasons.append(f"EV {ev_pct * 100:.1f}% in lean range (< {standard_ev * 100:.1f}%)")
-        return "small", small_mult, reasons
+    # One-tier downgrade guardrail: a single step regardless of how many fire.
+    triggers: list[str] = []
+    if stability_label == "fragile":
+        triggers.append("fragile edge")
+    if lineup_unconfirmed:
+        triggers.append("lineup unconfirmed")
     if confidence < min_conf:
-        reasons.append(f"confidence {confidence:.0f} below {min_conf:.0f}")
-        return "small", small_mult, reasons
+        triggers.append(f"confidence {confidence:.0f} < {min_conf:.0f}")
+    if triggers:
+        idx = _TIER_ORDER.index(tier)
+        new_tier = _TIER_ORDER[max(0, idx - 1)]
+        if new_tier != tier:
+            reasons.append(f"downgraded {tier} -> {new_tier}: {', '.join(triggers)}")
+            tier = new_tier
+        else:
+            reasons.append(f"downgrade noted (already at floor): {', '.join(triggers)}")
 
-    if ev_pct >= strong_ev and confidence >= strong_conf:
-        reasons.append(f"EV {ev_pct * 100:.1f}% & conf {confidence:.0f} both clear strong thresholds")
-        return "strong", 1.0, reasons
+    return tier, reasons
 
-    return "standard", 1.0, reasons
+
+def _kelly_cap_for_tier(tier: str, config: dict) -> float:
+    """Per-tier Kelly cap (fraction of bankroll). The final stake is
+    min(raw quarter-Kelly, this cap); pass -> 0. Caps live in
+    config.bet_sizing.kelly_caps and are tighter than kelly.max_bankroll_
+    fraction for small/standard on purpose (the model is unproven)."""
+    caps = config.get("bet_sizing", {}).get("kelly_caps", {})
+    default = {"pass": 0.0, "small": 0.005, "standard": 0.010, "strong": 0.020}
+    return float(caps.get(tier, default.get(tier, 0.0)))
 
 
 def _lineup_confidence_penalty(home_lu, away_lu, config: dict) -> float:

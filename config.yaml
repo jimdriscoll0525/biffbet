@@ -321,25 +321,39 @@ adjusted_ev:
   fragile_reduction: 0.015          # -1.5pp EV
 
 # -----------------------------------------------------------------------------
-# Bet sizing tiers — classify each pick into Pass/Small/Standard/Strong and
-# scale Kelly accordingly. This bakes the "reduce Kelly when confidence is low
-# or edge is modest" guardrail into the persisted stake. The unscaled Kelly is
-# preserved in reasoning_json so we can audit later. See pipeline._classify_bet_tier.
-# Sizing reads ADJUSTED EV (above), not Raw EV.
+# Bet sizing tiers (Step 5, 2026-05-30) — classify each pick into
+# Pass/Small/Standard/Strong on ADJUSTED EV (not Raw), then cap the Kelly
+# stake per tier. Deliberately CONSERVATIVE: the model is unproven on a small
+# graded sample, so we cap hard and downgrade on any quality flag.
+# See pipeline._classify_bet_tier / _kelly_cap_for_tier.
+#
+#   Adjusted EV band      tier        Kelly cap (fraction of bankroll)
+#     < 2.0%              pass        0.0%   (not action)
+#     2.0% - 4.9%         small/lean  0.5%
+#     5.0% - 7.9%         standard    1.0%
+#     >= 8.0%             strong      2.0%   (FLAG FOR MANUAL REVIEW -- see code)
+#
+# Downgrade ONE tier (a single step, no matter how many fire) if the edge is
+# FRAGILE, lineups are unconfirmed, or confidence < downgrade_confidence. We
+# do NOT add a sharp-fade downgrade here -- that penalty already lives in
+# Adjusted EV (Step 4); re-adding it would double-count.
 # -----------------------------------------------------------------------------
 bet_sizing:
-  # EV thresholds (decimal fractions, e.g. 0.05 = 5%).
-  standard_ev: 0.05            # below this -> "small" (a lean, not action)
-  strong_ev: 0.10              # at/above this AND confidence >= strong -> "strong"
-  # Confidence thresholds (0..100).
-  min_standard_confidence: 60  # below this -> "small" even if EV is in range
-  strong_confidence: 75        # required (alongside strong_ev) for "strong"
-  # Stake multipliers.
-  small_multiplier: 0.5        # halve Kelly on "small" picks
-  # Drop a Strong tier to Standard when we're fading sharp consensus by more
-  # than this many pp (but less than max_sharp_disagreement_pp, which would
-  # skip outright). Sharps disagreeing with our top conviction is a smell test.
-  sharp_fade_downgrade_pp: 2.5
+  # Adjusted-EV band edges (decimal fractions). pass < small_ev <= small <
+  # standard_ev <= standard < strong_ev <= strong.
+  small_ev: 0.02               # >= this (and < standard_ev) -> small/lean
+  standard_ev: 0.05            # >= this (and < strong_ev)   -> standard
+  strong_ev: 0.08              # >= this                     -> strong
+  # Below this confidence (0..100), downgrade one tier.
+  downgrade_confidence: 65
+  # Per-tier Kelly caps (fraction of bankroll). The stake is min(raw quarter-
+  # Kelly, cap_for_tier); pass -> 0. These are TIGHTER than kelly.max_bankroll_
+  # fraction for small/standard on purpose.
+  kelly_caps:
+    pass: 0.0
+    small: 0.005
+    standard: 0.010
+    strong: 0.020
 
 # -----------------------------------------------------------------------------
 # Confidence score weights (0-100). Components are each normalized to [0,1] and
