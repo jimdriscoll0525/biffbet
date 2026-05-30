@@ -772,15 +772,16 @@ def test_bullpen_status_short_label_and_score():
     assert "2/3" in s.short_label()
 
 
-def test_bullpen_fatigue_delta_clamped_and_signed():
-    """The fatigue delta favors the team whose opponent has more arms down."""
+def test_bullpen_fatigue_tiered_schedule():
+    """Per-team penalty uses the explicit non-linear schedule
+    [0, -0.5%, -1.5%, -3.0%], net delta = home_pen - away_pen."""
     from mlb_value_bot.analysis.win_probability import compute_win_probability
     from mlb_value_bot.data.bullpen_status import BullpenStatus
     ht = _mk_team("H", 0.5, 60, 100, 4.0)
     at = _mk_team("A", 0.5, 60, 100, 4.0)
     hp = _mk_pitcher("H SP", 4.0)
     ap = _mk_pitcher("A SP", 4.0)
-    # Home has 0 leverage down; away has 2 down -> + favors home.
+    # Home 0 down (0%), away 2 down (-1.5%) -> net = 0 - (-0.015) = +0.015.
     home_bp = BullpenStatus(team="H", available=True, leverage_total=3, leverage_unavailable=0)
     away_bp = BullpenStatus(team="A", available=True, leverage_total=3, leverage_unavailable=2)
     res = compute_win_probability(ht, at, hp, ap,
@@ -788,14 +789,56 @@ def test_bullpen_fatigue_delta_clamped_and_signed():
                                   away_bullpen_status=away_bp)
     bf = next(c for c in res.components if c.name == "bullpen_fatigue")
     assert bf.available
-    # (2 - 0) * 0.012 = 0.024, within +/- 0.03 clamp.
-    assert approx(bf.raw_delta, 0.024, tol=1e-6)
-    # Sign check: swap roles -> negative.
+    assert approx(bf.raw_delta, 0.015, tol=1e-6), bf.raw_delta
+    # Sign check: swap roles -> -0.015.
     res2 = compute_win_probability(ht, at, hp, ap,
                                    home_bullpen_status=away_bp,
                                    away_bullpen_status=home_bp)
     bf2 = next(c for c in res2.components if c.name == "bullpen_fatigue")
-    assert approx(bf2.raw_delta, -0.024, tol=1e-6)
+    assert approx(bf2.raw_delta, -0.015, tol=1e-6)
+
+
+def test_bullpen_fatigue_max_penalty_3_down():
+    """0/3 leverage available on home vs 3/3 on away -> -3.0% on home."""
+    from mlb_value_bot.analysis.win_probability import compute_win_probability
+    from mlb_value_bot.data.bullpen_status import BullpenStatus
+    ht = _mk_team("H", 0.5, 60, 100, 4.0); at = _mk_team("A", 0.5, 60, 100, 4.0)
+    hp = _mk_pitcher("H SP", 4.0); ap = _mk_pitcher("A SP", 4.0)
+    home_bp = BullpenStatus(team="H", available=True, leverage_total=3, leverage_unavailable=3)
+    away_bp = BullpenStatus(team="A", available=True, leverage_total=3, leverage_unavailable=0)
+    res = compute_win_probability(ht, at, hp, ap,
+                                  home_bullpen_status=home_bp,
+                                  away_bullpen_status=away_bp)
+    bf = next(c for c in res.components if c.name == "bullpen_fatigue")
+    # home_pen = -0.030, away_pen = 0 -> net = -0.030.
+    assert approx(bf.raw_delta, -0.030, tol=1e-6)
+    # Note format: both per-team values must appear and the right signs.
+    assert "-3.0%" in bf.note and "+0.0%" in bf.note
+
+
+def test_bullpen_fatigue_penalty_for_team_no_leverage_data():
+    """leverage_total < 3 -> per-team penalty 0 (schedule needs full 3-arm core)."""
+    from mlb_value_bot.analysis.win_probability import _bullpen_penalty_for_team
+    from mlb_value_bot.data.bullpen_status import BullpenStatus
+    bp = BullpenStatus(team="X", available=True, leverage_total=1, leverage_unavailable=1)
+    cfg = {"bullpen_fatigue": {"penalty_by_unavailable": [0.0, -0.005, -0.015, -0.030]}}
+    assert _bullpen_penalty_for_team(bp, cfg) == 0.0
+
+
+def test_bullpen_confidence_penalty_when_feed_unavailable():
+    """Per-team confidence reduction when bullpen status is None or
+    unavailable. NOT triggered by '3/3 available' (that's real data)."""
+    from mlb_value_bot.pipeline import _bullpen_confidence_penalty
+    from mlb_value_bot.data.bullpen_status import BullpenStatus
+    cfg = {"bullpen_fatigue": {"unavailable_confidence_penalty_per_team": 2.0}}
+    real_bp = BullpenStatus(team="H", available=True, leverage_total=3, leverage_unavailable=0)
+    unavail_bp = BullpenStatus(team="A", available=False, leverage_total=0)
+    # Both real -> 0 penalty.
+    assert _bullpen_confidence_penalty(real_bp, real_bp, cfg) == 0.0
+    # One unavailable -> 2.0 penalty.
+    assert _bullpen_confidence_penalty(real_bp, unavail_bp, cfg) == 2.0
+    # Both unavailable -> 4.0 penalty.
+    assert _bullpen_confidence_penalty(None, unavail_bp, cfg) == 4.0
 
 
 def test_bullpen_fatigue_missing_status_degrades_cleanly():

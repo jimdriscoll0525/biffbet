@@ -180,31 +180,43 @@ def compute_win_probability(
         bp_avail = False
     components.append(_mk("bullpen", bullpen_delta, weights["bullpen"], note, bp_avail))
 
-    # 3b) BULLPEN FATIGUE — additive tilt on top of (3) using today's
-    # availability of each team's leverage arms (see data/bullpen_status.py).
-    # Each "down" leverage arm contributes a configurable per-arm tilt; the
-    # net is (away_down - home_down) * scale, clamped tight (default +/-0.03).
-    # If either side's status is unavailable we contribute 0 and label it --
-    # never crash the slate on a transient API hiccup.
-    bp_scale = float(m.get("bullpen_fatigue_scale", 0.012))
+    # 3b) BULLPEN FATIGUE — non-linear tiered penalty per team based on
+    # today's availability of each team's leverage arms (data/bullpen_status.py).
+    # As of 2026-05-30 the schedule is explicit and non-linear (one arm down
+    # barely matters; a gassed pen with 0/3 available is a real signal):
+    #
+    #     leverage_unavailable  | per-team penalty
+    #            0/3 (all up)   |   0.0%
+    #            1/3            |  -0.5%
+    #            2/3            |  -1.5%
+    #            3/3            |  -3.0%
+    #
+    # Net delta to home_win_prob = home_penalty - away_penalty (signed:
+    # both penalties are <=0, so a more-tired home depresses the home wp
+    # and a more-tired away lifts it). Clamped to +/- bullpen_fatigue_clamp
+    # as a safety bound.
+    #
+    # If EITHER team's status is unavailable, the component contributes 0
+    # and is labeled "bullpen availability unavailable" -- we DO NOT
+    # fabricate a tilt from partial data. The missing-data confidence
+    # penalty is applied separately in pipeline._bullpen_confidence_penalty.
     bp_clamp = float(m.get("bullpen_fatigue_clamp", 0.03))
     bp_weight = float(weights.get("bullpen_fatigue", 1.0))
     if (
         home_bullpen_status is not None and home_bullpen_status.available
         and away_bullpen_status is not None and away_bullpen_status.available
     ):
-        h_down = home_bullpen_status.leverage_unavailable
-        a_down = away_bullpen_status.leverage_unavailable
-        # + favors home (away more tired).
-        bp_fatigue_delta = clamp((a_down - h_down) * bp_scale, -bp_clamp, bp_clamp)
+        h_pen = _bullpen_penalty_for_team(home_bullpen_status, config)
+        a_pen = _bullpen_penalty_for_team(away_bullpen_status, config)
+        bp_fatigue_delta = clamp(h_pen - a_pen, -bp_clamp, bp_clamp)
         bp_fatigue_note = (
-            f"H {home_bullpen_status.short_label()}; "
-            f"A {away_bullpen_status.short_label()}"
+            f"H {home_bullpen_status.short_label()} ({h_pen * 100:+.1f}%); "
+            f"A {away_bullpen_status.short_label()} ({a_pen * 100:+.1f}%)"
         )
         bp_fatigue_avail = True
     else:
         bp_fatigue_delta = 0.0
-        bp_fatigue_note = "bullpen status unavailable"
+        bp_fatigue_note = "bullpen availability unavailable"
         bp_fatigue_avail = False
     components.append(_mk("bullpen_fatigue", bp_fatigue_delta, bp_weight, bp_fatigue_note, bp_fatigue_avail))
 
@@ -300,6 +312,29 @@ def _regress_recent(recent: float | None, season: float | None, w_recent: float)
     if season is None:
         return recent
     return w_recent * recent + (1.0 - w_recent) * season
+
+
+def _bullpen_penalty_for_team(bp: "BullpenStatus", config: dict) -> float:
+    """Per-team probability penalty (<=0) from the tiered availability schedule.
+
+    See win_probability.compute_win_probability section 3b for the rationale.
+    Schedule lives in config.bullpen_fatigue.penalty_by_unavailable as a list
+    indexed by leverage_unavailable: [0_down, 1_down, 2_down, 3_down]. Default
+    [0.0, -0.005, -0.015, -0.030].
+
+    Returns 0 (no penalty) when leverage_total < 3 -- the schedule assumes a
+    full 3-arm leverage core, and applying it on partial data would amplify
+    noise. Caller still gets a label via BullpenStatus.short_label.
+    """
+    if bp.leverage_total < 3:
+        return 0.0
+    cfg = config.get("bullpen_fatigue", {})
+    schedule = cfg.get("penalty_by_unavailable", [0.0, -0.005, -0.015, -0.030])
+    # min() guards against leverage_unavailable somehow > 3 (shouldn't happen
+    # given leverage_total cap, but the cost of misindexing here would be
+    # silent garbage on the breakdown).
+    idx = min(int(bp.leverage_unavailable), len(schedule) - 1)
+    return float(schedule[idx])
 
 
 @dataclass
@@ -472,6 +507,7 @@ def compute_confidence(
     recommended_ev: float,
     config: dict | None = None,
     lineup_penalty: float = 0.0,
+    bullpen_penalty: float = 0.0,
 ) -> float:
     """Composite 0-100 confidence in the recommendation.
 
@@ -537,10 +573,11 @@ def compute_confidence(
     )
     total_weight = sum(weights.values())
     confidence = 100.0 * score / total_weight if total_weight else 0.0
-    # Same lineup-penalty mechanic as compute_data_confidence: a projected
-    # lineup is a measurable confidence gap regardless of EV magnitude. Floor
-    # at 0 so we never report a negative score.
-    confidence = max(0.0, confidence - lineup_penalty)
+    # Missing-data penalties (both nonnegative, both subtracted): lineup
+    # not yet confirmed AND/OR bullpen availability feed unavailable. We
+    # don't fabricate signal when the data is missing -- we just lower
+    # the confidence the user sees on the card. Floored at 0.
+    confidence = max(0.0, confidence - lineup_penalty - bullpen_penalty)
     result.confidence = round(confidence, 1)
     return result.confidence
 
@@ -554,6 +591,7 @@ def compute_data_confidence(
     away_team: TeamProfile,
     config: dict | None = None,
     lineup_penalty: float = 0.0,
+    bullpen_penalty: float = 0.0,
 ) -> float:
     """0-100 confidence in the DATA INPUTS, with no EV dependency.
 
@@ -606,10 +644,10 @@ def compute_data_confidence(
     if denom <= 0:
         return 0.0
     score = (w_data * data_completeness + w_samp * sample_size + w_agree * component_agreement) / denom
-    # `lineup_penalty` subtracts confidence points when today's lineups
-    # haven't been confirmed yet (we're effectively betting on a projected
-    # roster). Floored at 0 so a heavy penalty + low base doesn't go negative.
-    return round(max(0.0, 100.0 * score - lineup_penalty), 1)
+    # Missing-data penalties (both nonnegative, both subtracted): lineup
+    # not yet confirmed AND/OR bullpen availability feed unavailable.
+    # Floored at 0 so a heavy penalty + low base doesn't go negative.
+    return round(max(0.0, 100.0 * score - lineup_penalty - bullpen_penalty), 1)
 
 
 def resolve_market_blend(data_confidence: float, model_config: dict) -> tuple[float, str]:

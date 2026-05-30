@@ -319,13 +319,19 @@ def evaluate_game(
     # bigger edges. Falls back to a fixed blend if config.model.market_blend is
     # still a scalar.
     #
-    # `lineup_penalty` shaves confidence when either team's lineup is still
-    # projected at run time. We're betting on a roster guess in that case, so
-    # the model should defer more to the market -- which is exactly what a
-    # lower data confidence achieves through the blend tier table.
+    # Missing-data penalties shave confidence (and therefore data_confidence,
+    # which feeds the blend tier table -> more market anchoring on a thin
+    # data game). We DO NOT fabricate probability signal when data is
+    # missing -- we just lower the score the UI shows.
+    #   lineup_penalty: applied when either team's lineup is still projected.
+    #   bullpen_penalty: applied when the bullpen-availability feed is
+    #                    unavailable for either team (genuine API gap, not
+    #                    "3/3 available which the schedule maps to 0%").
     lineup_penalty = _lineup_confidence_penalty(home_lu, away_lu, config)
+    bullpen_penalty = _bullpen_confidence_penalty(home_bp, away_bp, config)
     data_conf = compute_data_confidence(
-        wp, home_pp, away_pp, home_tp, away_tp, config, lineup_penalty=lineup_penalty,
+        wp, home_pp, away_pp, home_tp, away_tp, config,
+        lineup_penalty=lineup_penalty, bullpen_penalty=bullpen_penalty,
     )
     blend, blend_tier = resolve_market_blend(data_conf, config["model"])
     blended_home = blend * wp.home_win_prob + (1.0 - blend) * market_home
@@ -372,7 +378,7 @@ def evaluate_game(
 
     confidence = compute_confidence(
         wp, home_pp, away_pp, home_tp, away_tp, evals[best_side].ev_pct, config,
-        lineup_penalty=lineup_penalty,
+        lineup_penalty=lineup_penalty, bullpen_penalty=bullpen_penalty,
     )
 
     # Market-intel disagreement: compute how much we're "fading the sharps"
@@ -523,6 +529,27 @@ def _lineup_confidence_penalty(home_lu, away_lu, config: dict) -> float:
     n = 0
     for lu in (home_lu, away_lu):
         if lu is None or lu.status != "confirmed":
+            n += 1
+    return per_team * n
+
+
+def _bullpen_confidence_penalty(home_bp, away_bp, config: dict) -> float:
+    """Confidence points to subtract when the bullpen-availability feed is
+    genuinely unavailable for a team.
+
+    Distinct from the case where the feed says "3/3 available" (no penalty;
+    that's a real read of "everyone's rested"). Only fires when the feed
+    didn't return usable data -- per Step 2 design we lower confidence in
+    that case rather than fabricate signal.
+
+    Counts one penalty unit per team whose BullpenStatus is None or has
+    available=False.
+    """
+    cfg = config.get("bullpen_fatigue", {})
+    per_team = float(cfg.get("unavailable_confidence_penalty_per_team", 2.0))
+    n = 0
+    for bp in (home_bp, away_bp):
+        if bp is None or not bp.available:
             n += 1
     return per_team * n
 

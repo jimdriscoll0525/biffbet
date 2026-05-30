@@ -113,11 +113,30 @@ model:
   bullpen_run_to_winpct: 0.022
 
   # --- Bullpen fatigue (additive on top of bullpen FIP) ---------------------
-  # Each "leverage arm unavailable" tilts the win prob by this much. Net delta
-  # = (away_down - home_down) * scale, clamped to +/- bullpen_fatigue_clamp.
-  # Tiny on purpose -- this is a tilt, not a takeover. Tune via backtest.
-  bullpen_fatigue_scale: 0.012
+  # 2026-05-30: replaced linear (a_down - h_down) * scale with an explicit
+  # NON-LINEAR tiered schedule. Rationale: one arm down on a 12-arm pen
+  # barely matters, but a fully gassed pen (0/3 leverage available) is a
+  # real signal. The old linear formula understated the bad-pen case.
+  #
+  # Schedule -- per-team probability penalty (<=0) indexed by # leverage
+  # arms unavailable: [0_down, 1_down, 2_down, 3_down].
+  #   0/3 (all up) -> 0.0%   |   2/3 -> -1.5%
+  #   1/3          -> -0.5%  |   3/3 -> -3.0%
+  # Net delta to home_win_prob = home_penalty - away_penalty (both <=0).
+  penalty_by_unavailable: [0.0, -0.005, -0.015, -0.030]
+  # Safety clamp on the net delta. Schedule max is -3pp so this only kicks
+  # in for hypothetical out-of-range inputs; kept as a defensive guard.
   bullpen_fatigue_clamp: 0.03
+  # Confidence reduction when the bullpen-availability feed is genuinely
+  # unavailable (API failure, no recent games, etc.) for a team. Distinct
+  # from "3/3 available" which is a real read of "everyone's rested" and
+  # gets no penalty. Counts ONE unit per team with no usable data.
+  unavailable_confidence_penalty_per_team: 2.0
+  # DEPRECATED 2026-05-30: superseded by penalty_by_unavailable above.
+  # Kept in config solely so a manual rollback to the linear formula is
+  # one-line; the new code path never reads this. Remove after a few
+  # weeks of data confirms the tiered schedule is the right shape.
+  bullpen_fatigue_scale: 0.012
 
   # --- Lineup (key bats in / out of today's confirmed batting order) --------
   # Each missing key bat tilts toward the opponent by this much; net delta is
