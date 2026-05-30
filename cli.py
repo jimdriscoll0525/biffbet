@@ -121,7 +121,7 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
 def _render_slate_table(analyses: list[GameAnalysis], threshold: float, bankroll: float, game_date: str) -> None:
     title = f"MLB slate — {game_date}  (bankroll {bankroll:.0f}, EV threshold {threshold*100:.1f}%)"
     table = Table(title=title, header_style="bold cyan", expand=False)
-    for col in ("Matchup", "Pick", "Odds", "Model%", "Mkt%", "EV%", "Kelly%", "Stake", "Conf"):
+    for col in ("Matchup", "Pick", "Odds", "Model%", "Mkt%", "Raw EV%", "Adj EV%", "Kelly%", "Stake", "Conf"):
         table.add_column(col)
 
     if not analyses:
@@ -136,13 +136,16 @@ def _render_slate_table(analyses: list[GameAnalysis], threshold: float, bankroll
         is_value = be.ev_pct >= threshold and be.kelly_stake > 0
         style = "bold green" if is_value else "white"
         stake_dollars = be.kelly_stake * bankroll
+        # Adjusted EV (Step 4) drives sizing; Raw EV shown alongside unchanged.
+        adj_ev = a.adjusted_ev_pct if a.adjusted_ev_pct is not None else be.ev_pct
         table.add_row(
             f"{a.away_team} @ {a.home_team}",
             f"[{style}]{pick_team} ({a.best_side})[/]",
             _american(be.american_odds),
             _fmt_pct(be.model_prob),
             _fmt_pct(be.market_prob_devigged),
-            f"[{style}]{be.ev_pct*100:+.1f}%[/]",
+            f"{be.ev_pct*100:+.1f}%",
+            f"[{style}]{adj_ev*100:+.1f}%[/]",
             _fmt_pct(be.kelly_stake),
             f"{stake_dollars:,.0f}",
             _fmt_num(a.confidence, 0),
@@ -170,6 +173,18 @@ def _render_value_breakdowns(value_bets: list[GameAnalysis]) -> None:
                 f"  = market blend: model {a.wp.home_win_prob:.3f} x {a.blend:g} + "
                 f"market {a.market_home_prob:.3f} x {1 - a.blend:g} "
                 f"-> [bold]{a.blended_home_prob:.3f}[/] (home, used for EV)"
+            )
+        # Edge stability badge (Step 3) + Raw/Adjusted EV (Step 4).
+        be = a.best_eval
+        if a.stability is not None:
+            label = a.stability.label.upper()
+            color = {"STABLE": "green", "MODERATE": "yellow", "FRAGILE": "red"}.get(label, "white")
+            lines.append(f"  edge stability: [{color}]{label}[/]  tier [bold]{a.tier}[/]")
+        if be is not None and a.adjusted_ev_pct is not None:
+            adj_note = ("; ".join(a.adjusted_ev_reasons)) or "no adjustments"
+            lines.append(
+                f"  EV: raw [bold]{be.ev_pct*100:+.1f}%[/] -> adjusted "
+                f"[bold]{a.adjusted_ev_pct*100:+.1f}%[/]  ({adj_note})"
             )
         console.print(Panel("\n".join(lines), border_style="green", expand=False))
 

@@ -553,6 +553,57 @@ def test_stability_drivers_sorted_for_ui():
     assert names == ["starter", "home_field", "form"]
 
 
+# --- Adjusted EV (Step 4, 2026-05-30) --------------------------------------
+def test_adjusted_ev_clean_pick_is_unchanged():
+    """No sharp signal, confirmed lineups, non-fragile -> Adjusted == Raw."""
+    from mlb_value_bot.pipeline import _compute_adjusted_ev
+    adj, reasons = _compute_adjusted_ev(
+        0.06, sharp_fade_pp=None, lineup_unconfirmed=False, fragile=False, config={}
+    )
+    assert math.isclose(adj, 0.06)
+    assert reasons == []
+
+
+def test_adjusted_ev_mild_sharp_fade_reduces():
+    """Fading sharps by 4pp (in [3,5)) -> -1.0pp; large band not triggered."""
+    from mlb_value_bot.pipeline import _compute_adjusted_ev
+    adj, reasons = _compute_adjusted_ev(
+        0.06, sharp_fade_pp=0.04, lineup_unconfirmed=False, fragile=False, config={}
+    )
+    assert math.isclose(adj, 0.05)
+    assert any("sharp fade" in r for r in reasons)
+
+
+def test_adjusted_ev_large_sharp_fade_reduces_more():
+    """Fading sharps by 6pp -> larger -2.0pp reduction (not stacked w/ mild)."""
+    from mlb_value_bot.pipeline import _compute_adjusted_ev
+    adj, reasons = _compute_adjusted_ev(
+        0.08, sharp_fade_pp=0.06, lineup_unconfirmed=False, fragile=False, config={}
+    )
+    assert math.isclose(adj, 0.06)
+    assert any("large sharp fade" in r for r in reasons)
+
+
+def test_adjusted_ev_sharp_support_boosts():
+    """Sharps even more bullish on our side (-4pp) -> +1.0pp boost."""
+    from mlb_value_bot.pipeline import _compute_adjusted_ev
+    adj, reasons = _compute_adjusted_ev(
+        0.04, sharp_fade_pp=-0.04, lineup_unconfirmed=False, fragile=False, config={}
+    )
+    assert math.isclose(adj, 0.05)
+    assert any("support" in r for r in reasons)
+
+
+def test_adjusted_ev_projected_lineup_and_fragile_stack():
+    """Projected lineup (-1.0pp) and fragile edge (-1.5pp) both apply."""
+    from mlb_value_bot.pipeline import _compute_adjusted_ev
+    adj, reasons = _compute_adjusted_ev(
+        0.06, sharp_fade_pp=None, lineup_unconfirmed=True, fragile=True, config={}
+    )
+    assert math.isclose(adj, 0.06 - 0.010 - 0.015)
+    assert len(reasons) == 2
+
+
 # --- In-progress games are not bettable (2026-05-28) -----------------------
 def test_in_progress_games_are_not_playable():
     """A game whose detailedState is 'In Progress' (or Final, etc.) must NOT

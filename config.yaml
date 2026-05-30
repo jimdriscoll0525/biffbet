@@ -286,10 +286,46 @@ kelly:
   max_bankroll_fraction: 0.02   # never stake more than 2% of bankroll
 
 # -----------------------------------------------------------------------------
+# Adjusted EV (Step 4, 2026-05-30)
+# "Raw EV" is the pure model-vs-price edge (model_prob*decimal - 1), displayed
+# unchanged. "Adjusted EV" applies a few SMALL, signed context haircuts/boosts
+# the raw number can't see, and is the value the sizing tiers (below) read.
+#
+# IMPORTANT: this is the SINGLE home for the sharp-fade penalty. It used to
+# ALSO live in the confidence score ("confidence -X for Ypp sharp fade") and
+# as a separate Strong->Standard tier downgrade; both of those were removed
+# when Adjusted EV shipped so the sharp signal is counted exactly once.
+#
+# Sign convention (see pipeline._compute_adjusted_ev): sharp_fade_pp is +ve
+# when WE are more bullish on the pick side than the sharp consensus (we're
+# FADING the sharps) and -ve when the sharps are even more bullish than we are
+# (sharp SUPPORT). All magnitudes below are decimal fractions (0.01 = 1pp EV).
+# -----------------------------------------------------------------------------
+adjusted_ev:
+  # Sharp consensus agrees with our side (by >= this many pp) -> small boost.
+  sharp_support_pp: 3.0
+  sharp_support_boost: 0.010        # +1.0pp EV
+  # We fade the sharps by >= this many pp -> small reduction.
+  sharp_fade_pp: 3.0
+  sharp_fade_reduction: 0.010       # -1.0pp EV
+  # We fade the sharps by >= this many pp -> larger reduction. (Above
+  # sanity.max_sharp_disagreement_pp the game is SKIPPED outright, so this
+  # bites in the [large, skip) band.)
+  sharp_fade_large_pp: 5.0
+  sharp_fade_large_reduction: 0.020 # -2.0pp EV
+  # Lineups not both confirmed (projected/too-early/unavailable) -> the
+  # offense input is a guess; shave a little. Small on purpose: a projected
+  # lineup is real info loss but not catastrophic.
+  projected_lineup_reduction: 0.010 # -1.0pp EV
+  # Edge classified FRAGILE by Step 3 (form-driven / missing data) -> shave.
+  fragile_reduction: 0.015          # -1.5pp EV
+
+# -----------------------------------------------------------------------------
 # Bet sizing tiers — classify each pick into Pass/Small/Standard/Strong and
 # scale Kelly accordingly. This bakes the "reduce Kelly when confidence is low
 # or edge is modest" guardrail into the persisted stake. The unscaled Kelly is
 # preserved in reasoning_json so we can audit later. See pipeline._classify_bet_tier.
+# Sizing reads ADJUSTED EV (above), not Raw EV.
 # -----------------------------------------------------------------------------
 bet_sizing:
   # EV thresholds (decimal fractions, e.g. 0.05 = 5%).

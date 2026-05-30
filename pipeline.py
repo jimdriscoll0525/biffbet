@@ -69,6 +69,12 @@ class GameAnalysis:
     # "stable" / "moderate" / "fragile". Gates the "Strong" sizing tier
     # via the hard rule below. Also feeds the UI badge + Edge Drivers list.
     stability: "object | None" = None
+    # Adjusted EV (Step 4, 2026-05-30). Raw EV (best_eval.ev_pct) is the pure
+    # model-vs-price edge, shown unchanged. adjusted_ev_pct applies small,
+    # signed context haircuts/boosts (sharp support/fade, projected lineup,
+    # fragile edge) and is what the sizing tiers read. None until computed.
+    adjusted_ev_pct: float | None = None
+    adjusted_ev_reasons: list[str] = field(default_factory=list)
 
     @property
     def best_eval(self) -> SideEvaluation | None:
@@ -97,6 +103,15 @@ class GameAnalysis:
             "reasons": self.tier_reasons,
             # Raw Kelly before the tier multiplier was applied (only set when scaled).
             "raw_kelly": getattr(self, "_tier_original_kelly", None),
+        }
+        # Adjusted EV (Step 4): raw vs adjusted side by side + the per-line
+        # adjustments, so the frontend can show both and we can backtest how
+        # much the context haircuts moved sizing. raw_ev mirrors best_eval.ev_pct.
+        be = self.best_eval
+        data["adjusted_ev"] = {
+            "raw_ev_pct": round(be.ev_pct, 4) if be is not None else None,
+            "adjusted_ev_pct": round(self.adjusted_ev_pct, 4) if self.adjusted_ev_pct is not None else None,
+            "adjustments": list(self.adjusted_ev_reasons),
         }
         data["pitchers"] = {"home": self.home_pitcher, "away": self.away_pitcher}
         data["game_datetime"] = self.game_datetime
@@ -441,56 +456,49 @@ def evaluate_game(
         config=config,
     )
 
+    # Adjusted EV (Step 4): Raw EV (evals[best_side].ev_pct) is displayed
+    # unchanged; Adjusted EV applies small, signed context haircuts/boosts and
+    # is what the sizing tiers below read. This is the SINGLE home for the
+    # sharp-fade penalty -- the old confidence-score penalty and the old
+    # Strong->Standard sharp-fade tier downgrade were both REMOVED here so the
+    # sharp signal is counted exactly once (no double/triple counting).
+    raw_ev = evals[best_side].ev_pct
+    lineup_unconfirmed = (
+        (home_lu is None or home_lu.status != "confirmed")
+        or (away_lu is None or away_lu.status != "confirmed")
+    )
+    adjusted_ev, adjusted_ev_reasons = _compute_adjusted_ev(
+        raw_ev, sharp_fade_pp, lineup_unconfirmed, stability.label == "fragile", config
+    )
+
     # Bet sizing tiers: classify the pick into Pass/Small/Standard/Strong and
-    # apply a stake multiplier to the raw Kelly stake. This bakes our
-    # "reduce Kelly when confidence is low / edge is modest" guardrails into
-    # the persisted stake instead of leaving them to the user. The unscaled
+    # apply a stake multiplier to the raw Kelly stake. Reads ADJUSTED EV (not
+    # raw) so the context haircuts flow through to the stake. The unscaled
     # Kelly is preserved in reasoning_json for transparency.
     tier, tier_mult, tier_reasons = _classify_bet_tier(
-        evals[best_side].ev_pct, confidence, config
+        adjusted_ev, confidence, config
     )
 
     # HARD RULE (Step 3): never display Strong sizing on a FRAGILE edge.
     # A "Strong" pick is supposed to mean "high conviction + clean signal";
     # fragile edges by definition lack the clean signal. Downgrade in place
-    # and record why. The fragile-edge downgrade is independent of the
-    # sharp-fade downgrade below (a pick can hit either or both reasons).
+    # and record why. (Step 4 removed the separate sharp-fade tier downgrade
+    # that used to live here -- sharp fade now lives only in Adjusted EV, and
+    # a 2-5pp fade already marks the edge fragile via Step 3, so this rule
+    # subsumes it.)
     if tier == "strong" and stability.label == "fragile":
         tier = "standard"
         signals = "; ".join(stability.hard_fragile_signals) or f"fragile_share={stability.fragile_share}"
         tier_reasons.append(f"downgraded Strong -> Standard: fragile edge ({signals})")
 
-    # Tier downgrade when mildly fading sharps: even below the skip threshold,
-    # a Strong pick that contradicts sharp consensus is suspicious. Drop it
-    # one tier (Strong -> Standard) and record the reason. Tunable in
-    # config.bet_sizing.sharp_fade_downgrade_pp.
-    downgrade_thr_pp = float(config.get("bet_sizing", {}).get("sharp_fade_downgrade_pp", 2.5))
-    if (
-        tier == "strong"
-        and sharp_fade_pp is not None
-        and sharp_fade_pp * 100 > downgrade_thr_pp
-    ):
-        tier = "standard"
-        tier_reasons.append(
-            f"downgraded Strong -> Standard: fading sharps by {sharp_fade_pp * 100:.1f}pp"
-        )
     if tier_mult != 1.0:
         # Mutate in place: the consumer only ever uses evals[best_side].
         original_kelly = evals[best_side].kelly_stake
         evals[best_side].kelly_stake = round(original_kelly * tier_mult, 6)
         analysis._tier_original_kelly = original_kelly  # type: ignore[attr-defined]
 
-    # Confidence penalty for mild sharp fade (below the skip threshold but
-    # still negative). Half a point per pp of fade, capped at 10. Surfaces as
-    # a lower data_confidence -> looser blend tier -> more market anchoring.
-    # We DON'T re-blend after the fact (that would invalidate the EV already
-    # computed); we just lower the score the UI shows.
-    if sharp_fade_pp is not None and sharp_fade_pp > 0:
-        penalty = min(10.0, sharp_fade_pp * 100 * 0.5)
-        confidence = max(0.0, confidence - penalty)
-        if penalty >= 1.0:
-            tier_reasons.append(f"confidence -{penalty:.1f} for {sharp_fade_pp * 100:.1f}pp sharp fade")
-
+    analysis.adjusted_ev_pct = adjusted_ev
+    analysis.adjusted_ev_reasons = adjusted_ev_reasons
     analysis.wp = wp
     analysis.evals = evals
     analysis.best_side = best_side
@@ -509,6 +517,63 @@ def evaluate_game(
     analysis.projected_score = proj_score
     analysis.stability = stability
     return analysis
+
+
+# --- Adjusted EV -------------------------------------------------------------
+def _compute_adjusted_ev(
+    raw_ev: float,
+    sharp_fade_pp: float | None,
+    lineup_unconfirmed: bool,
+    fragile: bool,
+    config: dict,
+) -> tuple[float, list[str]]:
+    """Turn Raw EV into the sizing-grade Adjusted EV (Step 4).
+
+    Raw EV is the pure model-vs-price edge (kept and displayed unchanged).
+    Adjusted EV applies a few SMALL, signed adjustments for context the raw
+    number can't see, and is the value the sizing tiers read. Returns
+    (adjusted_ev, reasons). Magnitudes are config.adjusted_ev.*.
+
+    This is the SINGLE home for the sharp-fade penalty. Sign convention:
+    `sharp_fade_pp` (a fraction, e.g. 0.04 = 4pp) is POSITIVE when WE are
+    more bullish on the pick side than the sharp consensus (we are FADING
+    the sharps) and NEGATIVE when the sharps are even more bullish on our
+    side than we are (sharp SUPPORT). Sharp support and fade are mutually
+    exclusive; the fade reduction is tiered (mild vs large), not stacked.
+    """
+    cfg = config.get("adjusted_ev", {})
+    adj = raw_ev
+    reasons: list[str] = []
+
+    support_pp = float(cfg.get("sharp_support_pp", 3.0))
+    fade_pp = float(cfg.get("sharp_fade_pp", 3.0))
+    fade_large_pp = float(cfg.get("sharp_fade_large_pp", 5.0))
+    if sharp_fade_pp is not None:
+        fade = sharp_fade_pp * 100.0  # to pp
+        if fade <= -support_pp:
+            boost = float(cfg.get("sharp_support_boost", 0.010))
+            adj += boost
+            reasons.append(f"+{boost * 100:.1f}pp sharps support pick ({-fade:.1f}pp)")
+        elif fade >= fade_large_pp:
+            cut = float(cfg.get("sharp_fade_large_reduction", 0.020))
+            adj -= cut
+            reasons.append(f"-{cut * 100:.1f}pp large sharp fade ({fade:.1f}pp)")
+        elif fade >= fade_pp:
+            cut = float(cfg.get("sharp_fade_reduction", 0.010))
+            adj -= cut
+            reasons.append(f"-{cut * 100:.1f}pp sharp fade ({fade:.1f}pp)")
+
+    if lineup_unconfirmed:
+        cut = float(cfg.get("projected_lineup_reduction", 0.010))
+        adj -= cut
+        reasons.append(f"-{cut * 100:.1f}pp projected/unconfirmed lineup")
+
+    if fragile:
+        cut = float(cfg.get("fragile_reduction", 0.015))
+        adj -= cut
+        reasons.append(f"-{cut * 100:.1f}pp fragile edge")
+
+    return round(adj, 6), reasons
 
 
 # --- Bet sizing tiers --------------------------------------------------------
