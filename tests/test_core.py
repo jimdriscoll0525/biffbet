@@ -149,7 +149,11 @@ def test_golden_win_probability_locks_current_math():
     res = compute_win_probability(ht, at, hp, ap)
 
     assert approx(res.base_prob, 0.550802, tol=1e-5), res.base_prob
-    assert approx(res.home_win_prob, 0.659446, tol=1e-5), res.home_win_prob
+    # home_win_prob shifted by -0.005 on 2026-05-30 when the form normal cap
+    # tightened from +/-5% to +/-1.5% (Step 1). Raw form diff is still 0.020
+    # (legacy single-window path with recent=0.360 vs 0.320), but it now
+    # clamps to 0.015. Everything else is unchanged.
+    assert approx(res.home_win_prob, 0.654446, tol=1e-5), res.home_win_prob
     deltas = {c.name: c.weighted_delta for c in res.components}
     assert approx(deltas["starter"], 0.051895, tol=1e-5), deltas["starter"]
     assert approx(deltas["bullpen"], 0.011000, tol=1e-5), deltas["bullpen"]
@@ -157,7 +161,11 @@ def test_golden_win_probability_locks_current_math():
     # home_field is now the park-specific DEFAULT (team "H" isn't in park_hfa);
     # changed 0.035 -> 0.025 on 2026-05-27 with park-specific HFA.
     assert approx(deltas["home_field"], 0.025000, tol=1e-5), deltas["home_field"]
-    assert approx(deltas["form"], 0.020000, tol=1e-5), deltas["form"]
+    # Form: legacy path produces diff 0.020, clamped to new 1.5% cap.
+    assert approx(deltas["form"], 0.015000, tol=1e-5), deltas["form"]
+    # Form is fragile under the legacy path (no per-window validation possible).
+    form_comp = next(c for c in res.components if c.name == "form")
+    assert form_comp.fragile is True
 
 
 def test_park_specific_home_field_advantage():
@@ -189,17 +197,20 @@ def test_recent_form_regresses_toward_season():
     home = PitcherProfile(player_id=1, name="H", recent_xwoba_con=0.300, xwoba_con=0.340, recent_starts=5)
     away = PitcherProfile(player_id=2, name="A", recent_xwoba_con=0.360, xwoba_con=0.340, recent_starts=5)
     # 0.6 recent / 0.4 season -> H=0.316, A=0.352, diff 0.036, *0.5 scale = 0.018.
-    delta, _, avail = _form_delta(home, away, scale=0.5, recent_weight=0.6)
-    assert avail
-    assert approx(delta, 0.018, tol=1e-6), delta
-    # Raw recent (weight 1.0) would be 0.030 — regression dampens it.
-    raw, _, _ = _form_delta(home, away, scale=0.5, recent_weight=1.0)
-    assert approx(raw, 0.030, tol=1e-6) and delta < raw
-    # No season value -> falls back to recent only (no crash).
+    # New cap (2026-05-30) is +/-1.5% on the legacy path -> clamped to 0.015.
+    # Legacy path always sets fragile=True (no per-window validation possible).
+    delta, _, avail, fragile = _form_delta(home, away, scale=0.5, recent_weight=0.6)
+    assert avail and fragile
+    assert approx(delta, 0.015, tol=1e-6), delta
+    # Same cap applies regardless of recent_weight (it's a hard ceiling now,
+    # not a value that scales with the input).
+    raw, _, _, _ = _form_delta(home, away, scale=0.5, recent_weight=1.0)
+    assert approx(raw, 0.015, tol=1e-6)
+    # No season value -> falls back to recent only -> still clamped to 0.015.
     h2 = PitcherProfile(player_id=3, name="H2", recent_xwoba_con=0.300, recent_starts=5)
     a2 = PitcherProfile(player_id=4, name="A2", recent_xwoba_con=0.360, recent_starts=5)
-    d2, _, ok2 = _form_delta(h2, a2, scale=0.5, recent_weight=0.6)
-    assert ok2 and approx(d2, 0.030, tol=1e-6)
+    d2, _, ok2, frag2 = _form_delta(h2, a2, scale=0.5, recent_weight=0.6)
+    assert ok2 and approx(d2, 0.015, tol=1e-6) and frag2
 
 
 def test_starter_delta_is_clamped():
@@ -518,10 +529,12 @@ def test_blended_form_uses_all_windows_when_present():
                        xwoba_con=0.340)
     cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
                      "form_min_bip": {"d14": 25, "d30": 60}}}
-    blended, note = _blended_form_xwoba(p, cfg)
+    fb = _blended_form_xwoba(p, cfg)
     # 0.5*0.300 + 0.3*0.320 + 0.2*0.340 = 0.150 + 0.096 + 0.068 = 0.314
-    assert approx(blended, 0.314, tol=1e-6)
-    assert "14d=" in note and "30d=" in note and "season=" in note
+    assert approx(fb.blended, 0.314, tol=1e-6)
+    assert "14d=" in fb.note and "30d=" in fb.note and "season=" in fb.note
+    # All three windows present; 14d carries exactly its configured 50% share.
+    assert approx(fb.w14_share, 0.5, tol=1e-6)
 
 
 def test_blended_form_drops_undersample_windows_and_renormalizes():
@@ -533,11 +546,13 @@ def test_blended_form_drops_undersample_windows_and_renormalizes():
                        xwoba_con=0.340)
     cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
                      "form_min_bip": {"d14": 25, "d30": 60}}}
-    blended, note = _blended_form_xwoba(p, cfg)
+    fb = _blended_form_xwoba(p, cfg)
     # 14d dropped; 30d (0.3) + season (0.2) renormalize to (0.6, 0.4):
     # 0.6*0.320 + 0.4*0.340 = 0.192 + 0.136 = 0.328
-    assert approx(blended, 0.328, tol=1e-6)
-    assert "14d" not in note  # 14d not in label since it was dropped
+    assert approx(fb.blended, 0.328, tol=1e-6)
+    # 14d was dropped under its sample floor -> 0% share.
+    assert fb.w14_share == 0.0
+    assert "14d" not in fb.note  # 14d not in label since it was dropped
 
 
 def test_blended_form_returns_none_when_nothing_available():
@@ -545,8 +560,7 @@ def test_blended_form_returns_none_when_nothing_available():
     p = PitcherProfile(player_id=1, name="P")  # all None
     cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
                      "form_min_bip": {"d14": 25, "d30": 60}}}
-    blended, _ = _blended_form_xwoba(p, cfg)
-    assert blended is None
+    assert _blended_form_xwoba(p, cfg) is None
 
 
 def test_form_delta_prefers_multi_window_when_available():
@@ -565,11 +579,85 @@ def test_form_delta_prefers_multi_window_when_available():
                           xwoba_con=0.340)
     cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
                      "form_min_bip": {"d14": 25, "d30": 60}}}
-    delta, note, avail = _form_delta(home, away, scale=0.5, config=cfg)
+    delta, note, avail, _fragile = _form_delta(home, away, scale=0.5, config=cfg)
     # Multi-window blend favors HOME (lower xwOBA). Legacy fields would flip it.
     assert avail
     assert delta > 0
     assert "xwOBAcon H" in note and "14d=0.290" in note
+
+
+def test_form_normal_cap_is_15bp():
+    """Without 14d+30d directional agreement OR meaningful sample, the form
+    delta is clamped to +/- 1.5% even when the raw diff would be much larger."""
+    from mlb_value_bot.analysis.win_probability import _form_delta
+    # Inputs that pre-2026-05-30 would have produced ~3% delta (well above the
+    # new 1.5% normal cap but under the old 5% cap). Use under-sample 30d so
+    # the extreme cap is NOT licensed -- forces normal cap.
+    home = PitcherProfile(player_id=1, name="H",
+                          recent_xwoba_con_14d=0.250, recent_bip_14d=40,
+                          recent_xwoba_con_30d=0.260, recent_bip_30d=50,  # below 70 floor
+                          xwoba_con=0.310)
+    away = PitcherProfile(player_id=2, name="A",
+                          recent_xwoba_con_14d=0.400, recent_bip_14d=40,
+                          recent_xwoba_con_30d=0.390, recent_bip_30d=50,  # below 70 floor
+                          xwoba_con=0.350)
+    cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
+                     "form_min_bip": {"d14": 25, "d30": 30},  # let 30d into blend
+                     "form_normal_cap": 0.015, "form_extreme_cap": 0.025,
+                     "form_extreme_min_bip_14d": 30, "form_extreme_min_bip_30d": 70,
+                     "form_fragile_w14_share": 0.60}}
+    delta, note, avail, _ = _form_delta(home, away, scale=0.5, config=cfg)
+    assert avail
+    assert approx(delta, 0.015, tol=1e-6), delta   # hit normal cap
+    assert "normal cap" in note
+
+
+def test_form_extreme_cap_requires_agreement_and_sample():
+    """Extreme cap (+/-2.5%) is allowed only when both 14d and 30d agree
+    directionally with the blended diff AND BIP samples are meaningful."""
+    from mlb_value_bot.analysis.win_probability import _form_delta
+    # Strong + clean signal: home is much better on both windows AND season,
+    # both pitchers well over the sample floor.
+    home = PitcherProfile(player_id=1, name="H",
+                          recent_xwoba_con_14d=0.230, recent_bip_14d=60,
+                          recent_xwoba_con_30d=0.240, recent_bip_30d=120,
+                          xwoba_con=0.250)
+    away = PitcherProfile(player_id=2, name="A",
+                          recent_xwoba_con_14d=0.420, recent_bip_14d=60,
+                          recent_xwoba_con_30d=0.410, recent_bip_30d=120,
+                          xwoba_con=0.400)
+    cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
+                     "form_min_bip": {"d14": 25, "d30": 60},
+                     "form_normal_cap": 0.015, "form_extreme_cap": 0.025,
+                     "form_extreme_min_bip_14d": 30, "form_extreme_min_bip_30d": 70,
+                     "form_fragile_w14_share": 0.60}}
+    delta, note, avail, _ = _form_delta(home, away, scale=0.5, config=cfg)
+    assert avail
+    # Raw diff > extreme cap, so clamps to +0.025 (not the +0.015 normal cap).
+    assert approx(delta, 0.025, tol=1e-6), delta
+    assert "extreme cap" in note
+
+
+def test_form_fragile_when_14d_dominates():
+    """When 30d underweights below its sample floor, 14d carries >= 60% of the
+    blend on both pitchers -> the form component is tagged fragile=True."""
+    from mlb_value_bot.analysis.win_probability import _form_delta
+    home = PitcherProfile(player_id=1, name="H",
+                          recent_xwoba_con_14d=0.300, recent_bip_14d=40,
+                          recent_xwoba_con_30d=None,  recent_bip_30d=0,  # missing 30d
+                          xwoba_con=0.330)
+    away = PitcherProfile(player_id=2, name="A",
+                          recent_xwoba_con_14d=0.360, recent_bip_14d=40,
+                          recent_xwoba_con_30d=None,  recent_bip_30d=0,
+                          xwoba_con=0.340)
+    cfg = {"model": {"form_windows": {"d14": 0.5, "d30": 0.3, "season": 0.2},
+                     "form_min_bip": {"d14": 25, "d30": 60},
+                     "form_normal_cap": 0.015, "form_extreme_cap": 0.025,
+                     "form_extreme_min_bip_14d": 30, "form_extreme_min_bip_30d": 70,
+                     "form_fragile_w14_share": 0.60}}
+    _delta, _note, _avail, fragile = _form_delta(home, away, scale=0.5, config=cfg)
+    # Only 14d (w=0.5) and season (w=0.2) made it -> 14d is 0.5/0.7 = 71% > 60%.
+    assert fragile is True
 
 
 # --- Lineup confirmation component (2026-05-28) -----------------------------

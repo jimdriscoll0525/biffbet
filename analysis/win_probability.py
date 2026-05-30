@@ -82,6 +82,12 @@ class Component:
     weighted_delta: float  # raw_delta * weight (what's actually added)
     note: str = ""
     available: bool = True
+    # Signal-quality flag. True when this component's contribution is
+    # disproportionately driven by noisy short-window inputs (e.g. 14d
+    # xwOBAcon is ~50 batted balls, mostly variance). The pick-level
+    # stability classifier (Step 3) treats a fragile-flagged dominant
+    # component as evidence the whole edge is fragile.
+    fragile: bool = False
 
 
 @dataclass
@@ -254,12 +260,14 @@ def compute_win_probability(
     # 6) RECENT FORM — pitcher last ~5 starts via Statcast (xwOBA-on-contact,
     # fallback CSW%). NOTE: rolling team-offense form (last 14d) is not yet
     # pulled; this component currently reflects recent PITCHING form only.
-    form_delta, form_note, form_avail = _form_delta(
+    # The fragility flag flows to Step 3's pick-level stability classifier.
+    form_delta, form_note, form_avail, form_fragile = _form_delta(
         home_pitcher, away_pitcher,
         float(m.get("form_scale", 0.5)), float(m.get("form_recent_weight", 0.6)),
         config=config,
     )
-    components.append(_mk("form", form_delta, weights["form"], form_note, form_avail))
+    components.append(_mk("form", form_delta, weights["form"], form_note, form_avail,
+                          fragile=form_fragile))
 
     # Assemble.
     home_prob = base + sum(c.weighted_delta for c in components)
@@ -277,9 +285,11 @@ def compute_win_probability(
     return result
 
 
-def _mk(name: str, raw: float, weight: float, note: str, available: bool) -> Component:
+def _mk(name: str, raw: float, weight: float, note: str, available: bool,
+        fragile: bool = False) -> Component:
     weight = float(weight)
-    return Component(name=name, raw_delta=raw, weight=weight, weighted_delta=raw * weight, note=note, available=available)
+    return Component(name=name, raw_delta=raw, weight=weight, weighted_delta=raw * weight,
+                     note=note, available=available, fragile=fragile)
 
 
 def _regress_recent(recent: float | None, season: float | None, w_recent: float) -> float | None:
@@ -292,7 +302,21 @@ def _regress_recent(recent: float | None, season: float | None, w_recent: float)
     return w_recent * recent + (1.0 - w_recent) * season
 
 
-def _blended_form_xwoba(p: PitcherProfile, config: dict) -> tuple[float | None, str]:
+@dataclass
+class _FormBlend:
+    """Output of `_blended_form_xwoba` -- weighted-window xwOBAcon plus the
+    raw per-window values + the share of total weight that came from 14d.
+    Returned in one shape so the form-delta logic can compare windows
+    directly (for the directional-agreement / fragility checks)."""
+    blended: float
+    note: str
+    w14_share: float          # 0..1 -- fraction of total weight from the 14d window
+    v14: float | None
+    v30: float | None
+    vseason: float | None
+
+
+def _blended_form_xwoba(p: PitcherProfile, config: dict) -> _FormBlend | None:
     """Weighted 14d / 30d / season blend of xwOBA-on-contact for one pitcher.
 
     Each window only contributes if it has enough sample (BIP floor for the
@@ -300,8 +324,8 @@ def _blended_form_xwoba(p: PitcherProfile, config: dict) -> tuple[float | None, 
     have their weight redistributed to the available ones, so the blend stays
     well-formed even when a pitcher is fresh off the IL or skipped a turn.
 
-    Returns (None, note) when no window has usable data -- caller falls back
-    to the legacy single-window logic.
+    Returns None when no window has usable data -- caller falls back to the
+    legacy single-window logic.
     """
     m = config["model"]
     fw = m.get("form_windows", {})
@@ -314,64 +338,128 @@ def _blended_form_xwoba(p: PitcherProfile, config: dict) -> tuple[float | None, 
     bip14_min = int(min_bip.get("d14", 25))
     bip30_min = int(min_bip.get("d30", 60))
 
+    v14 = v30 = vseason = None
     if p.recent_xwoba_con_14d is not None and p.recent_bip_14d >= bip14_min:
-        candidates.append(("14d", p.recent_xwoba_con_14d, w14))
+        v14 = p.recent_xwoba_con_14d
+        candidates.append(("14d", v14, w14))
     if p.recent_xwoba_con_30d is not None and p.recent_bip_30d >= bip30_min:
-        candidates.append(("30d", p.recent_xwoba_con_30d, w30))
+        v30 = p.recent_xwoba_con_30d
+        candidates.append(("30d", v30, w30))
     if p.xwoba_con is not None:
-        candidates.append(("season", p.xwoba_con, wseason))
+        vseason = p.xwoba_con
+        candidates.append(("season", vseason, wseason))
 
     if not candidates:
-        return None, ""
+        return None
     total_w = sum(w for _, _, w in candidates)
     if total_w <= 0:
-        return None, ""
+        return None
     blended = sum(v * w for _, v, w in candidates) / total_w
-    # Compact note: which windows fed the blend, with their values.
+    # Compact note: which windows fed the blend, with their values (so the UI
+    # can still show the raw 14d/30d/season numbers for transparency even
+    # though the contribution itself is capped tight).
     label = "/".join(f"{name}={val:.3f}" for name, val, _ in candidates)
-    return blended, label
+    w14_share = next((w / total_w for n, _, w in candidates if n == "14d"), 0.0)
+    return _FormBlend(blended=blended, note=label, w14_share=w14_share,
+                      v14=v14, v30=v30, vseason=vseason)
 
 
 def _form_delta(home: PitcherProfile, away: PitcherProfile, scale: float,
                 recent_weight: float = 0.6,
-                config: dict | None = None) -> tuple[float, str, bool]:
-    """Recent-form delta. Prefers the multi-window xwOBA-on-contact blend
-    (14d / 30d / season, configurable in model.form_windows); falls back to
-    the legacy `recent_xwoba_con` + season blend when the new per-window
-    fields aren't populated (e.g. tests that construct PitcherProfile by
-    hand, or older cached pulls). + favors home (away's xwOBA is higher).
+                config: dict | None = None) -> tuple[float, str, bool, bool]:
+    """Recent-form delta. Returns (delta, note, available, fragile).
+
+    Prefers the multi-window xwOBA-on-contact blend (14d / 30d / season,
+    weights in model.form_windows); falls back to the legacy
+    `recent_xwoba_con` + season blend when the new per-window fields aren't
+    populated. + favors home (away's xwOBA is higher = away worse).
+
+    CAP RATIONALE: short-window hitting stats are noise. 14d xwOBAcon is
+    ~50 BIP, well within sampling variance; a "hot streak" that's actually
+    a coin flip can swing a game several win-prob points if the cap is loose.
+    We tighten to:
+
+        normal:  +/- 1.5%
+        extreme: +/- 2.5%, ONLY if 14d AND 30d agree directionally with
+                 the blended diff AND sample sizes are meaningful
+
+    The form component is also tagged `fragile=True` when its blend is
+    >=60% driven by the 14d window -- i.e. the older windows underweighted
+    OR missing -- so Step 3's stability classifier can mark the whole edge
+    fragile if form is what's carrying it.
     """
     config = config or load_config()
 
-    # Multi-window path (added 2026-05-28): only take it when BOTH sides have
-    # at least one of the new per-window fields populated. Otherwise fall
-    # through to the legacy single-window path so old call sites (and tests
-    # that hand-build PitcherProfile with only the legacy fields) behave
-    # exactly as they used to.
+    # Tight caps (config.model.form_normal_cap / form_extreme_cap, defaulted
+    # in code so legacy configs still work). Both are FAR tighter than the
+    # +/- 0.05 we had pre-2026-05-30 -- intentional, see docstring.
+    m = config["model"]
+    normal_cap = float(m.get("form_normal_cap", 0.015))
+    extreme_cap = float(m.get("form_extreme_cap", 0.025))
+    bip14_extreme_min = int(m.get("form_extreme_min_bip_14d", 30))
+    bip30_extreme_min = int(m.get("form_extreme_min_bip_30d", 70))
+    fragile_w14_threshold = float(m.get("form_fragile_w14_share", 0.60))
+
+    # Multi-window path -- preferred. Only taken when BOTH sides have at
+    # least one new per-window field populated; otherwise fall through to
+    # the legacy single-window path so tests that hand-build PitcherProfile
+    # with only the legacy fields behave exactly as they used to.
     h_has_window = home.recent_xwoba_con_14d is not None or home.recent_xwoba_con_30d is not None
     a_has_window = away.recent_xwoba_con_14d is not None or away.recent_xwoba_con_30d is not None
     if h_has_window and a_has_window:
-        h_xw_mw, h_note_mw = _blended_form_xwoba(home, config)
-        a_xw_mw, a_note_mw = _blended_form_xwoba(away, config)
-        if h_xw_mw is not None and a_xw_mw is not None:
-            diff = a_xw_mw - h_xw_mw  # + favors home
-            delta = clamp(diff * scale, -0.05, 0.05)
-            return delta, f"xwOBAcon H {h_note_mw} | A {a_note_mw}", True
+        hb = _blended_form_xwoba(home, config)
+        ab = _blended_form_xwoba(away, config)
+        if hb is not None and ab is not None:
+            diff = ab.blended - hb.blended  # + favors home (away xwOBA higher = away worse)
+            raw_delta = diff * scale
 
-    # Legacy path: single-window recent regressed toward season.
+            # Directional agreement: do 14d-only and 30d-only diffs match
+            # the sign of the blended diff? Both must agree (and both must
+            # exist on BOTH pitchers) to license the extreme cap.
+            diff_14 = (ab.v14 - hb.v14) if (hb.v14 is not None and ab.v14 is not None) else None
+            diff_30 = (ab.v30 - hb.v30) if (hb.v30 is not None and ab.v30 is not None) else None
+            both_agree = (
+                diff_14 is not None and diff_30 is not None
+                and diff_14 * diff >= 0 and diff_30 * diff >= 0
+            )
+            # Sample-size gate: only extend the cap when ALL FOUR
+            # pitcher-windows clear the meaningful-sample floor. A single
+            # under-sampled side disqualifies the extreme cap.
+            sample_meaningful = (
+                home.recent_bip_14d >= bip14_extreme_min
+                and away.recent_bip_14d >= bip14_extreme_min
+                and home.recent_bip_30d >= bip30_extreme_min
+                and away.recent_bip_30d >= bip30_extreme_min
+            )
+            cap = extreme_cap if (both_agree and sample_meaningful) else normal_cap
+            delta = clamp(raw_delta, -cap, cap)
+
+            # Fragile flag: form is "carrying noise" when the 14d window is
+            # disproportionately driving the blend on EITHER pitcher.
+            # `w14_share` is per-pitcher; we take the max to be conservative.
+            w14_max = max(hb.w14_share, ab.w14_share)
+            fragile = w14_max >= fragile_w14_threshold
+
+            cap_note = "extreme cap" if cap == extreme_cap else "normal cap"
+            note = f"xwOBAcon H {hb.note} | A {ab.note} ({cap_note} +/-{cap * 100:.1f}%)"
+            return delta, note, True, fragile
+
+    # Legacy path: single-window recent regressed toward season. No per-window
+    # validation possible here -- always normal cap, always fragile (the
+    # input data isn't rich enough to confirm the signal is stable).
     h_xw = _regress_recent(home.recent_xwoba_con, home.xwoba_con, recent_weight)
     a_xw = _regress_recent(away.recent_xwoba_con, away.xwoba_con, recent_weight)
     if h_xw is not None and a_xw is not None:
         diff = a_xw - h_xw
-        delta = clamp(diff * scale, -0.05, 0.05)
-        return delta, f"recent xwOBAcon(reg) H={h_xw:.3f} A={a_xw:.3f}", True
+        delta = clamp(diff * scale, -normal_cap, normal_cap)
+        return delta, f"recent xwOBAcon(reg) H={h_xw:.3f} A={a_xw:.3f} (normal cap +/-{normal_cap * 100:.1f}%)", True, True
     h_csw = _regress_recent(home.recent_csw_pct, home.csw_pct, recent_weight)
     a_csw = _regress_recent(away.recent_csw_pct, away.csw_pct, recent_weight)
     if h_csw is not None and a_csw is not None:
         diff = h_csw - a_csw  # higher CSW = better
-        delta = clamp(diff * scale, -0.05, 0.05)
-        return delta, f"recent CSW%(reg) H={h_csw:.3f} A={a_csw:.3f}", True
-    return 0.0, "missing recent Statcast form", False
+        delta = clamp(diff * scale, -normal_cap, normal_cap)
+        return delta, f"recent CSW%(reg) H={h_csw:.3f} A={a_csw:.3f} (normal cap +/-{normal_cap * 100:.1f}%)", True, True
+    return 0.0, "missing recent Statcast form", False, False
 
 
 # --- Confidence score (0-100) ------------------------------------------------

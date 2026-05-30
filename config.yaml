@@ -133,6 +133,23 @@ model:
   # hot/cold-streak noise: blended = form_recent_weight*recent + (1-w)*season.
   # Used as the legacy fallback when the multi-window fields aren't populated.
   form_recent_weight: 0.6
+  # CAP for the recent-form component. 14d xwOBAcon is ~50 batted balls --
+  # mostly variance. Tightened 2026-05-30 from +/-5% to +/-1.5% normal /
+  # +/-2.5% extreme so a hot/cold streak can't swing a game several wp pts
+  # on what's effectively noise. Extreme cap is only allowed when 14d AND
+  # 30d agree directionally with the blended diff AND both pitchers clear
+  # the BIP floor below.
+  form_normal_cap: 0.015
+  form_extreme_cap: 0.025
+  form_extreme_min_bip_14d: 30   # both pitchers need >= this BIP in 14d for extreme cap
+  form_extreme_min_bip_30d: 70   # both pitchers need >= this BIP in 30d for extreme cap
+  # Fragility flag threshold: when the 14d window contributes >= this share
+  # of either pitcher's weighted blend, the form component is tagged fragile
+  # and Step 3's pick-level classifier treats a form-dominated edge as
+  # fragile too. 0.60 is conservative -- a healthy three-window blend has
+  # 14d at 0.50 (the configured d14 weight) and only crosses 0.60 when 30d
+  # or season drop under their sample floors.
+  form_fragile_w14_share: 0.60
   # Multi-window form blend (added 2026-05-28). Slices the same 30d Statcast
   # pull at 14 days, 30 days, and uses the season xwOBA-on-contact as anchor.
   # Weights are NORMALIZED at use time, so missing windows redistribute weight
@@ -169,6 +186,19 @@ model:
   # To revert to the old fixed behavior, set `market_blend: 0.35` (a scalar).
   # The pipeline handles both shapes (see resolve_market_blend).
   # Override per-run with the --market-blend CLI flag (still scalar-only).
+  #
+  # IMPORTANT distinction (do NOT conflate these in future edits):
+  #   * DATA CONFIDENCE drives this blend table. It is the non-EV portion of
+  #     the confidence score (data_completeness + sample_size + component
+  #     agreement). Weighting the blend by HOW GOOD YOUR DATA IS is legitimate
+  #     -- more complete inputs -> trust the model read more. Not circular.
+  #   * MODEL CONF (the full confidence score the UI displays, which folds in
+  #     edge_magnitude i.e. EV) MUST NOT drive the blend. Using the model's
+  #     self-assessed edge to decide how much to trust the model is a feedback
+  #     loop that amplifies overconfidence -- explicitly banned.
+  # If you ever want to widen this table or add a tier, base it on
+  # data_confidence (see compute_data_confidence). Do NOT swap it for the
+  # full confidence score.
   market_blend:
     high_conf: 0.45          # data confidence >= high_threshold
     mid_conf: 0.35           # data confidence in [mid_threshold, high_threshold)
