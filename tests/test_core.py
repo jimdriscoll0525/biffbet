@@ -618,11 +618,25 @@ def test_bet_tier_bands_on_adjusted_ev():
 
 
 def test_bet_tier_downgrade_one_step_each_trigger():
-    """Fragile, unconfirmed lineup, or low confidence each drop exactly one tier."""
+    """Each guardrail drops exactly one tier. Fragile only at the Strong band
+    (never-Strong rule); lineup/conf at any band."""
     from mlb_value_bot.pipeline import _classify_bet_tier
-    assert _classify_bet_tier(0.100, 80, "fragile", False, {})[0] == "standard"   # fragile
+    assert _classify_bet_tier(0.100, 80, "fragile", False, {})[0] == "standard"   # fragile @ strong
     assert _classify_bet_tier(0.060, 80, "stable", True, {})[0] == "small"        # lineup
     assert _classify_bet_tier(0.060, 60, "stable", False, {})[0] == "small"       # conf<65
+
+
+def test_bet_tier_fragile_not_double_counted_below_strong():
+    """De-dup (2026-06-03): fragility's magnitude lives ONLY in Adjusted EV, so a
+    fragile small/standard pick with no other trigger keeps its tier instead of
+    being knocked down a second time. Only the Strong band is capped."""
+    from mlb_value_bot.pipeline import _classify_bet_tier
+    # Small band, fragile, confirmed lineups, high conf -> stays small (was: pass).
+    assert _classify_bet_tier(0.030, 80, "fragile", False, {})[0] == "small"
+    # Standard band, fragile, no other trigger -> stays standard (was: small).
+    assert _classify_bet_tier(0.060, 80, "fragile", False, {})[0] == "standard"
+    # But a genuine OTHER trigger still downgrades a fragile standard pick.
+    assert _classify_bet_tier(0.060, 80, "fragile", True, {})[0] == "small"
 
 
 def test_bet_tier_downgrade_is_single_step_even_with_multiple_triggers():

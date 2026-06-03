@@ -333,10 +333,14 @@ adjusted_ev:
 #     5.0% - 7.9%         standard    1.0%
 #     >= 8.0%             strong      2.0%   (FLAG FOR MANUAL REVIEW -- see code)
 #
-# Downgrade ONE tier (a single step, no matter how many fire) if the edge is
-# FRAGILE, lineups are unconfirmed, or confidence < downgrade_confidence. We
-# do NOT add a sharp-fade downgrade here -- that penalty already lives in
-# Adjusted EV (Step 4); re-adding it would double-count.
+# Downgrade ONE tier (a single step, no matter how many fire) if lineups are
+# unconfirmed, confidence < downgrade_confidence, OR the edge is FRAGILE *and
+# the band tier is Strong* (the "never Strong on fragile" hard rule). We do NOT
+# add a general fragile or sharp-fade downgrade here -- BOTH penalties already
+# live in Adjusted EV (Step 4: fragile_reduction / sharp_fade_reduction), so a
+# general tier step would double-count them (a pp haircut AND a full tier). A
+# fragile small/standard pick therefore keeps its tier; only the rare Strong
+# band is capped (strong -> standard).
 # -----------------------------------------------------------------------------
 bet_sizing:
   # Adjusted-EV band edges (decimal fractions). pass < small_ev <= small <

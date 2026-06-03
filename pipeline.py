@@ -595,12 +595,20 @@ def _classify_bet_tier(
     the sanity guards in evaluate_game skip the most egregious cases, but a
     clean-looking 8%+ still deserves a human glance before sizing up.
 
-    Downgrade ONE tier (a single step, never below pass) if ANY of: edge is
-    FRAGILE, lineups are unconfirmed, or confidence < downgrade_confidence.
-    These are the non-sharp guardrails; the sharp-fade penalty already lives
-    in Adjusted EV (Step 4), so we deliberately do NOT add a sharp-fade
-    downgrade here (that would double-count it). The Step 3 "never Strong on
-    a fragile edge" hard rule is the fragile case of this same downgrade.
+    Downgrade ONE tier (a single step, never below pass) if ANY of: lineups
+    are unconfirmed, confidence < downgrade_confidence, OR the edge is FRAGILE
+    *and the band tier is Strong* (the "never Strong on a fragile edge" hard
+    rule, Step 3).
+
+    De-dup note (2026-06-03): the sharp-fade AND the fragile penalties both
+    already live in Adjusted EV (Step 4: -fragile_reduction pp), so neither
+    adds a *general* tier step here -- doing so would DOUBLE-COUNT the same
+    signal (a pp haircut AND a full tier). The only fragile-driven step that
+    survives is the never-Strong ceiling, which bites the Strong band alone; a
+    fragile small/standard pick keeps its tier because its fragility is already
+    priced into Adjusted EV. (Before this fix, fragility knocked ordinary
+    small/standard picks down a tier on top of the EV haircut, flipping
+    marginal picks straight to pass.)
     """
     sizing = config.get("bet_sizing", {})
     small_ev = float(sizing.get("small_ev", 0.02))
@@ -625,9 +633,12 @@ def _classify_bet_tier(
         )
 
     # One-tier downgrade guardrail: a single step regardless of how many fire.
+    # FRAGILE participates ONLY at the Strong band (the never-Strong hard rule);
+    # its magnitude penalty already lives in Adjusted EV, so it does NOT add a
+    # general tier step at small/standard (that was the double-count we removed).
     triggers: list[str] = []
-    if stability_label == "fragile":
-        triggers.append("fragile edge")
+    if stability_label == "fragile" and tier == "strong":
+        triggers.append("fragile edge (never Strong on fragile)")
     if lineup_unconfirmed:
         triggers.append("lineup unconfirmed")
     if confidence < min_conf:
