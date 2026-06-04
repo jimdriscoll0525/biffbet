@@ -352,7 +352,12 @@ bet_sizing:
   standard_ev: 0.05            # >= this (and < strong_ev)   -> standard
   strong_ev: 0.08              # >= this                     -> strong
   # Below this confidence (0..100), downgrade one tier.
-  downgrade_confidence: 65
+  # Lowered 65 -> 60 on 2026-06-04: the stored confidence distribution clusters
+  # right on 65, and a routine morning-run lineup penalty (-5 both-projected)
+  # slid ~half the slate under 65 -- re-creating a soft version of the removed
+  # projected-lineup tax. 60 keeps the cliff below the typical penalized score
+  # so the downgrade fires on genuinely low confidence, not just "ran early".
+  downgrade_confidence: 60
   # Per-tier Kelly caps (fraction of bankroll). The stake is min(raw quarter-
   # Kelly, cap_for_tier); pass -> 0. These are TIGHTER than kelly.max_bankroll_
   # fraction for small/standard on purpose.

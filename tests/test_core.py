@@ -1180,8 +1180,10 @@ def test_classify_bet_tier():
     assert _classify_bet_tier(0.06, 80.0, "moderate", cfg)[0] == "standard"
     # >= 8% -> Strong.
     assert _classify_bet_tier(0.10, 80.0, "moderate", cfg)[0] == "strong"
-    # Confidence < 65 downgrades Standard -> Small.
-    assert _classify_bet_tier(0.06, 60.0, "moderate", cfg)[0] == "small"
+    # Confidence < downgrade_confidence (60) downgrades Standard -> Small;
+    # a score AT the threshold does not.
+    assert _classify_bet_tier(0.06, 55.0, "moderate", cfg)[0] == "small"
+    assert _classify_bet_tier(0.06, 60.0, "moderate", cfg)[0] == "standard"
 
 
 # --- Manual runner -----------------------------------------------------------
