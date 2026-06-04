@@ -313,10 +313,11 @@ adjusted_ev:
   # bites in the [large, skip) band.)
   sharp_fade_large_pp: 5.0
   sharp_fade_large_reduction: 0.020 # -2.0pp EV
-  # Lineups not both confirmed (projected/too-early/unavailable) -> the
-  # offense input is a guess; shave a little. Small on purpose: a projected
-  # lineup is real info loss but not catastrophic.
-  projected_lineup_reduction: 0.010 # -1.0pp EV
+  # NOTE (2026-06-04): projected_lineup_reduction was REMOVED. A projected/
+  # unconfirmed lineup no longer haircuts EV (nor downgrades the sizing tier).
+  # It fired on every pre-lineup (morning) run, so it was a flat slate-wide tax
+  # rather than a discriminating signal. The uncertainty is now carried solely
+  # by the graduated lineup CONFIDENCE penalty (config.lineup.confidence_penalty).
   # Edge classified FRAGILE by Step 3 (form-driven / missing data) -> shave.
   fragile_reduction: 0.015          # -1.5pp EV
 
@@ -333,9 +334,11 @@ adjusted_ev:
 #     5.0% - 7.9%         standard    1.0%
 #     >= 8.0%             strong      2.0%   (FLAG FOR MANUAL REVIEW -- see code)
 #
-# Downgrade ONE tier (a single step, no matter how many fire) if lineups are
-# unconfirmed, confidence < downgrade_confidence, OR the edge is FRAGILE *and
-# the band tier is Strong* (the "never Strong on fragile" hard rule). We do NOT
+# Downgrade ONE tier (a single step, no matter how many fire) if confidence <
+# downgrade_confidence, OR the edge is FRAGILE *and the band tier is Strong*
+# (the "never Strong on fragile" hard rule). (The lineup-unconfirmed downgrade
+# was removed 2026-06-04 -- it taxed every pre-lineup run; projected-lineup
+# uncertainty now lives only in the lineup confidence penalty.) We do NOT
 # add a general fragile or sharp-fade downgrade here -- BOTH penalties already
 # live in Adjusted EV (Step 4: fragile_reduction / sharp_fade_reduction), so a
 # general tier step would double-count them (a pp haircut AND a full tier). A

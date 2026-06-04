@@ -9,8 +9,10 @@ Definitions (from the upgrade spec):
 
   STABLE   driven mostly by starting pitcher, bullpen, confirmed lineup,
            or projected run differential.
-  FRAGILE  driven mostly by recent form, projected/unavailable lineup,
-           missing data, or sharp fade.
+  FRAGILE  driven mostly by recent form, an UNAVAILABLE lineup feed,
+           missing data, or sharp fade. (A merely *projected* lineup is
+           timing, not fragility -- it's priced via the Adjusted-EV haircut,
+           not a hard fragile signal.)
   MODERATE in between.
 
 Hard rule the caller is expected to enforce after reading the label:
@@ -120,13 +122,18 @@ def classify_edge_stability(
     if sharp_fade_pp is not None and sharp_fade_pp * 100.0 >= sharp_fade_fragile_pp:
         hard_signals.append(f"fading sharps by {sharp_fade_pp * 100:.1f}pp")
 
-    # Lineup state: a projected or unavailable lineup on EITHER side means
-    # the offense input is a guess. Per spec, this alone makes the edge
-    # fragile (even if other drivers look stable today).
+    # Lineup state: an UNAVAILABLE lineup feed (a genuine API/data gap, or the
+    # feature disabled so lu is None) on EITHER side means the offense input is
+    # missing -- that's a hard fragility signal. A merely PROJECTED lineup (not
+    # posted yet -- pure timing, which resolves as first pitch nears since the
+    # engine re-runs through the day) is NOT a fragility signal: forcing every
+    # pre-lineup (morning) run to FRAGILE was a flat slate-wide tax, not a
+    # discriminator. Projected-lineup uncertainty is instead carried by the
+    # graduated lineup CONFIDENCE penalty (config.lineup.confidence_penalty).
     for label, lu in (("home", home_lineup_status), ("away", away_lineup_status)):
-        if lu is None or lu.status != "confirmed":
-            status = getattr(lu, "status", None) or "no data"
-            hard_signals.append(f"{label} lineup {status}")
+        status = getattr(lu, "status", None)
+        if lu is None or status == "unavailable":
+            hard_signals.append(f"{label} lineup {status or 'no data'}")
             break  # one signal is enough; don't double-count both sides
 
     # Missing-data pile-up: betting on a game where multiple model

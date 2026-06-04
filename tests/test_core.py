@@ -485,8 +485,10 @@ def test_stability_fragile_when_form_fragile_dominates():
     assert s.fragile_share >= 0.50
 
 
-def test_stability_fragile_on_hard_signal_projected_lineup():
-    """Even a stable-driver pick is FRAGILE when a lineup is projected."""
+def test_stability_projected_lineup_does_not_force_fragile():
+    """A merely PROJECTED lineup is timing, not fragility, so it must NOT force
+    FRAGILE -- it's already priced in via the Adjusted-EV projected-lineup
+    haircut. A stable-driver pick with one side projected stays STABLE."""
     from mlb_value_bot.analysis.stability import classify_edge_stability
     from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED, STATUS_PROJECTED
     components = [
@@ -498,8 +500,26 @@ def test_stability_fragile_on_hard_signal_projected_lineup():
     projected = LineupStatus(team="A", status=STATUS_PROJECTED, key_bats_total=3)
     s = classify_edge_stability(components, "home", sharp_fade_pp=None,
                                 home_lineup_status=confirmed, away_lineup_status=projected)
+    assert s.label == "stable"
+    assert not any("projected" in sig for sig in s.hard_fragile_signals)
+
+
+def test_stability_fragile_on_hard_signal_unavailable_lineup():
+    """An UNAVAILABLE lineup feed (a genuine data/API gap, distinct from a
+    not-yet-posted projected lineup) IS still a hard fragility signal."""
+    from mlb_value_bot.analysis.stability import classify_edge_stability
+    from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED, STATUS_UNAVAILABLE
+    components = [
+        _mk_component("starter", 0.040),
+        _mk_component("bullpen", 0.020),
+        _mk_component("home_field", 0.025),
+    ]
+    confirmed = LineupStatus(team="H", status=STATUS_CONFIRMED, key_bats_total=3, key_bats_present=3)
+    unavailable = LineupStatus(team="A", status=STATUS_UNAVAILABLE, key_bats_total=3)
+    s = classify_edge_stability(components, "home", sharp_fade_pp=None,
+                                home_lineup_status=confirmed, away_lineup_status=unavailable)
     assert s.label == "fragile"
-    assert any("projected" in sig for sig in s.hard_fragile_signals)
+    assert any("unavailable" in sig for sig in s.hard_fragile_signals)
 
 
 def test_stability_fragile_on_sharp_fade_hard_signal():
@@ -558,7 +578,7 @@ def test_adjusted_ev_clean_pick_is_unchanged():
     """No sharp signal, confirmed lineups, non-fragile -> Adjusted == Raw."""
     from mlb_value_bot.pipeline import _compute_adjusted_ev
     adj, reasons = _compute_adjusted_ev(
-        0.06, sharp_fade_pp=None, lineup_unconfirmed=False, fragile=False, config={}
+        0.06, sharp_fade_pp=None, fragile=False, config={}
     )
     assert math.isclose(adj, 0.06)
     assert reasons == []
@@ -568,7 +588,7 @@ def test_adjusted_ev_mild_sharp_fade_reduces():
     """Fading sharps by 4pp (in [3,5)) -> -1.0pp; large band not triggered."""
     from mlb_value_bot.pipeline import _compute_adjusted_ev
     adj, reasons = _compute_adjusted_ev(
-        0.06, sharp_fade_pp=0.04, lineup_unconfirmed=False, fragile=False, config={}
+        0.06, sharp_fade_pp=0.04, fragile=False, config={}
     )
     assert math.isclose(adj, 0.05)
     assert any("sharp fade" in r for r in reasons)
@@ -578,7 +598,7 @@ def test_adjusted_ev_large_sharp_fade_reduces_more():
     """Fading sharps by 6pp -> larger -2.0pp reduction (not stacked w/ mild)."""
     from mlb_value_bot.pipeline import _compute_adjusted_ev
     adj, reasons = _compute_adjusted_ev(
-        0.08, sharp_fade_pp=0.06, lineup_unconfirmed=False, fragile=False, config={}
+        0.08, sharp_fade_pp=0.06, fragile=False, config={}
     )
     assert math.isclose(adj, 0.06)
     assert any("large sharp fade" in r for r in reasons)
@@ -588,20 +608,22 @@ def test_adjusted_ev_sharp_support_boosts():
     """Sharps even more bullish on our side (-4pp) -> +1.0pp boost."""
     from mlb_value_bot.pipeline import _compute_adjusted_ev
     adj, reasons = _compute_adjusted_ev(
-        0.04, sharp_fade_pp=-0.04, lineup_unconfirmed=False, fragile=False, config={}
+        0.04, sharp_fade_pp=-0.04, fragile=False, config={}
     )
     assert math.isclose(adj, 0.05)
     assert any("support" in r for r in reasons)
 
 
-def test_adjusted_ev_projected_lineup_and_fragile_stack():
-    """Projected lineup (-1.0pp) and fragile edge (-1.5pp) both apply."""
+def test_adjusted_ev_fragile_reduces():
+    """Fragile edge -> -1.5pp. Projected/unconfirmed lineups no longer haircut
+    EV (removed 2026-06-04), so only the fragile reduction applies."""
     from mlb_value_bot.pipeline import _compute_adjusted_ev
     adj, reasons = _compute_adjusted_ev(
-        0.06, sharp_fade_pp=None, lineup_unconfirmed=True, fragile=True, config={}
+        0.06, sharp_fade_pp=None, fragile=True, config={}
     )
-    assert math.isclose(adj, 0.06 - 0.010 - 0.015)
-    assert len(reasons) == 2
+    assert math.isclose(adj, 0.06 - 0.015)
+    assert len(reasons) == 1
+    assert any("fragile" in r for r in reasons)
 
 
 # --- Bet sizing tiers + Kelly caps (Step 5, 2026-05-30) --------------------
@@ -609,21 +631,21 @@ def test_bet_tier_bands_on_adjusted_ev():
     """Pass/Small/Standard/Strong bands at 2/5/8% on Adjusted EV."""
     from mlb_value_bot.pipeline import _classify_bet_tier
     hi = 80.0  # high confidence so no spurious downgrade
-    assert _classify_bet_tier(0.015, hi, "moderate", False, {})[0] == "pass"
-    assert _classify_bet_tier(0.030, hi, "moderate", False, {})[0] == "small"
-    assert _classify_bet_tier(0.060, hi, "moderate", False, {})[0] == "standard"
-    tier, reasons = _classify_bet_tier(0.100, hi, "moderate", False, {})
+    assert _classify_bet_tier(0.015, hi, "moderate", {})[0] == "pass"
+    assert _classify_bet_tier(0.030, hi, "moderate", {})[0] == "small"
+    assert _classify_bet_tier(0.060, hi, "moderate", {})[0] == "standard"
+    tier, reasons = _classify_bet_tier(0.100, hi, "moderate", {})
     assert tier == "strong"
     assert any("MANUAL REVIEW" in r for r in reasons)
 
 
 def test_bet_tier_downgrade_one_step_each_trigger():
     """Each guardrail drops exactly one tier. Fragile only at the Strong band
-    (never-Strong rule); lineup/conf at any band."""
+    (never-Strong rule); confidence at any band. (The lineup-unconfirmed
+    downgrade was removed 2026-06-04.)"""
     from mlb_value_bot.pipeline import _classify_bet_tier
-    assert _classify_bet_tier(0.100, 80, "fragile", False, {})[0] == "standard"   # fragile @ strong
-    assert _classify_bet_tier(0.060, 80, "stable", True, {})[0] == "small"        # lineup
-    assert _classify_bet_tier(0.060, 60, "stable", False, {})[0] == "small"       # conf<65
+    assert _classify_bet_tier(0.100, 80, "fragile", {})[0] == "standard"   # fragile @ strong
+    assert _classify_bet_tier(0.060, 60, "stable", {})[0] == "small"       # conf<65
 
 
 def test_bet_tier_fragile_not_double_counted_below_strong():
@@ -631,25 +653,25 @@ def test_bet_tier_fragile_not_double_counted_below_strong():
     fragile small/standard pick with no other trigger keeps its tier instead of
     being knocked down a second time. Only the Strong band is capped."""
     from mlb_value_bot.pipeline import _classify_bet_tier
-    # Small band, fragile, confirmed lineups, high conf -> stays small (was: pass).
-    assert _classify_bet_tier(0.030, 80, "fragile", False, {})[0] == "small"
+    # Small band, fragile, high conf -> stays small (was: pass).
+    assert _classify_bet_tier(0.030, 80, "fragile", {})[0] == "small"
     # Standard band, fragile, no other trigger -> stays standard (was: small).
-    assert _classify_bet_tier(0.060, 80, "fragile", False, {})[0] == "standard"
-    # But a genuine OTHER trigger still downgrades a fragile standard pick.
-    assert _classify_bet_tier(0.060, 80, "fragile", True, {})[0] == "small"
+    assert _classify_bet_tier(0.060, 80, "fragile", {})[0] == "standard"
+    # But a genuine OTHER trigger (confidence < 65) still downgrades it.
+    assert _classify_bet_tier(0.060, 60, "fragile", {})[0] == "small"
 
 
 def test_bet_tier_downgrade_is_single_step_even_with_multiple_triggers():
     """Several triggers at once still move only ONE tier (strong -> standard)."""
     from mlb_value_bot.pipeline import _classify_bet_tier
-    tier, _ = _classify_bet_tier(0.100, 50, "fragile", True, {})
+    tier, _ = _classify_bet_tier(0.100, 50, "fragile", {})
     assert tier == "standard"  # not small
 
 
 def test_bet_tier_never_strong_on_fragile():
     """Step 3 hard rule preserved as a special case of the unified downgrade."""
     from mlb_value_bot.pipeline import _classify_bet_tier
-    assert _classify_bet_tier(0.20, 90, "fragile", False, {})[0] != "strong"
+    assert _classify_bet_tier(0.20, 90, "fragile", {})[0] != "strong"
 
 
 def test_kelly_caps_per_tier():
@@ -1151,15 +1173,15 @@ def test_classify_bet_tier():
     cfg = load_config()
 
     # Below 2% adjusted EV -> Pass.
-    assert _classify_bet_tier(0.01, 80.0, "moderate", False, cfg)[0] == "pass"
+    assert _classify_bet_tier(0.01, 80.0, "moderate", cfg)[0] == "pass"
     # [2%, 5%) -> Small.
-    assert _classify_bet_tier(0.035, 80.0, "moderate", False, cfg)[0] == "small"
+    assert _classify_bet_tier(0.035, 80.0, "moderate", cfg)[0] == "small"
     # [5%, 8%) with good confidence + clean flags -> Standard.
-    assert _classify_bet_tier(0.06, 80.0, "moderate", False, cfg)[0] == "standard"
+    assert _classify_bet_tier(0.06, 80.0, "moderate", cfg)[0] == "standard"
     # >= 8% -> Strong.
-    assert _classify_bet_tier(0.10, 80.0, "moderate", False, cfg)[0] == "strong"
+    assert _classify_bet_tier(0.10, 80.0, "moderate", cfg)[0] == "strong"
     # Confidence < 65 downgrades Standard -> Small.
-    assert _classify_bet_tier(0.06, 60.0, "moderate", False, cfg)[0] == "small"
+    assert _classify_bet_tier(0.06, 60.0, "moderate", cfg)[0] == "small"
 
 
 # --- Manual runner -----------------------------------------------------------

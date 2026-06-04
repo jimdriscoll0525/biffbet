@@ -464,22 +464,25 @@ def evaluate_game(
     # Strong->Standard sharp-fade tier downgrade were both REMOVED here so the
     # sharp signal is counted exactly once (no double/triple counting).
     raw_ev = evals[best_side].ev_pct
-    lineup_unconfirmed = (
-        (home_lu is None or home_lu.status != "confirmed")
-        or (away_lu is None or away_lu.status != "confirmed")
-    )
     adjusted_ev, adjusted_ev_reasons = _compute_adjusted_ev(
-        raw_ev, sharp_fade_pp, lineup_unconfirmed, stability.label == "fragile", config
+        raw_ev, sharp_fade_pp, stability.label == "fragile", config
     )
 
     # Bet sizing tiers (Step 5): classify the pick into Pass/Small/Standard/
     # Strong on ADJUSTED EV, apply the unified one-tier downgrade guardrail
-    # (fragile / lineup unconfirmed / low confidence -- the Step 3 "never
-    # Strong on fragile" hard rule is now a special case of this), then cap
-    # the Kelly stake per tier. Reads ADJUSTED EV (not raw) so the Step 4
+    # (low confidence / the Step 3 "never Strong on fragile" hard rule), then
+    # cap the Kelly stake per tier. Reads ADJUSTED EV (not raw) so the Step 4
     # context haircuts flow through to the stake.
+    #
+    # NOTE (2026-06-04): projected/unconfirmed lineups no longer add an EV
+    # haircut OR a tier downgrade. Both were a flat tax on EVERY pre-lineup
+    # (morning) run, which never discriminated -- it just shifted the whole
+    # slate down. The uncertainty is still captured by the graduated lineup
+    # CONFIDENCE penalty (config.lineup.confidence_penalty), which feeds the
+    # market blend and can still trip the `confidence < downgrade_confidence`
+    # tier downgrade below when it actually drags confidence under the bar.
     tier, tier_reasons = _classify_bet_tier(
-        adjusted_ev, confidence, stability.label, lineup_unconfirmed, config
+        adjusted_ev, confidence, stability.label, config
     )
     kelly_cap = _kelly_cap_for_tier(tier, config)
     original_kelly = evals[best_side].kelly_stake
@@ -515,7 +518,6 @@ def evaluate_game(
 def _compute_adjusted_ev(
     raw_ev: float,
     sharp_fade_pp: float | None,
-    lineup_unconfirmed: bool,
     fragile: bool,
     config: dict,
 ) -> tuple[float, list[str]]:
@@ -555,10 +557,11 @@ def _compute_adjusted_ev(
             adj -= cut
             reasons.append(f"-{cut * 100:.1f}pp sharp fade ({fade:.1f}pp)")
 
-    if lineup_unconfirmed:
-        cut = float(cfg.get("projected_lineup_reduction", 0.010))
-        adj -= cut
-        reasons.append(f"-{cut * 100:.1f}pp projected/unconfirmed lineup")
+    # NOTE (2026-06-04): the projected/unconfirmed-lineup haircut was removed.
+    # It fired on every pre-lineup (morning) run, so it was a flat tax rather
+    # than a discriminating signal -- equivalent to raising the EV threshold by
+    # 1pp on the whole slate. Projected-lineup uncertainty is instead carried by
+    # the graduated lineup CONFIDENCE penalty (config.lineup.confidence_penalty).
 
     if fragile:
         cut = float(cfg.get("fragile_reduction", 0.015))
@@ -577,7 +580,6 @@ def _classify_bet_tier(
     adjusted_ev: float,
     confidence: float,
     stability_label: str,
-    lineup_unconfirmed: bool,
     config: dict,
 ) -> tuple[str, list[str]]:
     """Classify a pick into Pass/Small/Standard/Strong on ADJUSTED EV, then
@@ -595,10 +597,16 @@ def _classify_bet_tier(
     the sanity guards in evaluate_game skip the most egregious cases, but a
     clean-looking 8%+ still deserves a human glance before sizing up.
 
-    Downgrade ONE tier (a single step, never below pass) if ANY of: lineups
-    are unconfirmed, confidence < downgrade_confidence, OR the edge is FRAGILE
-    *and the band tier is Strong* (the "never Strong on a fragile edge" hard
-    rule, Step 3).
+    Downgrade ONE tier (a single step, never below pass) if ANY of: confidence
+    < downgrade_confidence, OR the edge is FRAGILE *and the band tier is Strong*
+    (the "never Strong on a fragile edge" hard rule, Step 3).
+
+    NOTE (2026-06-04): the `lineup_unconfirmed` downgrade trigger was removed.
+    It fired on every pre-lineup (morning) run, so it knocked EVERY pick down a
+    full tier rather than discriminating -- a heavier version of the (also
+    removed) projected-lineup EV haircut. Projected-lineup uncertainty now lives
+    solely in the graduated lineup CONFIDENCE penalty, which can still trip the
+    `confidence < downgrade_confidence` step below when it actually matters.
 
     De-dup note (2026-06-03): the sharp-fade AND the fragile penalties both
     already live in Adjusted EV (Step 4: -fragile_reduction pp), so neither
@@ -639,8 +647,6 @@ def _classify_bet_tier(
     triggers: list[str] = []
     if stability_label == "fragile" and tier == "strong":
         triggers.append("fragile edge (never Strong on fragile)")
-    if lineup_unconfirmed:
-        triggers.append("lineup unconfirmed")
     if confidence < min_conf:
         triggers.append(f"confidence {confidence:.0f} < {min_conf:.0f}")
     if triggers:
