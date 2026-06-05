@@ -319,7 +319,13 @@ adjusted_ev:
   # rather than a discriminating signal. The uncertainty is now carried solely
   # by the graduated lineup CONFIDENCE penalty (config.lineup.confidence_penalty).
   # Edge classified FRAGILE by Step 3 (form-driven / missing data) -> shave.
-  fragile_reduction: 0.015          # -1.5pp EV
+  # Lowered 1.5 -> 1.0pp on 2026-06-05: fragile was firing on 56% of all games
+  # (a flat slate-wide tax, not a discriminator), so its magnitude is reduced to
+  # match its near-universal fire rate. Pairs with raising stability.sharp_fade_
+  # fragile_pp 2->3 (below) so a normal 2-3pp model-vs-sharp gap no longer trips
+  # the fragile label at all. Fragile now SIZES a pick down (Step 5), it does not
+  # veto it -- see _classify_bet_tier's is_raw_pick floor.
+  fragile_reduction: 0.010          # -1.0pp EV
 
 # -----------------------------------------------------------------------------
 # Bet sizing tiers (Step 5, 2026-05-30) — classify each pick into
@@ -486,8 +492,13 @@ stability:
   # form, components with available=False).
   fragile_share_min: 0.50
   # Sharp fade above this many pp on the pick side is a HARD fragile signal.
-  # (Above 5pp the sanity guard SKIPS; this triggers in the 2-5pp range.)
-  sharp_fade_fragile_pp: 2.0
+  # (Above 5pp the sanity guard SKIPS; this triggers in the [this, 5pp] range.)
+  # Raised 2.0 -> 3.0 on 2026-06-05 to ALIGN with adjusted_ev.sharp_fade_pp (3.0):
+  # a 2-3pp model-vs-sharp gap is normal when the model is only weighted 0.35-0.45
+  # in the blend, so tagging it FRAGILE at 2pp made fragile fire on the majority of
+  # the slate AND partially double-counted the sharp signal (fragile haircut at 2pp
+  # PLUS the sharp-fade haircut at 3pp). Now both kick in at the same 3pp gap.
+  sharp_fade_fragile_pp: 3.0
   # >= this many model components with available=False is a HARD fragile
   # signal regardless of which ones are driving the edge.
   missing_component_fragile_n: 2

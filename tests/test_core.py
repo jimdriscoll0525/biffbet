@@ -523,7 +523,7 @@ def test_stability_fragile_on_hard_signal_unavailable_lineup():
 
 
 def test_stability_fragile_on_sharp_fade_hard_signal():
-    """A 2pp+ sharp fade on the pick side flags fragile regardless of drivers."""
+    """A 3pp+ sharp fade on the pick side flags fragile regardless of drivers."""
     from mlb_value_bot.analysis.stability import classify_edge_stability
     from mlb_value_bot.data.lineup_status import LineupStatus, STATUS_CONFIRMED
     components = [
@@ -672,6 +672,21 @@ def test_bet_tier_never_strong_on_fragile():
     """Step 3 hard rule preserved as a special case of the unified downgrade."""
     from mlb_value_bot.pipeline import _classify_bet_tier
     assert _classify_bet_tier(0.20, 90, "fragile", {})[0] != "strong"
+
+
+def test_bet_tier_raw_pick_floored_to_small_not_pass():
+    """Decouple selection from sizing (2026-06-05): a game that cleared the raw-EV
+    pick threshold is floored at `small` -- Adjusted EV / fragility size it but can
+    never veto it back to `pass`. Without the raw-pick flag, the same sub-2% adj EV
+    still passes (a non-pick game)."""
+    from mlb_value_bot.pipeline import _classify_bet_tier
+    # Adj EV below the 2% small_ev floor.
+    assert _classify_bet_tier(0.005, 80, "moderate", {})[0] == "pass"              # not a raw pick
+    assert _classify_bet_tier(0.005, 80, "moderate", {}, is_raw_pick=True)[0] == "small"
+    # Even fragile + low confidence cannot push a raw pick below small.
+    assert _classify_bet_tier(0.005, 50, "fragile", {}, is_raw_pick=True)[0] == "small"
+    # And a fragile raw pick whose band IS small stays small (single-step floor).
+    assert _classify_bet_tier(0.030, 50, "fragile", {}, is_raw_pick=True)[0] == "small"
 
 
 def test_kelly_caps_per_tier():

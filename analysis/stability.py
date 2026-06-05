@@ -72,7 +72,7 @@ def classify_edge_stability(
     cfg = config.get("stability", {})
     stable_threshold = float(cfg.get("stable_share_min", 0.60))
     fragile_threshold = float(cfg.get("fragile_share_min", 0.50))
-    sharp_fade_fragile_pp = float(cfg.get("sharp_fade_fragile_pp", 2.0))
+    sharp_fade_fragile_pp = float(cfg.get("sharp_fade_fragile_pp", 3.0))
     missing_component_fragile_n = int(cfg.get("missing_component_fragile_n", 2))
 
     sign = 1.0 if best_side == "home" else -1.0

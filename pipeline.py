@@ -481,8 +481,14 @@ def evaluate_game(
     # CONFIDENCE penalty (config.lineup.confidence_penalty), which feeds the
     # market blend and can still trip the `confidence < downgrade_confidence`
     # tier downgrade below when it actually drags confidence under the bar.
+    # Selection is decided by RAW EV (config.ev.threshold); Adjusted EV / fragility
+    # only SIZE the bet. A game that already cleared the raw bar is floored at the
+    # `small` tier inside _classify_bet_tier so the context haircuts can't veto it
+    # back to `pass` (the 2026-06-05 decouple-selection-from-sizing change).
+    ev_threshold = float(config.get("ev", {}).get("threshold", 0.03))
+    is_raw_pick = raw_ev >= ev_threshold
     tier, tier_reasons = _classify_bet_tier(
-        adjusted_ev, confidence, stability.label, config
+        adjusted_ev, confidence, stability.label, config, is_raw_pick=is_raw_pick
     )
     kelly_cap = _kelly_cap_for_tier(tier, config)
     original_kelly = evals[best_side].kelly_stake
@@ -581,6 +587,7 @@ def _classify_bet_tier(
     confidence: float,
     stability_label: str,
     config: dict,
+    is_raw_pick: bool = False,
 ) -> tuple[str, list[str]]:
     """Classify a pick into Pass/Small/Standard/Strong on ADJUSTED EV, then
     apply a single one-tier downgrade guardrail. Returns (tier, reasons).
@@ -590,6 +597,16 @@ def _classify_bet_tier(
         [small_ev, standard_ev)   -> small/lean
         [standard_ev, strong_ev)  -> standard
         adj EV >= strong_ev  (8%) -> strong
+
+    SELECTION vs SIZING (2026-06-05): `is_raw_pick` is True when the game already
+    cleared the raw-EV pick threshold (config.ev.threshold). Selection is decided
+    by RAW EV alone; Adjusted EV / fragility only SIZE the bet. So a raw-qualifying
+    pick is floored at `small` -- the context haircuts can keep it from sizing UP to
+    standard/strong, but never veto it back to `pass`. Only a game that never cleared
+    the raw bar can land in `pass`. (Before this, a fragile -1.5pp + sharp-fade -1.0pp
+    stack routinely dragged a +3-4% raw edge under the 2% adj-EV floor -> pass -> no
+    pick, which silenced the slate for 6 straight days. CLV on the now-published small
+    picks is the honest test of whether fragile edges deserve to be bet at all.)
 
     NOTE on STRONG: 8%+ EV on an MLB moneyline is RARE and far more often a
     model/data error (stale line, scratched starter, bad de-vig) than a real
@@ -624,10 +641,20 @@ def _classify_bet_tier(
     strong_ev = float(sizing.get("strong_ev", 0.08))
     min_conf = float(sizing.get("downgrade_confidence", 65.0))
 
+    # Floor index for the downgrade step below: a raw-qualifying pick never
+    # drops below `small` (selection is by raw EV; haircuts only size it).
+    floor_idx = _TIER_ORDER.index("small") if is_raw_pick else _TIER_ORDER.index("pass")
+
     reasons: list[str] = []
     if adjusted_ev < small_ev:
-        return "pass", [f"adj EV {adjusted_ev * 100:.1f}% below {small_ev * 100:.1f}% threshold"]
-    if adjusted_ev < standard_ev:
+        if not is_raw_pick:
+            return "pass", [f"adj EV {adjusted_ev * 100:.1f}% below {small_ev * 100:.1f}% threshold"]
+        tier = "small"
+        reasons.append(
+            f"adj EV {adjusted_ev * 100:.1f}% < {small_ev * 100:.0f}% but raw EV cleared the pick "
+            f"threshold -> floored to small (selection is by raw EV; haircuts only size)"
+        )
+    elif adjusted_ev < standard_ev:
         tier = "small"
         reasons.append(f"adj EV {adjusted_ev * 100:.1f}% in lean range [{small_ev * 100:.0f}%, {standard_ev * 100:.0f}%)")
     elif adjusted_ev < strong_ev:
@@ -651,7 +678,7 @@ def _classify_bet_tier(
         triggers.append(f"confidence {confidence:.0f} < {min_conf:.0f}")
     if triggers:
         idx = _TIER_ORDER.index(tier)
-        new_tier = _TIER_ORDER[max(0, idx - 1)]
+        new_tier = _TIER_ORDER[max(floor_idx, idx - 1)]
         if new_tier != tier:
             reasons.append(f"downgraded {tier} -> {new_tier}: {', '.join(triggers)}")
             tier = new_tier
