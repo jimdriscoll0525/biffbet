@@ -82,6 +82,27 @@ def _prepare(df: pd.DataFrame) -> pd.DataFrame:
     # which of our newer guardrails are actually predictive.
     df["bet_tier"] = df["reasoning_json"].apply(_extract_bet_tier).astype("string")
     df["blend_tier"] = df["reasoning_json"].apply(_extract_blend_tier).astype("string")
+
+    # Stratified view (2026-06-11): the three slices that drove the sharp-fade
+    # tightening — edge stability label, signed sharp-fade pp, and a finer
+    # odds split than favorite/underdog. All derivable from stored rows, so
+    # history back-fills the moment this ships.
+    df["stability"] = pd.Categorical(
+        df["reasoning_json"].apply(_extract_stability),
+        categories=["stable", "moderate", "fragile", "n/a"],
+    )
+    fade_pp = df.apply(_sharp_fade_pp, axis=1)
+    df["sharp_fade"] = pd.cut(
+        fade_pp, bins=[-np.inf, -3.0, 3.0, 4.0, np.inf],
+        labels=["sharps agree 3pp+", "neutral", "fade 3-4pp", "fade 4pp+"],
+    ).cat.add_categories(["n/a"]).fillna("n/a")
+    # American odds are never in (-100, 100), so a bin edge at 0 splits
+    # favorites from underdogs exactly.
+    df["odds_bucket"] = pd.cut(
+        df["american_odds"], bins=[-np.inf, -150, 0, 150, np.inf],
+        labels=["big fav (-150+)", "small fav (-101..-149)",
+                "small dog (+100..+150)", "big dog (+151+)"],
+    )
     return df
 
 
@@ -101,6 +122,38 @@ def _extract_blend_tier(raw: str | None) -> str:
         return json.loads(raw).get("market_anchor", {}).get("blend_tier") or "n/a"
     except (json.JSONDecodeError, AttributeError):
         return "n/a"
+
+
+def _extract_stability(raw: str | None) -> str:
+    if not isinstance(raw, str) or not raw:
+        return "n/a"
+    try:
+        return json.loads(raw).get("stability", {}).get("label") or "n/a"
+    except (json.JSONDecodeError, AttributeError):
+        return "n/a"
+
+
+def _sharp_fade_pp(row) -> float:
+    """Signed sharp-fade in probability points, reconstructed per row.
+
+    Positive = our blended prob on the pick side exceeds the sharp consensus
+    (we are FADING the sharps); negative = the sharps are even more bullish
+    than we are (sharp support). Same sign convention as pipeline's
+    sharp_fade_pp. Reconstructed from market_intel.sharp_devig_home +
+    the stored pick-side model_prob, so it covers every row that captured
+    market intel — there is no separate stored field to depend on.
+    """
+    raw = row.get("reasoning_json")
+    if not isinstance(raw, str) or not raw:
+        return np.nan
+    try:
+        sharp_home = json.loads(raw).get("market_intel", {}).get("sharp_devig_home")
+    except (json.JSONDecodeError, AttributeError):
+        return np.nan
+    if sharp_home is None:
+        return np.nan
+    sharp_pick = sharp_home if row["recommended_side"] == "home" else 1.0 - sharp_home
+    return (float(row["model_prob"]) - float(sharp_pick)) * 100.0
 
 
 def _stats(df: pd.DataFrame) -> dict:
@@ -163,6 +216,9 @@ def compute_performance(since: str | None = None) -> PerformanceReport:
     overall = _stats(df)
 
     segments = {
+        "By edge stability": _segment(df, "stability"),
+        "By sharp fade": _segment(df, "sharp_fade"),
+        "By odds bucket": _segment(df, "odds_bucket"),
         "By confidence bucket": _segment(df, "confidence_bucket"),
         "By EV bucket": _segment(df, "ev_bucket"),
         "By Kelly bucket": _segment(df, "kelly_bucket"),

@@ -319,6 +319,25 @@ def test_get_open_dates_backfill_sweep():
         importlib.reload(recs)
 
 
+def test_sharp_fade_pp_reconstruction():
+    """Signed sharp-fade is rebuilt from stored model_prob + market_intel:
+    positive when we're more bullish than the sharps on our pick side,
+    NaN when market intel was never captured."""
+    import json as _json
+    import math
+    from mlb_value_bot.tracking.performance import _sharp_fade_pp
+
+    rj = _json.dumps({"market_intel": {"sharp_devig_home": 0.50}})
+    home_fade = _sharp_fade_pp({"reasoning_json": rj, "recommended_side": "home", "model_prob": 0.545})
+    assert approx(home_fade, 4.5, tol=1e-9)
+    # Away pick: sharps' away prob is 1 - sharp_devig_home.
+    away_support = _sharp_fade_pp({"reasoning_json": rj, "recommended_side": "away", "model_prob": 0.47})
+    assert approx(away_support, -3.0, tol=1e-9)
+    # No market intel captured -> NaN (lands in the "n/a" bucket).
+    assert math.isnan(_sharp_fade_pp({"reasoning_json": "{}", "recommended_side": "home", "model_prob": 0.5}))
+    assert math.isnan(_sharp_fade_pp({"reasoning_json": None, "recommended_side": "home", "model_prob": 0.5}))
+
+
 # --- Odds <-> schedule matching (date-aware, series-safe) --------------------
 def test_match_odds_picks_correct_day_in_a_series():
     from types import SimpleNamespace
