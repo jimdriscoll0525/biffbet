@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import sys
-from datetime import date, timedelta
+from datetime import date
 
 # Windows legacy consoles default to cp1252; force UTF-8 so rich tables and any
 # unicode render cleanly. No-op on platforms that already use UTF-8.
@@ -204,28 +204,53 @@ def _render_skipped(skipped: list[GameAnalysis]) -> None:
 # results
 # ---------------------------------------------------------------------------
 @cli.command()
-@click.option("--date", "date_", default=None, help="Game date YYYY-MM-DD (default: yesterday).")
+@click.option("--date", "date_", default=None,
+              help="Game date YYYY-MM-DD (default: sweep ALL past dates with open bets).")
 def results(date_: str | None) -> None:
-    """Fetch final scores and settle open bets for a date."""
-    game_date = date_ or (date.today() - timedelta(days=1)).isoformat()
-    summary = results_mod.grade_date(game_date)
+    """Fetch final scores and settle open bets.
 
-    table = Table(title=f"Results — {game_date}", header_style="bold cyan")
-    for col in ("Matchup", "Pick", "Result", "P/L (units)"):
-        table.add_column(col)
-    for b in summary.bets:
-        color = "green" if b.result == "win" else ("red" if b.result == "loss" else "yellow")
-        table.add_row(b.matchup, b.side, f"[{color}]{b.result}[/]", f"[{color}]{b.profit_loss:+.4f}[/]")
-    console.print(table)
+    With --date, grades that single date. Without it, sweeps every past date
+    that still has pending bets, so a missed grading run (failed pipeline,
+    suspended game, pre-grading rows) self-heals on the next run.
+    """
+    if date_:
+        summaries = [results_mod.grade_date(date_)]
+    else:
+        summaries = results_mod.grade_all_open(before=date.today().isoformat())
+        if not summaries:
+            console.print("[dim]No past dates with open bets.[/]")
+            return
 
-    roi_txt = _fmt_pct(summary.roi) if summary.staked > 0 else "-"
-    console.print(Panel(
-        f"Settled: [bold]{summary.graded}[/]  ({summary.wins}W-{summary.losses}L)   "
-        f"Void: {summary.voids}   Pending: {summary.pending}\n"
-        f"Staked: {summary.staked:.4f} units   "
-        f"P/L: [bold]{summary.profit_loss:+.4f}[/] units   ROI: [bold]{roi_txt}[/]",
-        title=f"Daily P/L — {game_date}", border_style="cyan", expand=False,
-    ))
+    for summary in summaries:
+        table = Table(title=f"Results — {summary.date}", header_style="bold cyan")
+        for col in ("Matchup", "Pick", "Result", "P/L (units)"):
+            table.add_column(col)
+        for b in summary.bets:
+            color = "green" if b.result == "win" else ("red" if b.result == "loss" else "yellow")
+            table.add_row(b.matchup, b.side, f"[{color}]{b.result}[/]", f"[{color}]{b.profit_loss:+.4f}[/]")
+        console.print(table)
+
+        roi_txt = _fmt_pct(summary.roi) if summary.staked > 0 else "-"
+        console.print(Panel(
+            f"Settled: [bold]{summary.graded}[/]  ({summary.wins}W-{summary.losses}L)   "
+            f"Void: {summary.voids}   Pending: {summary.pending}\n"
+            f"Staked: {summary.staked:.4f} units   "
+            f"P/L: [bold]{summary.profit_loss:+.4f}[/] units   ROI: [bold]{roi_txt}[/]",
+            title=f"Daily P/L — {summary.date}", border_style="cyan", expand=False,
+        ))
+
+    if len(summaries) > 1:
+        graded = sum(s.graded for s in summaries)
+        wins = sum(s.wins for s in summaries)
+        losses = sum(s.losses for s in summaries)
+        pl = sum(s.profit_loss for s in summaries)
+        pending = sum(s.pending for s in summaries)
+        console.print(Panel(
+            f"Dates swept: [bold]{len(summaries)}[/]   Settled: [bold]{graded}[/]  "
+            f"({wins}W-{losses}L)   Still pending: {pending}   "
+            f"P/L: [bold]{pl:+.4f}[/] units",
+            title="Backfill total", border_style="magenta", expand=False,
+        ))
 
 
 # ---------------------------------------------------------------------------

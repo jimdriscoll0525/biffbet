@@ -98,3 +98,22 @@ def grade_date(game_date: str, mlb_client: MLBClient | None = None) -> GradingSu
         game_date, summary.graded, summary.wins, summary.losses, summary.voids, summary.pending, summary.profit_loss,
     )
     return summary
+
+
+def grade_all_open(before: str, mlb_client: MLBClient | None = None) -> list[GradingSummary]:
+    """Grade EVERY past date (< `before`) that still has pending bets.
+
+    Self-healing backfill: grading only yesterday orphans any bet whose result
+    wasn't captured on its one chance (pipeline run failed, game suspended past
+    the grading run, rows created before grading shipped). Sweeping all open
+    dates means a missed grade is retried on every subsequent run until the
+    MLB API can settle it.
+    """
+    mlb = mlb_client or MLBClient()
+    dates = recs.get_open_dates(before=before)
+    if not dates:
+        log.info("No past dates with open bets.")
+        return []
+    if len(dates) > 1:
+        log.info("Open bets on %d dates (%s..%s) — sweeping all.", len(dates), dates[0], dates[-1])
+    return [grade_date(d, mlb_client=mlb) for d in dates]

@@ -284,6 +284,26 @@ def get_open_for_date(game_date: str) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def get_open_dates(before: str | None = None) -> list[str]:
+    """Distinct game dates that still have pending bets (is_value=1), ascending.
+
+    `before` (YYYY-MM-DD, exclusive) restricts to past dates so an in-progress
+    slate isn't swept; None returns every open date. Used by the grading
+    backfill: a bet can outlive the old "grade yesterday" default (a failed
+    run, a game still in progress when graded, rows created before grading
+    existed), so `results` sweeps these instead of assuming yesterday.
+    """
+    init_db()
+    query = "SELECT DISTINCT date FROM recommendations WHERE result='pending' AND is_value=1"
+    params: tuple = ()
+    if before:
+        query += " AND date < ?"
+        params = (before,)
+    query += " ORDER BY date"
+    with connect() as conn:
+        return [row["date"] for row in conn.execute(query, params)]
+
+
 def get_for_date(game_date: str) -> list[sqlite3.Row]:
     init_db()
     with connect() as conn:

@@ -277,9 +277,15 @@ sanity:
   # Sharp-fade skip threshold (#5). If our blended pick disagrees with the
   # sharp consensus on the side we're recommending by MORE than this many
   # probability points, skip the game -- the sharps know something we don't.
-  # 5pp is conservative; tune via backtest. Set to a very large number to
-  # disable while leaving the rest of the sharp/square signal active.
-  max_sharp_disagreement_pp: 5.0
+  # Set to a very large number to disable while leaving the rest of the
+  # sharp/square signal active.
+  # Tightened 5.0 -> 4.0 on 2026-06-11: after the 06-05 selection/sizing
+  # decoupling the pick stream became dominated by fragile sharp-fade picks
+  # hugging the old threshold (12 of 14 graded picks 06-07..06-10 faded the
+  # sharps 3.5-5.0pp; the 4-5pp bucket went 4-6, -1.3% bankroll). Raw-EV
+  # selection preferentially picks the games where we disagree with Pinnacle
+  # the most, so the skip line moves down to cut that adverse-selection tail.
+  max_sharp_disagreement_pp: 4.0
 
 kelly:
   fraction: 0.25          # quarter-Kelly

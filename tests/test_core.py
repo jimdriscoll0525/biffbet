@@ -281,6 +281,44 @@ def test_tracking_roundtrip(tmp_path=None):
         importlib.reload(recs)
 
 
+def test_get_open_dates_backfill_sweep():
+    """get_open_dates returns past dates with pending BETS only (the grading
+    backfill source): graded rows, analysis-only rows, and dates >= `before`
+    are all excluded."""
+    import importlib
+    import mlb_value_bot.utils as utils
+    from pathlib import Path
+    import tempfile
+
+    tmpdir = Path(tempfile.mkdtemp())
+    orig_db = utils.DB_PATH
+    utils.DB_PATH = tmpdir / "test.db"
+    recs = importlib.reload(importlib.import_module("mlb_value_bot.tracking.recommendations"))
+    try:
+        def mk(d, gid, is_value=True):
+            return recs.RecommendationRecord(
+                date=d, game_id=gid, home_team="H", away_team="A",
+                recommended_side="home", model_prob=0.55, market_prob_devigged=0.52,
+                american_odds=-110, decimal_odds=ev.american_to_decimal(-110),
+                ev_pct=0.04, kelly_stake=0.005, confidence=70.0, is_value=is_value,
+            )
+
+        old_pending = recs.upsert_recommendation(mk("2024-04-01", 1))   # orphaned bet
+        recs.upsert_recommendation(mk("2024-04-02", 2))                 # graded below
+        recs.upsert_recommendation(mk("2024-04-03", 3, is_value=False)) # analysis only
+        recs.upsert_recommendation(mk("2024-04-05", 4))                 # today (excluded)
+        graded = recs.get_for_date("2024-04-02")[0]["id"]
+        recs.update_result(graded, "win", 0.004)
+
+        assert recs.get_open_dates(before="2024-04-05") == ["2024-04-01"]
+        # No cutoff -> today's open bet included too.
+        assert recs.get_open_dates() == ["2024-04-01", "2024-04-05"]
+        assert old_pending > 0
+    finally:
+        utils.DB_PATH = orig_db
+        importlib.reload(recs)
+
+
 # --- Odds <-> schedule matching (date-aware, series-safe) --------------------
 def test_match_odds_picks_correct_day_in_a_series():
     from types import SimpleNamespace
