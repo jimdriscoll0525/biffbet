@@ -75,6 +75,13 @@ class GameAnalysis:
     # fragile edge) and is what the sizing tiers read. None until computed.
     adjusted_ev_pct: float | None = None
     adjusted_ev_reasons: list[str] = field(default_factory=list)
+    # Bet-book moneyline per side, kept even when a later sanity guard SKIPS
+    # the game, so committed bets on skipped games can still get their closing
+    # line refreshed (CLV is the primary metric; a skip must not freeze it).
+    # Only set once the prices clear the implausible-odds guard -- a garbage
+    # line must never become a closing price. None on no-odds/unplayable skips.
+    home_odds: int | None = None
+    away_odds: int | None = None
 
     @property
     def best_eval(self) -> SideEvaluation | None:
@@ -280,6 +287,11 @@ def evaluate_game(
             f"implausible odds ({home_odds:+d}/{away_odds:+d}) - likely bad market data"
         )
         return analysis
+    # Prices are sane: keep them on the analysis so later sanity skips
+    # (divergence / sharp fade / max EV) can still refresh committed bets'
+    # closing lines.
+    analysis.home_odds = int(home_odds)
+    analysis.away_odds = int(away_odds)
 
     # Build metric profiles. Missing probable pitchers degrade gracefully:
     # the starter/form components fall to 0 and confidence drops.
@@ -1004,6 +1016,32 @@ def flag_starter_scratches(analyses: list[GameAnalysis], game_date: str) -> int:
                 )
         n_alerts += added
     return n_alerts
+
+
+def refresh_skipped_closing_lines(analyses: list[GameAnalysis], game_date: str) -> int:
+    """Refresh closing line + CLV on committed bets whose game was skipped.
+
+    Sanity skips (divergence, sharp fade, implausible EV) early-return before
+    save, so a committed bet on a skipped game stopped getting closing-line
+    refreshes -- its CLV froze at the last non-skipped run. Since CLV is the
+    project's primary edge metric, and a scratch/news event (the usual skip
+    trigger) is precisely when the close moves most, those are the LAST bets
+    whose CLV we can afford to lose. Only analyses whose prices cleared the
+    implausible-odds guard carry home_odds/away_odds, so a garbage line can
+    never become a closing price. Saved (evaluable) games are untouched --
+    their upsert already refreshes the close. Returns bets refreshed.
+    """
+    from mlb_value_bot.tracking.recommendations import refresh_closing_line
+
+    n = 0
+    for a in analyses:
+        if a.best_eval is not None:
+            continue  # saved normally; upsert handled the close
+        if a.home_odds is None or a.away_odds is None:
+            continue  # no trustworthy prices this run
+        if refresh_closing_line(game_date, a.game_id, {"home": a.home_odds, "away": a.away_odds}):
+            n += 1
+    return n
 
 
 def save_value_bets(value_bets: list[GameAnalysis], game_date: str) -> int:

@@ -32,6 +32,7 @@ from mlb_value_bot.pipeline import (  # save_value_bets kept for back-compat imp
     GameAnalysis,
     analyze_slate,
     flag_starter_scratches,
+    refresh_skipped_closing_lines,
     save_slate,
     save_value_bets,
 )
@@ -123,16 +124,25 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
     elif save:
         console.print("[dim]Nothing to save (no evaluable games).[/]")
 
-    # Scratch detection: runs over the FULL slate (skipped games included --
+    # Post-save maintenance over the FULL slate (skipped games included --
     # a scratched game usually trips the divergence guard, so the skipped
-    # list is where it lands). Annotates committed bets whose probable
-    # starter changed since commit; the bets themselves stay frozen.
+    # list is where it lands):
+    #   * scratch detection annotates committed bets whose probable starter
+    #     changed since commit (the bets themselves stay frozen);
+    #   * closing-line refresh keeps CLV moving on committed bets whose game
+    #     was sanity-skipped this run (a skip must not freeze the close).
     if save and analyses:
         n_scratches = flag_starter_scratches(analyses, game_date)
         if n_scratches:
             console.print(
                 f"[bold red]{n_scratches} starter change(s) detected on committed "
                 f"pick(s) -- their edge basis is stale. See log / site for details.[/]"
+            )
+        n_refreshed = refresh_skipped_closing_lines(analyses, game_date)
+        if n_refreshed:
+            console.print(
+                f"[dim]Refreshed closing line on {n_refreshed} committed pick(s) "
+                f"whose game was skipped this run.[/]"
             )
 
 

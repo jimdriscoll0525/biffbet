@@ -383,6 +383,65 @@ def test_scratch_alerts_merge_and_dedupe():
         importlib.reload(recs)
 
 
+def test_refresh_closing_line_on_skipped_game():
+    """A committed bet on a sanity-skipped game still gets its closing line +
+    CLV refreshed from the skipped analysis's stored prices; analysis-only
+    rows and games without trustworthy prices are untouched."""
+    import importlib
+    import mlb_value_bot.utils as utils
+    from pathlib import Path
+    import tempfile
+
+    tmpdir = Path(tempfile.mkdtemp())
+    orig_db = utils.DB_PATH
+    utils.DB_PATH = tmpdir / "test.db"
+    recs = importlib.reload(importlib.import_module("mlb_value_bot.tracking.recommendations"))
+    try:
+        def mk(gid, is_value=True):
+            return recs.RecommendationRecord(
+                date="2024-04-01", game_id=gid, home_team="H", away_team="A",
+                recommended_side="away", model_prob=0.55, market_prob_devigged=0.52,
+                american_odds=-110, decimal_odds=ev.american_to_decimal(-110),
+                ev_pct=0.05, kelly_stake=0.005, confidence=70.0, is_value=is_value,
+            )
+
+        recs.upsert_recommendation(mk(1))                  # committed bet
+        recs.upsert_recommendation(mk(2, is_value=False))  # analysis only
+
+        # Direct refresh: away side shortened -110 -> -130 => positive CLV.
+        assert recs.refresh_closing_line("2024-04-01", 1, {"home": 110, "away": -130})
+        row = recs.get_for_date("2024-04-01")[0]
+        assert row["closing_line"] == -130
+        assert row["opening_line"] == -110          # opening never moves
+        assert row["clv_pct"] is not None and row["clv_pct"] > 0
+        # Non-bet rows and unknown games are no-ops.
+        assert not recs.refresh_closing_line("2024-04-01", 2, {"home": 110, "away": -130})
+        assert not recs.refresh_closing_line("2024-04-01", 99, {"home": 110, "away": -130})
+        # Missing the bet's side -> no-op.
+        assert not recs.refresh_closing_line("2024-04-01", 1, {"home": 110})
+
+        # Through the pipeline pass: a skipped analysis (no best_eval) with
+        # sane stored prices refreshes; one without prices is ignored.
+        from mlb_value_bot.pipeline import GameAnalysis, refresh_skipped_closing_lines
+        skipped = GameAnalysis(
+            game_id=1, game_date="2024-04-01", home_team="H", away_team="A",
+            status="Scheduled", home_pitcher="X", away_pitcher="Y",
+            skipped_reason="fading sharp consensus by 9.9pp",
+        )
+        skipped.home_odds, skipped.away_odds = 120, -140
+        no_odds = GameAnalysis(
+            game_id=2, game_date="2024-04-01", home_team="H", away_team="A",
+            status="Scheduled", home_pitcher=None, away_pitcher=None,
+            skipped_reason="no odds found",
+        )
+        assert refresh_skipped_closing_lines([skipped, no_odds], "2024-04-01") == 1
+        row = recs.get_for_date("2024-04-01")[0]
+        assert row["closing_line"] == -140
+    finally:
+        utils.DB_PATH = orig_db
+        importlib.reload(recs)
+
+
 def test_sharp_fade_pp_reconstruction():
     """Signed sharp-fade is rebuilt from stored model_prob + market_intel:
     positive when we're more bullish than the sharps on our pick side,

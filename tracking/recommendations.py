@@ -284,6 +284,39 @@ def get_open_for_date(game_date: str) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def refresh_closing_line(game_date: str, game_id: int, side_odds: dict[str, int]) -> bool:
+    """Update closing_line/clv_pct on a committed bet from current prices.
+
+    Mirrors the committed-bet branch of `upsert_recommendation` (opening line
+    kept, only close + CLV move) for games the pipeline did NOT save this run
+    -- i.e. sanity-skipped games, whose committed bets otherwise freeze their
+    CLV at the last non-skipped run. `side_odds` maps "home"/"away" to the
+    bet-book American price. Returns True if a bet was updated.
+    """
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, recommended_side, opening_line FROM recommendations "
+            "WHERE date=? AND game_id=? AND is_value=1",
+            (game_date, game_id),
+        ).fetchone()
+        if row is None:
+            return False
+        closing = side_odds.get(row["recommended_side"])
+        if closing is None:
+            return False
+        clv = _compute_clv(row["opening_line"], int(closing))
+        conn.execute(
+            "UPDATE recommendations SET closing_line=?, clv_pct=?, updated_at=? WHERE id=?",
+            (int(closing), clv, _now(), row["id"]),
+        )
+        log.info(
+            "Refreshed closing line for skipped game %s (%s): %+d (CLV %.2f%%)",
+            game_id, row["recommended_side"], int(closing), clv if clv is not None else 0.0,
+        )
+        return True
+
+
 def get_committed_bet(game_date: str, game_id: int) -> sqlite3.Row | None:
     """The committed bet row (is_value=1) for a game, or None."""
     init_db()
