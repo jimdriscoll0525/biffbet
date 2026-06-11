@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -197,6 +198,10 @@ def push_performance(url: str, key: str, since: str | None = None) -> int:
         "scope": scope,
         "overall": _clean(report.overall),
         "segments": _segments_to_json(report.segments),
+        # The column's DEFAULT now() only fires on INSERT; the merge-duplicates
+        # upsert keeps whatever was first written unless we send it explicitly,
+        # which froze the site's "updated ..." stamp at the first-ever sync.
+        "computed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }]
     _post(url, key, "performance_snapshot", payload, on_conflict="scope")
     log.info("Synced performance snapshot (scope=%s) to Supabase.", scope)
