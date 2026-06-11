@@ -946,6 +946,66 @@ def save_slate(analyses: list[GameAnalysis], threshold: float, game_date: str) -
     return total, n_value
 
 
+def _detect_starter_changes(
+    stored_pitchers: dict | None,
+    current_home: str | None,
+    current_away: str | None,
+) -> list[dict]:
+    """Compare a committed bet's pitchers against today's probables.
+
+    Returns one alert per changed side: {"side", "was", "now"}. A side only
+    alerts when the bet was priced on a NAMED starter (`was` non-null) and the
+    current probable differs; a probable that has been pulled entirely reads
+    as "TBD" (a scratch with no announced replacement). A bet committed with
+    no probable never alerts -- there was no starter assumption to invalidate.
+    """
+    alerts: list[dict] = []
+    for side, current in (("home", current_home), ("away", current_away)):
+        was = (stored_pitchers or {}).get(side)
+        if was and current != was:
+            alerts.append({"side": side, "was": was, "now": current or "TBD"})
+    return alerts
+
+
+def flag_starter_scratches(analyses: list[GameAnalysis], game_date: str) -> int:
+    """Annotate committed bets whose probable starter changed since commit.
+
+    PRODUCTION INCIDENTS 2026-05-28/29: a late scratch moves the market
+    25-30pp while a morning-committed pick still prices the announced
+    starter. The sanity guards stop NEW picks on such games, but the
+    committed bet stays published with its edge basis silently invalidated.
+    This pass runs over the FULL slate -- including skipped games, which is
+    exactly where a scratched game lands once the divergence guard fires --
+    and appends a `scratch_alerts` entry to the bet's stored reasoning so the
+    CLI and the site can warn. Annotation only: the bet itself stays frozen
+    (price, EV, tier are the record of what was actually published).
+    Returns the number of new alerts recorded.
+    """
+    import json as _json
+
+    from mlb_value_bot.tracking.recommendations import add_scratch_alerts, get_committed_bet
+
+    n_alerts = 0
+    for a in analyses:
+        bet = get_committed_bet(game_date, a.game_id)
+        if bet is None:
+            continue
+        try:
+            stored = _json.loads(bet["reasoning_json"] or "{}").get("pitchers")
+        except _json.JSONDecodeError:
+            continue
+        alerts = _detect_starter_changes(stored, a.home_pitcher, a.away_pitcher)
+        added = add_scratch_alerts(game_date, a.game_id, alerts)
+        if added:
+            for alert in alerts:
+                log.warning(
+                    "STARTER CHANGE on committed bet %s @ %s: %s starter was %r, now %r",
+                    a.away_team, a.home_team, alert["side"], alert["was"], alert["now"],
+                )
+        n_alerts += added
+    return n_alerts
+
+
 def save_value_bets(value_bets: list[GameAnalysis], game_date: str) -> int:
     """Backward-compat wrapper: persist a pre-filtered list of +EV bets.
 

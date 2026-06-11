@@ -25,7 +25,7 @@ import pandas as pd
 import streamlit as st
 
 from mlb_value_bot.data.fangraphs_csv import status as fg_status
-from mlb_value_bot.pipeline import analyze_slate, save_slate
+from mlb_value_bot.pipeline import analyze_slate, flag_starter_scratches, save_slate
 from mlb_value_bot.tracking import performance as perf
 from mlb_value_bot.tracking import recommendations as recs
 from mlb_value_bot.tracking import results as results_mod
@@ -92,6 +92,11 @@ def page_today() -> None:
                 st.session_state[f"saved_{date_str}"] = total
                 st.success(f"Analyzed {len(evaluable)} games · "
                            f"{n_value} +EV · saved {total} rows ({n_value} bets) to the tracking DB.")
+                # Scratch detection over the FULL slate (skipped games included).
+                n_scratches = flag_starter_scratches(analyses, date_str)
+                if n_scratches:
+                    st.warning(f"{n_scratches} starter change(s) detected on committed picks — "
+                               "their edge basis is stale (see each pick's reasoning).")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Analysis failed: {exc}")
 

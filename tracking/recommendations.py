@@ -284,6 +284,59 @@ def get_open_for_date(game_date: str) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def get_committed_bet(game_date: str, game_id: int) -> sqlite3.Row | None:
+    """The committed bet row (is_value=1) for a game, or None."""
+    init_db()
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM recommendations WHERE date=? AND game_id=? AND is_value=1",
+            (game_date, game_id),
+        ).fetchone()
+
+
+def add_scratch_alerts(game_date: str, game_id: int, alerts: list[dict]) -> int:
+    """Merge starter-change alerts into a committed bet's reasoning_json.
+
+    Committed bets deliberately freeze their reasoning at commit time (the
+    upsert never rewrites it), so this is the ONE sanctioned mutation: an
+    append-only `scratch_alerts` list recording that the probable starter the
+    bet was priced on has changed. Deduped on (side, was, now) so the every-30m
+    pipeline doesn't stack copies. Returns the number of alerts actually added.
+    """
+    if not alerts:
+        return 0
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, reasoning_json FROM recommendations WHERE date=? AND game_id=? AND is_value=1",
+            (game_date, game_id),
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            reasoning = json.loads(row["reasoning_json"] or "{}")
+        except json.JSONDecodeError:
+            reasoning = {}
+        existing = reasoning.get("scratch_alerts") or []
+        seen = {(a.get("side"), a.get("was"), a.get("now")) for a in existing}
+        added = 0
+        for alert in alerts:
+            key = (alert.get("side"), alert.get("was"), alert.get("now"))
+            if key in seen:
+                continue
+            seen.add(key)
+            existing.append({**alert, "detected_at": _now()})
+            added += 1
+        if not added:
+            return 0
+        reasoning["scratch_alerts"] = existing
+        conn.execute(
+            "UPDATE recommendations SET reasoning_json=?, updated_at=? WHERE id=?",
+            (json.dumps(reasoning), _now(), row["id"]),
+        )
+        return added
+
+
 def get_open_dates(before: str | None = None) -> list[str]:
     """Distinct game dates that still have pending bets (is_value=1), ascending.
 

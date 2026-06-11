@@ -319,6 +319,70 @@ def test_get_open_dates_backfill_sweep():
         importlib.reload(recs)
 
 
+def test_detect_starter_changes():
+    """A committed bet alerts only when a NAMED starter it was priced on
+    changes; a pulled probable reads as TBD; no stored name -> no alert."""
+    from mlb_value_bot.pipeline import _detect_starter_changes
+
+    stored = {"home": "Jack Perkins", "away": "Bryan Woo"}
+    # No change -> no alerts.
+    assert _detect_starter_changes(stored, "Jack Perkins", "Bryan Woo") == []
+    # Home starter swapped -> one home alert.
+    assert _detect_starter_changes(stored, "Emergency Guy", "Bryan Woo") == [
+        {"side": "home", "was": "Jack Perkins", "now": "Emergency Guy"}
+    ]
+    # Probable pulled entirely (scratch, replacement TBD).
+    assert _detect_starter_changes(stored, "Jack Perkins", None) == [
+        {"side": "away", "was": "Bryan Woo", "now": "TBD"}
+    ]
+    # Bet committed with no probable -> nothing to invalidate.
+    assert _detect_starter_changes({"home": None, "away": None}, "Anyone", "Else") == []
+    assert _detect_starter_changes(None, "Anyone", "Else") == []
+
+
+def test_scratch_alerts_merge_and_dedupe():
+    """add_scratch_alerts appends to the committed bet's reasoning, dedupes on
+    (side, was, now) across runs, and ignores non-bet / missing rows."""
+    import importlib
+    import json as _json
+    import mlb_value_bot.utils as utils
+    from pathlib import Path
+    import tempfile
+
+    tmpdir = Path(tempfile.mkdtemp())
+    orig_db = utils.DB_PATH
+    utils.DB_PATH = tmpdir / "test.db"
+    recs = importlib.reload(importlib.import_module("mlb_value_bot.tracking.recommendations"))
+    try:
+        rec = recs.RecommendationRecord(
+            date="2024-04-01", game_id=7, home_team="H", away_team="A",
+            recommended_side="home", model_prob=0.55, market_prob_devigged=0.52,
+            american_odds=-110, decimal_odds=ev.american_to_decimal(-110),
+            ev_pct=0.05, kelly_stake=0.005, confidence=70.0,
+            reasoning={"pitchers": {"home": "Old Guy", "away": "Away Guy"}},
+        )
+        recs.upsert_recommendation(rec)
+        alert = {"side": "home", "was": "Old Guy", "now": "New Guy"}
+
+        assert recs.add_scratch_alerts("2024-04-01", 7, [alert]) == 1
+        # Same alert again (the every-30m run) -> deduped.
+        assert recs.add_scratch_alerts("2024-04-01", 7, [alert]) == 0
+        # A different change appends.
+        assert recs.add_scratch_alerts(
+            "2024-04-01", 7, [{"side": "away", "was": "Away Guy", "now": "TBD"}]
+        ) == 1
+        stored = _json.loads(recs.get_for_date("2024-04-01")[0]["reasoning_json"])
+        assert len(stored["scratch_alerts"]) == 2
+        assert all(a.get("detected_at") for a in stored["scratch_alerts"])
+        # Original reasoning is preserved alongside the alerts.
+        assert stored["pitchers"] == {"home": "Old Guy", "away": "Away Guy"}
+        # No committed bet for the game -> no-op.
+        assert recs.add_scratch_alerts("2024-04-01", 999, [alert]) == 0
+    finally:
+        utils.DB_PATH = orig_db
+        importlib.reload(recs)
+
+
 def test_sharp_fade_pp_reconstruction():
     """Signed sharp-fade is rebuilt from stored model_prob + market_intel:
     positive when we're more bullish than the sharps on our pick side,
