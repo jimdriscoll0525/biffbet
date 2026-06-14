@@ -29,6 +29,7 @@ GRIFF_FEATURE_KEYS = [
     "whiff_net", "csw_net", "hardhit_net",       # pitcher pitch-quality (+ favors home)
     "lineup_confirmed", "keybats_net",            # lineup state
     "temp", "wind",                               # weather / run environment
+    "matchup_net",                                # full per-batter pitch-type matchup
 ]
 
 
@@ -176,8 +177,19 @@ def weather_archive(home_team: str, game_date: str, config: dict) -> dict:
 def extra_features(home_pp, away_pp, home_lu, away_lu, home_team: str,
                    game_date: str, config: dict) -> dict:
     """All Stage-4 features for one game, keyed by GRIFF_FEATURE_KEYS."""
+    from datetime import date as _date
+    from mlb_value_bot.griffbet.matchup import matchup_feature
+
     feat = {}
     feat.update(pitcher_quality_features(home_pp, away_pp))
     feat.update(lineup_features(home_lu, away_lu))
     feat.update(weather_features(home_team, game_date, config))
+    try:
+        season = int(game_date[:4])
+        feat["matchup_net"] = matchup_feature(
+            home_pp, away_pp, home_lu, away_lu, season, _date.fromisoformat(game_date), config
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("matchup feature failed (%s)", exc)
+        feat["matchup_net"] = 0.0
     return {k: feat.get(k, 0.0) for k in GRIFF_FEATURE_KEYS}

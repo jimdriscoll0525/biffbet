@@ -491,6 +491,43 @@ def test_feature_store_join_in_extractor(monkeypatch):
     importlib.reload(griff_tracking)
 
 
+def test_matchup_math():
+    """compute_matchup nets home vs away expected offense; + favors home."""
+    from mlb_value_bot.griffbet.matchup import compute_matchup, _lineup_offense
+    # Home pitcher throws 100% fastball; away pitcher 100% slider.
+    home_arsenal = {"FF": 1.0}
+    away_arsenal = {"SL": 1.0}
+    # Home batters crush sliders (.400 vs SL); away batters weak vs fastballs (.250 vs FF).
+    home_batters = [{"SL": 0.400}, {"SL": 0.420}]
+    away_batters = [{"FF": 0.250}, {"FF": 0.230}]
+    net = compute_matchup(home_arsenal, away_arsenal, home_batters, away_batters)
+    # home_offense ~0.41 (vs away SL), away_offense ~0.24 (vs home FF) -> + favors home.
+    assert net > 0.15
+    # Symmetric skill -> ~0.
+    sym = compute_matchup({"FF": 1.0}, {"FF": 1.0}, [{"FF": 0.32}], [{"FF": 0.32}])
+    assert approx(sym, 0.0, tol=1e-9)
+    # Missing data on a side -> degrade to 0.
+    assert compute_matchup({"FF": 1.0}, {}, [{"FF": 0.3}], [{"FF": 0.3}]) == 0.0
+    # Batter with no overlapping pitch type is skipped, not counted as 0.
+    assert _lineup_offense({"FF": 1.0}, [{"SL": 0.5}]) is None
+
+
+def test_matchup_feature_requires_confirmed_lineups():
+    """The live feature is 0 unless BOTH lineups are confirmed (look-ahead-free
+    + bounds the heavy pulls to near first pitch)."""
+    from types import SimpleNamespace
+    from datetime import date
+    from mlb_value_bot.griffbet.matchup import matchup_feature
+    cfg = load_griff_config()
+    pp = SimpleNamespace(player_id=1)
+    proj = SimpleNamespace(is_confirmed=False, batting_order_ids=[])
+    conf = SimpleNamespace(is_confirmed=True, batting_order_ids=[100, 101])
+    assert matchup_feature(pp, pp, proj, conf, 2026, date(2026, 6, 14), cfg) == 0.0
+    # Disabled -> 0 even when confirmed (no network).
+    off = {"griff_features": {"matchup": {"enabled": False}}}
+    assert matchup_feature(pp, pp, conf, conf, 2026, date(2026, 6, 14), off) == 0.0
+
+
 # --- Self-running harness (mirrors test_core.py) -----------------------------
 def _run_all():
     import inspect, sys

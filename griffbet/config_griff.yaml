@@ -164,6 +164,12 @@ griff_features:
   weather:
     enabled: true
     timeout: 8
+  # Full per-batter pitch-type matchup (heavy: Statcast for both starters + all
+  # 18 lineup batters, as-of date). Computed only when BOTH lineups are
+  # confirmed (near first pitch), so morning runs aren't slowed. Disable to drop
+  # the pulls entirely.
+  matchup:
+    enabled: true
 
 sanity:
   max_abs_odds: 800
