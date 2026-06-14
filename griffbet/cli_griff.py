@@ -113,6 +113,71 @@ def backfill(limit: int | None) -> None:
     click.echo("Run `griff train` to fold the backfilled features into the model.")
 
 
+@cli.command(name="fetch-history")
+def fetch_history() -> None:
+    """Download a free historical MLB odds dataset (pwu97/bettingtools, 2014-2019)
+    and convert it to the ingester CSV at storage/hist_odds/mlb_2014_2019.csv.
+    One-time; needs `pip install pyreadr` (R .rda reader, not a runtime dep)."""
+    import os
+    import urllib.request
+
+    import pandas as pd
+    try:
+        import pyreadr
+    except ImportError:
+        raise SystemExit("Install the one-time converter dep: pip install pyreadr")
+
+    out_dir = "storage/hist_odds"
+    os.makedirs(out_dir, exist_ok=True)
+    base = "https://raw.githubusercontent.com/pwu97/bettingtools/master/data/mlb_odds_{yr}.rda"
+    frames = []
+    for yr in range(2014, 2020):
+        tmp = os.path.join(out_dir, f"_{yr}.rda")
+        urllib.request.urlretrieve(base.format(yr=yr), tmp)
+        frames.append(list(pyreadr.read_r(tmp).values())[0])
+        os.remove(tmp)
+        click.echo(f"  {yr}: {len(frames[-1])} games")
+    raw = pd.concat(frames, ignore_index=True)
+    out = pd.DataFrame({
+        "date": raw["date"].astype(str),
+        "home_team": raw["home_name"], "away_team": raw["away_name"],
+        "home_open": raw["home_open_ml"], "away_open": raw["away_open_ml"],
+        "home_close": raw["home_close_ml"], "away_close": raw["away_close_ml"],
+        "home_score": raw["home_score"], "away_score": raw["away_score"],
+    }).dropna()
+    for c in ("home_open", "away_open", "home_close", "away_close", "home_score", "away_score"):
+        out[c] = out[c].astype(int)
+    path = os.path.join(out_dir, "mlb_2014_2019.csv")
+    out.to_csv(path, index=False)
+    click.echo(f"Wrote {len(out)} games -> {path}. Now run `griff hist-train`.")
+
+
+@cli.command(name="hist-train")
+@click.option("--file", "path", default="storage/hist_odds/mlb_2014_2019.csv",
+              help="Historical odds CSV/XLSX (see griffbet/hist_odds.py schema).")
+@click.option("--l2", default=20.0, help="L2 shrinkage.")
+def hist_train(path: str, l2: float) -> None:
+    """Train + out-of-sample-test the market-microstructure model on a historical
+    odds dataset: does line movement beat the closing line?"""
+    from mlb_value_bot.griffbet.hist_odds import build_market_rows, load_history
+    from mlb_value_bot.griffbet.market_model import save_model, train_from_history
+
+    config = load_griff_config()
+    df = build_market_rows(load_history(path), config["ev"]["devig_method"])
+    click.echo(f"Ingested {len(df)} usable historical games.")
+    if df.empty:
+        return
+    model, oos = train_from_history(df, l2)
+    save_model(model)
+    if oos.get("sufficient"):
+        verdict = "BEATS the close" if oos.get("beats_close_log_loss") else "does NOT beat the close"
+        click.echo(f"OOS (n_test={oos['n']}): model log loss {oos.get('model_log_loss')} vs "
+                   f"close {oos.get('close_log_loss')} -> {verdict}")
+        click.echo(f"Coefficients (standardized): {oos.get('coefficients')}")
+    else:
+        click.echo(f"OOS: {oos.get('note')}")
+
+
 @cli.command(name="pull")
 def pull_cmd() -> None:
     """Rebuild GriffBet's local DB from Supabase."""

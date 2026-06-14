@@ -528,6 +528,60 @@ def test_matchup_feature_requires_confirmed_lineups():
     assert matchup_feature(pp, pp, conf, conf, 2026, date(2026, 6, 14), off) == 0.0
 
 
+def test_hist_odds_devig_and_label():
+    """build_market_rows de-vigs open+close and labels the home outcome."""
+    import pandas as pd
+    from mlb_value_bot.griffbet.hist_odds import build_market_rows
+    df = pd.DataFrame([
+        {"date": "2024-04-01", "home_team": "H", "away_team": "A",
+         "home_open": -110, "away_open": -110, "home_close": -150, "away_close": 130,
+         "home_score": 5, "away_score": 3},
+        {"date": "2024-04-02", "home_team": "H", "away_team": "A",   # tie -> dropped
+         "home_open": -110, "away_open": -110, "home_close": -110, "away_close": -110,
+         "home_score": 4, "away_score": 4},
+    ])
+    rows = build_market_rows(df)
+    assert len(rows) == 1                                  # tie dropped
+    r = rows.iloc[0]
+    assert r["home_won"] == 1
+    assert approx(r["devig_open_home"], 0.5, tol=1e-3)     # -110/-110 ~ 50%
+    assert r["devig_close_home"] > 0.5                     # -150 favorite
+    assert approx(r["line_move"], r["devig_close_home"] - r["devig_open_home"], tol=1e-9)
+
+
+def test_market_model_learns_movement_signal():
+    """When line movement genuinely predicts outcomes beyond the close, the
+    model learns a coefficient and beats the close baseline out-of-sample."""
+    import numpy as np
+    import pandas as pd
+    from mlb_value_bot.griffbet.market_model import fit_market_model, time_split_eval
+    rng = np.random.default_rng(3)
+    n = 800
+    close = np.clip(rng.normal(0.5, 0.08, n), 0.2, 0.8)
+    move = rng.normal(0, 0.05, n)
+    # Truth: home wins with prob = close + 3*move (movement leads the outcome
+    # well beyond where the close landed) -- strong reverse-line-movement signal.
+    p_true = np.clip(close + 3.0 * move, 0.02, 0.98)
+    won = (rng.uniform(0, 1, n) < p_true).astype(int)
+    df = pd.DataFrame({"date": [f"2024-{i:04d}" for i in range(n)],
+                       "devig_close_home": close, "line_move": move,
+                       "fav_dog": close - 0.5, "home_won": won})
+    model = fit_market_model(df, l2=1.0)
+    b = dict(zip(model.features, model.beta))
+    assert b["line_move"] > 0.05                           # learned the signal
+    ev = time_split_eval(df, l2=1.0)
+    assert ev["sufficient"] and ev["beats_close_log_loss"]  # beats the close OOS
+
+    # Control: pure noise movement -> should NOT beat the close OOS (or barely).
+    df_noise = df.copy()
+    df_noise["home_won"] = (rng.uniform(0, 1, n) < close).astype(int)
+    ev_noise = time_split_eval(df_noise, l2=50.0)
+    assert ev_noise["sufficient"]
+    # With heavy L2 and no real signal, coefficients are crushed toward 0.
+    m2 = fit_market_model(df_noise, l2=50.0)
+    assert max(abs(x) for x in m2.beta) < 0.15
+
+
 # --- Self-running harness (mirrors test_core.py) -----------------------------
 def _run_all():
     import inspect, sys
