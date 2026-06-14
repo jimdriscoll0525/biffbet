@@ -396,6 +396,51 @@ def test_engine_switch_residual_vs_warmup():
     assert info3["mode"] == "warmup_blend"
 
 
+# --- Stage 4: free training features -----------------------------------------
+def test_pitcher_quality_and_lineup_features():
+    from types import SimpleNamespace
+    from mlb_value_bot.griffbet.features import pitcher_quality_features, lineup_features
+    home = SimpleNamespace(whiff_pct=0.30, csw_pct=0.32, hardhit_pct=0.34)
+    away = SimpleNamespace(whiff_pct=0.24, csw_pct=0.28, hardhit_pct=0.40)
+    pq = pitcher_quality_features(home, away)
+    assert approx(pq["whiff_net"], 0.06) and approx(pq["csw_net"], 0.04)
+    assert approx(pq["hardhit_net"], 0.06)            # away-home, + favors home (home suppresses contact)
+    # Missing metric -> 0.
+    assert pitcher_quality_features(SimpleNamespace(whiff_pct=None, csw_pct=None, hardhit_pct=None), away)["whiff_net"] == 0.0
+    # Lineup: only counts when BOTH confirmed.
+    h_lu = SimpleNamespace(is_confirmed=True, missing_count=1)
+    a_lu = SimpleNamespace(is_confirmed=True, missing_count=2)
+    lf = lineup_features(h_lu, a_lu)
+    assert lf["lineup_confirmed"] == 1.0 and approx(lf["keybats_net"], 1.0)   # away_missing-home_missing
+    proj = lineup_features(SimpleNamespace(is_confirmed=False, missing_count=0), a_lu)
+    assert proj["lineup_confirmed"] == 0.0 and proj["keybats_net"] == 0.0
+
+
+def test_weather_degrades_when_disabled_or_unknown():
+    from mlb_value_bot.griffbet.features import weather_features
+    cfg = {"griff_features": {"weather": {"enabled": False}}}
+    assert weather_features("Boston Red Sox", "2026-06-14", cfg) == {"temp": 0.0, "wind": 0.0}
+    # Unknown park -> neutral, even when enabled (no network call).
+    cfg_on = {"griff_features": {"weather": {"enabled": True}}}
+    assert weather_features("Nonexistent Team", "2026-06-14", cfg_on) == {"temp": 0.0, "wind": 0.0}
+
+
+def test_extractor_reads_griff_features_and_defaults_missing():
+    from mlb_value_bot.griffbet.residual_model import feature_vector, FEATURES
+    from mlb_value_bot.griffbet.features import GRIFF_FEATURE_KEYS
+    # New keys are part of the model's feature schema.
+    assert all(k in FEATURES for k in GRIFF_FEATURE_KEYS)
+    # Present block is read through.
+    r = {"market_anchor": {"market_devig_home_prob": 0.5},
+         "components": [], "griff_features": {"whiff_net": 0.05, "temp": 3.0}}
+    f = feature_vector(r)
+    assert approx(f["whiff_net"], 0.05) and approx(f["temp"], 3.0)
+    # Row predating Stage 4 (no block) -> all new features default to 0.
+    r2 = {"market_anchor": {"market_devig_home_prob": 0.5}, "components": []}
+    f2 = feature_vector(r2)
+    assert all(approx(f2[k], 0.0) for k in GRIFF_FEATURE_KEYS)
+
+
 # --- Self-running harness (mirrors test_core.py) -----------------------------
 def _run_all():
     import inspect, sys

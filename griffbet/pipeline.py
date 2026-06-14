@@ -76,6 +76,9 @@ class GriffAnalysis(GameAnalysis):
     confidence_breakdown: dict | None = None
     # Probability-engine decision: residual market-error model vs warmup blend.
     engine_info: dict | None = None
+    # Stage-4 free training features (pitch-quality, lineup state, weather),
+    # stored so they enter the training set going forward.
+    griff_features: dict | None = None
     # Discipline audit (set by the slate-level passes in analyze_slate_griff).
     stake_before_discipline: float | None = None
     discipline_reasons: list[str] = field(default_factory=list)
@@ -102,6 +105,8 @@ class GriffAnalysis(GameAnalysis):
             data["confidence_breakdown"] = self.confidence_breakdown
         if self.engine_info is not None:
             data["engine"] = self.engine_info
+        if self.griff_features is not None:
+            data["griff_features"] = self.griff_features
         if self.stake_before_discipline is not None or self.discipline_reasons:
             data["discipline"] = {
                 "stake_before": round(self.stake_before_discipline, 6)
@@ -174,13 +179,14 @@ def reset_residual_cache() -> None:
     _RESIDUAL_MODEL, _RESIDUAL_LOADED = None, False
 
 
-def _residual_features(wp, market_intel, data_conf: float) -> dict:
+def _residual_features(wp, market_intel, data_conf: float, griff_features: dict | None) -> dict:
     """Live feature vector matching residual_model.feature_vector's shape."""
     feat = {c.name: c.weighted_delta for c in wp.components}
     sms = market_intel.sharp_minus_square if market_intel.available else None
     feat["sharp_minus_square"] = float(sms) if sms is not None else 0.0
     feat["dispersion"] = (market_intel.dispersion_pp / 100.0) if market_intel.dispersion_pp is not None else 0.0
     feat["data_confidence"] = data_conf / 100.0
+    feat.update(griff_features or {})
     return feat
 
 
@@ -299,6 +305,13 @@ def evaluate_game_griff(
         except Exception as exc:  # noqa: BLE001
             log.warning("lineup status provider failed for game %s (%s)", scheduled.game_id, exc)
 
+    # Stage-4 free features (pitch-quality / lineup state / weather), stored so
+    # they enter the training set going forward.
+    from mlb_value_bot.griffbet.features import extra_features
+    analysis.griff_features = extra_features(
+        home_pp, away_pp, home_lu, away_lu, scheduled.home_team, scheduled.game_date, config
+    )
+
     # GriffBet model (neutralized-base wrapper over BiffBet's model).
     wp, neutralization = compute_win_probability_griff(
         home_tp, away_tp, home_pp, away_pp, config, season,
@@ -332,7 +345,7 @@ def evaluate_game_griff(
     # During warmup it falls back to the blend (GriffBet keeps making disciplined
     # picks; it never bets a data-starved model). The raw-model stream and the
     # divergence guard below still use wp.home_win_prob, unchanged.
-    feature_dict = _residual_features(wp, market_intel, data_conf)
+    feature_dict = _residual_features(wp, market_intel, data_conf, analysis.griff_features)
     blended_home, engine_info = resolve_engine_prob(
         blended_home, feature_dict, market_home, _residual_model(), config
     )

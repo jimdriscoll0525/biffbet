@@ -29,14 +29,16 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
+from mlb_value_bot.griffbet.features import GRIFF_FEATURE_KEYS
 from mlb_value_bot.utils import get_logger
 
 log = get_logger("griffbet.residual")
 
-# Fixed feature order. Component weighted-deltas (home-favoring) + market context.
+# Fixed feature order: component weighted-deltas (home-favoring) + market context
+# + the Stage-4 free features (pitcher pitch-quality, lineup state, weather).
 COMPONENT_FEATURES = ["starter", "bullpen", "bullpen_fatigue", "lineup", "park", "home_field", "form"]
 CONTEXT_FEATURES = ["sharp_minus_square", "dispersion", "data_confidence"]
-FEATURES = COMPONENT_FEATURES + CONTEXT_FEATURES
+FEATURES = COMPONENT_FEATURES + CONTEXT_FEATURES + GRIFF_FEATURE_KEYS
 
 _EPS = 1e-12
 
@@ -73,6 +75,10 @@ def feature_vector(reasoning: dict) -> dict | None:
     feat["sharp_minus_square"] = (float(sms) / 100.0) if sms is not None else 0.0
     feat["dispersion"] = (float(disp) / 100.0) if disp is not None else 0.0
     feat["data_confidence"] = float(ma.get("data_confidence", 0.0) or 0.0) / 100.0
+    # Stage-4 free features (default 0 for rows that predate them).
+    gf = reasoning.get("griff_features") or {}
+    for k in GRIFF_FEATURE_KEYS:
+        feat[k] = float(gf.get(k, 0.0) or 0.0)
     feat["_market_devig_home"] = float(market)
     return feat
 

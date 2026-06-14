@@ -154,6 +154,17 @@ ev:
   threshold: 0.03
   devig_method: "power"
 
+# -----------------------------------------------------------------------------
+# Stage-4 free training features (GriffBet only). Pitch-quality nets + lineup
+# state come from data already pulled (no config). Weather uses Open-Meteo
+# (free, no key); disable it to drop the per-game HTTP call. All degrade to
+# neutral (0) on any failure, and accumulate forward into the training set.
+# -----------------------------------------------------------------------------
+griff_features:
+  weather:
+    enabled: true
+    timeout: 8
+
 sanity:
   max_abs_odds: 800
   max_ev: 0.30
