@@ -152,6 +152,83 @@ def fetch_history() -> None:
     click.echo(f"Wrote {len(out)} games -> {path}. Now run `griff hist-train`.")
 
 
+@cli.command(name="fetch-pinnacle")
+def fetch_pinnacle() -> None:
+    """Download a free SHARP dataset -- actual Pinnacle MLB 2016 lines
+    (marcoblume/pinnacle.data) -- and convert open+close moneylines per game to
+    the ingester CSV at storage/hist_odds/pinnacle_mlb2016.csv. The team1/team2
+    -> home/away mapping is resolved by calibration. One-time; needs
+    `pip install rdata` (R reader, not a runtime dep)."""
+    import os
+    import urllib.request
+
+    import numpy as np
+    import pandas as pd
+    try:
+        import rdata
+    except ImportError:
+        raise SystemExit("Install the one-time converter dep: pip install rdata")
+    from mlb_value_bot.analysis.ev_calculator import devigged_market_probs
+
+    out_dir = "storage/hist_odds"
+    os.makedirs(out_dir, exist_ok=True)
+    rda = os.path.join(out_dir, "MLB2016.rda")
+    urllib.request.urlretrieve(
+        "https://raw.githubusercontent.com/marcoblume/pinnacle.data/master/data/MLB2016.rda", rda)
+    df = rdata.read_rda(rda)["MLB2016"]
+    os.remove(rda)
+
+    recs = []
+    for _, g in df.iterrows():
+        sh, sa = g["FinalScoreHome"], g["FinalScoreAway"]
+        if pd.isna(sh) or pd.isna(sa) or int(sh) == int(sa):
+            continue
+        L = g["Lines"]
+        if not isinstance(L, pd.DataFrame) or L.empty:
+            continue
+        pre = L[L["EnteredDateTimeUTC"] <= g["EventDateTimeUTC"]]
+        pre = (pre if not pre.empty else L).dropna(subset=["MoneyUS1", "MoneyUS2"]).sort_values("EnteredDateTimeUTC")
+        if pre.empty:
+            continue
+        o, c = pre.iloc[0], pre.iloc[-1]
+        recs.append({"date": pd.to_datetime(g["EventDateTimeUTC"], unit="s").strftime("%Y-%m-%d"),
+                     "home_team": g["HomeTeam"], "away_team": g["AwayTeam"],
+                     "m1_open": int(o["MoneyUS1"]), "m2_open": int(o["MoneyUS2"]),
+                     "m1_close": int(c["MoneyUS1"]), "m2_close": int(c["MoneyUS2"]),
+                     "home_score": int(sh), "away_score": int(sa)})
+    raw = pd.DataFrame(recs)
+    raw["home_won"] = (raw["home_score"] > raw["away_score"]).astype(int)
+
+    def brier(team2_home):
+        e = []
+        for _, r in raw.iterrows():
+            h, a = (r["m2_close"], r["m1_close"]) if team2_home else (r["m1_close"], r["m2_close"])
+            try:
+                dh, _ = devigged_market_probs(h, a)
+            except ValueError:
+                continue
+            e.append((dh - r["home_won"]) ** 2)
+        return float(np.mean(e))
+
+    team2_home = brier(True) < brier(False)
+
+    def side(r, which, is_home):
+        t1, t2 = r[f"m1_{which}"], r[f"m2_{which}"]
+        return (t2 if is_home else t1) if team2_home else (t1 if is_home else t2)
+
+    out = pd.DataFrame({
+        "date": raw["date"], "home_team": raw["home_team"], "away_team": raw["away_team"],
+        "home_open": raw.apply(lambda r: side(r, "open", True), axis=1),
+        "away_open": raw.apply(lambda r: side(r, "open", False), axis=1),
+        "home_close": raw.apply(lambda r: side(r, "close", True), axis=1),
+        "away_close": raw.apply(lambda r: side(r, "close", False), axis=1),
+        "home_score": raw["home_score"], "away_score": raw["away_score"]})
+    path = os.path.join(out_dir, "pinnacle_mlb2016.csv")
+    out.to_csv(path, index=False)
+    click.echo(f"Wrote {len(out)} Pinnacle games (home={'team2' if team2_home else 'team1'}) "
+               f"-> {path}. Run `griff hist-train --file {path}`.")
+
+
 @cli.command(name="hist-train")
 @click.option("--file", "path", default="storage/hist_odds/mlb_2014_2019.csv",
               help="Historical odds CSV/XLSX (see griffbet/hist_odds.py schema).")
