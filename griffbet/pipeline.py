@@ -74,6 +74,8 @@ class GriffAnalysis(GameAnalysis):
     best_away_line: int | None = None
     # EV-vs-data confidence breakdown (for Strong-pick manual review).
     confidence_breakdown: dict | None = None
+    # Probability-engine decision: residual market-error model vs warmup blend.
+    engine_info: dict | None = None
     # Discipline audit (set by the slate-level passes in analyze_slate_griff).
     stake_before_discipline: float | None = None
     discipline_reasons: list[str] = field(default_factory=list)
@@ -98,6 +100,8 @@ class GriffAnalysis(GameAnalysis):
             data["neutralization"] = self.neutralization
         if self.confidence_breakdown is not None:
             data["confidence_breakdown"] = self.confidence_breakdown
+        if self.engine_info is not None:
+            data["engine"] = self.engine_info
         if self.stake_before_discipline is not None or self.discipline_reasons:
             data["discipline"] = {
                 "stake_before": round(self.stake_before_discipline, 6)
@@ -147,6 +151,54 @@ def _compute_adjusted_ev_griff(
         reasons.append(f"-{cut * 100:.1f}pp fragile edge")
 
     return round(adj, 6), reasons
+
+
+# --- Probability engine: residual market-error model vs warmup blend ---------
+_RESIDUAL_MODEL = None
+_RESIDUAL_LOADED = False
+
+
+def _residual_model():
+    """Load the trained residual model once per process (None if absent)."""
+    global _RESIDUAL_MODEL, _RESIDUAL_LOADED
+    if not _RESIDUAL_LOADED:
+        from mlb_value_bot.griffbet.residual_model import load_model
+        _RESIDUAL_MODEL = load_model()
+        _RESIDUAL_LOADED = True
+    return _RESIDUAL_MODEL
+
+
+def reset_residual_cache() -> None:
+    """Test hook: force the next call to reload the residual model."""
+    global _RESIDUAL_MODEL, _RESIDUAL_LOADED
+    _RESIDUAL_MODEL, _RESIDUAL_LOADED = None, False
+
+
+def _residual_features(wp, market_intel, data_conf: float) -> dict:
+    """Live feature vector matching residual_model.feature_vector's shape."""
+    feat = {c.name: c.weighted_delta for c in wp.components}
+    sms = market_intel.sharp_minus_square if market_intel.available else None
+    feat["sharp_minus_square"] = float(sms) if sms is not None else 0.0
+    feat["dispersion"] = (market_intel.dispersion_pp / 100.0) if market_intel.dispersion_pp is not None else 0.0
+    feat["data_confidence"] = data_conf / 100.0
+    return feat
+
+
+def resolve_engine_prob(blended_home, feature_dict, market_home, model, config):
+    """Pick the final home prob. With engine='residual' and the model past its
+    warmup gate, use the residual market-error prediction; otherwise fall back
+    to the hand-weighted blend. Returns (final_home, engine_info)."""
+    engine = config.get("model", {}).get("engine", "weighted")
+    if engine != "residual":
+        return blended_home, {"mode": "weighted_blend"}
+    from mlb_value_bot.griffbet.residual_model import is_ready
+    ready, reason = is_ready(model, config)
+    if ready:
+        p = model.predict_home_prob(feature_dict, market_home)
+        return p, {"mode": "residual", "n_train": model.n_train, "reason": reason,
+                   "edge_vs_market": round(p - market_home, 4)}
+    return blended_home, {"mode": "warmup_blend", "reason": reason,
+                          "n_train": model.n_train if model else 0}
 
 
 def _confidence_breakdown(raw_ev: float, data_conf: float, config: dict) -> dict:
@@ -274,6 +326,19 @@ def evaluate_game_griff(
     )
     blend, blend_tier = resolve_market_blend(data_conf, config["model"])
     blended_home = blend * wp.home_win_prob + (1.0 - blend) * market_home
+
+    # Probability engine: when the residual market-error model is past its warmup
+    # gate, it REPLACES the hand-weighted blend as the final prob used for EV.
+    # During warmup it falls back to the blend (GriffBet keeps making disciplined
+    # picks; it never bets a data-starved model). The raw-model stream and the
+    # divergence guard below still use wp.home_win_prob, unchanged.
+    feature_dict = _residual_features(wp, market_intel, data_conf)
+    blended_home, engine_info = resolve_engine_prob(
+        blended_home, feature_dict, market_home, _residual_model(), config
+    )
+    analysis.engine_info = engine_info
+    if engine_info.get("mode") == "residual":
+        blend_tier = "residual"
 
     # Divergence sanity guard (same as BiffBet).
     max_div = float(config.get("sanity", {}).get("max_model_market_divergence", 0.15))

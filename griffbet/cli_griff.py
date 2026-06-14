@@ -75,6 +75,28 @@ def results(date_: str | None) -> None:
                    f"{s.voids} void, {s.pending} pending, P/L {s.profit_loss:+.4f}")
 
 
+@cli.command()
+def train() -> None:
+    """Retrain the residual market-error model on accumulated history, store it,
+    and report the out-of-sample verdict + feature ablation."""
+    from mlb_value_bot.griffbet.residual_model import train_and_save
+
+    config = load_griff_config()
+    report = train_and_save(config)
+    click.echo(f"Trained residual model on {report['n_train']} graded games (l2={report['l2']}).")
+    oos = report["oos"]
+    if oos.get("sufficient"):
+        verdict = "BEATS market" if oos.get("beats_market_log_loss") else "does NOT beat market"
+        click.echo(f"  OOS (n_test={oos.get('n')}): model log loss {oos.get('model_log_loss')} vs "
+                   f"market {oos.get('market_log_loss')} -> {verdict}")
+    else:
+        click.echo(f"  OOS: {oos.get('note', 'insufficient data')}")
+    if report["ablation"]:
+        click.echo("  Top features by out-of-sample value (positive = helps):")
+        for a in report["ablation"][:5]:
+            click.echo(f"    {a['feature']:18s} delta_log_loss {a['delta_vs_full']:+.4f}")
+
+
 @cli.command(name="pull")
 def pull_cmd() -> None:
     """Rebuild GriffBet's local DB from Supabase."""

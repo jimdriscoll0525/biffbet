@@ -105,6 +105,22 @@ model:
   # on ace-start vs back-end-start days for a sample of teams.
   starter_neutralized_base: true
 
+  # --- Probability engine (the #2 rebuild) -----------------------------------
+  # "weighted" = BiffBet's hand-weighted blend toward the de-vigged market.
+  # "residual" = GriffBet models the MARKET'S ERROR: logit(p) = logit(market) +
+  # Σβ·feature, with the de-vigged market as a fixed offset and shrunken learned
+  # coefficients on the transparent component features. See griffbet/residual_model.
+  # While the residual model is in WARMUP (below), GriffBet falls back to the
+  # weighted blend, so it never goes dark and never bets a data-starved model.
+  engine: "residual"
+  residual:
+    l2: 50.0                  # L2 shrinkage; high while data is thin -> β≈0 ≈ trust market
+    # Warmup gate: don't let the residual engine drive live picks until it has
+    # trained on >= this many graded games AND (require_beats_market) beaten the
+    # market baseline out-of-sample. Until then GriffBet uses the weighted blend.
+    min_train_games: 300
+    require_beats_market: true
+
   market_blend:
     high_conf: 0.45
     mid_conf: 0.35

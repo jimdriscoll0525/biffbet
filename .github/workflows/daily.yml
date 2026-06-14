@@ -63,5 +63,6 @@ jobs:
         run: |
           python -m mlb_value_bot.griffbet pull            || echo "griff pull: skipped"
           python -m mlb_value_bot.griffbet results         || echo "griff results: nothing to settle"
+          python -m mlb_value_bot.griffbet train           || echo "griff train: skipped"
           python -m mlb_value_bot.griffbet today            || echo "griff today: skipped"
           python -m mlb_value_bot.griffbet sync             || echo "griff sync: skipped"

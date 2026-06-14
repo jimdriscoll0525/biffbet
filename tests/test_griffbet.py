@@ -283,6 +283,119 @@ def test_referee_sharp_clv_join_reports_gap():
     assert out["avg"] > 0      # -110 open beat sharp -125 close
 
 
+# --- Residual market-error engine --------------------------------------------
+def test_residual_predict_equals_market_when_beta_zero():
+    """β all-zero (cold start) => p_home is exactly the market devig prob."""
+    from mlb_value_bot.griffbet.residual_model import ResidualModel, FEATURES
+    m = ResidualModel(FEATURES, [0.0] * len(FEATURES), [0.0] * len(FEATURES),
+                      [1.0] * len(FEATURES), l2=1.0, n_train=0)
+    for mkt in (0.40, 0.55, 0.73):
+        assert approx(m.predict_home_prob({f: 0.5 for f in FEATURES}, mkt), mkt, tol=1e-9)
+
+
+def test_residual_recovers_signal():
+    """With a real signal and light regularization, the model learns a positive
+    coefficient and tilts above the market when the feature is high."""
+    import numpy as np
+    import pandas as pd
+    from mlb_value_bot.griffbet.residual_model import FEATURES, fit_residual_model
+    rng = np.random.default_rng(0)
+    n = 400
+    starter = rng.normal(0, 1, n)
+    market = np.full(n, 0.5)
+    # Home wins with prob sigmoid(1.5*starter) -- market (0.5) is "wrong" in a
+    # way the starter feature explains: pure market error.
+    p_true = 1 / (1 + np.exp(-1.5 * starter))
+    home_won = (rng.uniform(0, 1, n) < p_true).astype(int)
+    data = {f: np.zeros(n) for f in FEATURES}
+    data["starter"] = starter
+    df = pd.DataFrame({**data, "market_devig_home": market, "home_won": home_won,
+                       "date": ["2026-01-01"] * n})
+    model = fit_residual_model(df, l2=0.5)
+    b = dict(zip(model.features, model.beta))
+    assert b["starter"] > 0.2                       # learned the signal
+    # High starter -> prob well above the 0.5 market; low -> below.
+    hi = model.predict_home_prob({**{f: 0.0 for f in FEATURES}, "starter": 2.0}, 0.5)
+    lo = model.predict_home_prob({**{f: 0.0 for f in FEATURES}, "starter": -2.0}, 0.5)
+    assert hi > 0.55 and lo < 0.45
+
+
+def test_residual_cold_start_shrinks_to_market():
+    """Few rows + heavy L2 => β ~ 0 => predictions hug the market (no
+    data-starved overconfidence)."""
+    import numpy as np
+    import pandas as pd
+    from mlb_value_bot.griffbet.residual_model import FEATURES, fit_residual_model
+    rng = np.random.default_rng(1)
+    n = 12
+    df = pd.DataFrame({
+        **{f: rng.normal(0, 1, n) for f in FEATURES},
+        "market_devig_home": rng.uniform(0.45, 0.55, n),
+        "home_won": rng.integers(0, 2, n), "date": ["2026-01-01"] * n,
+    })
+    model = fit_residual_model(df, l2=500.0)
+    assert max(abs(b) for b in model.beta) < 0.02            # β crushed toward 0
+    mkt = 0.52
+    assert approx(model.predict_home_prob({f: 1.0 for f in FEATURES}, mkt), mkt, tol=0.02)
+
+
+def test_residual_feature_extraction():
+    """feature_vector pulls component weighted-deltas + market context; _home_won
+    resolves the home outcome from result + pick side."""
+    from mlb_value_bot.griffbet.residual_model import feature_vector, _home_won
+    reasoning = {
+        "market_anchor": {"market_devig_home_prob": 0.48, "data_confidence": 80.0},
+        "market_intel": {"sharp_minus_square_pp": 1.5, "dispersion_pp": 0.6},
+        "components": [
+            {"name": "starter", "weighted_delta": 0.03},
+            {"name": "bullpen", "weighted_delta": -0.01},
+            {"name": "home_field", "weighted_delta": 0.025},
+        ],
+    }
+    f = feature_vector(reasoning)
+    assert approx(f["starter"], 0.03) and approx(f["bullpen"], -0.01)
+    assert approx(f["lineup"], 0.0)                      # missing component -> 0
+    assert approx(f["sharp_minus_square"], 0.015) and approx(f["data_confidence"], 0.8)
+    assert approx(f["_market_devig_home"], 0.48)
+    assert feature_vector({"components": []}) is None    # no market anchor -> None
+    # home won iff (home pick & win) or (away pick & loss)
+    assert _home_won("win", "home") == 1 and _home_won("loss", "home") == 0
+    assert _home_won("win", "away") == 0 and _home_won("loss", "away") == 1
+    assert _home_won("pending", "home") is None
+
+
+def test_engine_switch_residual_vs_warmup():
+    """engine='residual' uses the model only past the warmup gate (n_train floor
+    AND beats-market OOS); otherwise it falls back to the blend."""
+    from mlb_value_bot.griffbet.pipeline import resolve_engine_prob
+    from mlb_value_bot.griffbet.residual_model import ResidualModel, FEATURES
+    cfg = load_griff_config()
+    assert cfg["model"]["engine"] == "residual"
+    feat = {f: 0.0 for f in FEATURES}
+    feat["starter"] = 2.0
+    good_oos = {"sufficient": True, "beats_market_log_loss": True}
+
+    # Below the n_train floor -> warmup -> returns the blend untouched.
+    weak = ResidualModel(FEATURES, [0.0] * len(FEATURES), [0.0] * len(FEATURES),
+                         [1.0] * len(FEATURES), l2=50, n_train=10, oos=good_oos)
+    final, info = resolve_engine_prob(0.40, feat, 0.50, weak, cfg)
+    assert info["mode"] == "warmup_blend" and final == 0.40
+
+    # Past the floor + beats market OOS -> residual drives the prob.
+    beta = [0.0] * len(FEATURES)
+    beta[FEATURES.index("starter")] = 0.5
+    ready = ResidualModel(FEATURES, beta, [0.0] * len(FEATURES), [1.0] * len(FEATURES),
+                          l2=50, n_train=500, oos=good_oos)
+    final2, info2 = resolve_engine_prob(0.40, feat, 0.50, ready, cfg)
+    assert info2["mode"] == "residual" and final2 > 0.50   # starter>0, β>0 -> above market
+
+    # Past the floor but OOS says it does NOT beat the market -> held in warmup.
+    held = ResidualModel(FEATURES, beta, [0.0] * len(FEATURES), [1.0] * len(FEATURES),
+                         l2=50, n_train=500, oos={"sufficient": True, "beats_market_log_loss": False})
+    _, info3 = resolve_engine_prob(0.40, feat, 0.50, held, cfg)
+    assert info3["mode"] == "warmup_blend"
+
+
 # --- Self-running harness (mirrors test_core.py) -----------------------------
 def _run_all():
     import inspect, sys
