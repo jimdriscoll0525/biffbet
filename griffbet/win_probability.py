@@ -28,7 +28,7 @@ from mlb_value_bot.analysis.win_probability import (
     log5,
     regress_winpct,
 )
-from mlb_value_bot.griffbet.team_extras import rotation_winpct_increment
+from mlb_value_bot.griffbet.team_extras import rotation_rate_source, rotation_winpct_increment
 from mlb_value_bot.utils import get_logger
 
 log = get_logger("griffbet.win_probability")
@@ -60,6 +60,7 @@ def _neutralized_base(
 
     info = {
         "applied": True,
+        "source": rotation_rate_source(season),
         "home_rotation_increment": round(home_inc, 4) if home_inc is not None else None,
         "away_rotation_increment": round(away_inc, 4) if away_inc is not None else None,
         "base_off": round(base_off, 4),

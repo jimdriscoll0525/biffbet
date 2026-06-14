@@ -42,9 +42,11 @@ def _mk_pitcher(name, xfip, ip=80.0):
 
 # --- Golden equivalence ------------------------------------------------------
 def test_golden_equivalence_neutralization_off():
-    """Flag OFF == BiffBet exactly, across several matchups."""
+    """Flag OFF == BiffBet exactly, across several matchups. Forces the flag OFF
+    in a copied config so the invariant holds regardless of the shipped default
+    (the golden guarantee is about the OFF code path, not the config value)."""
     cfg = load_griff_config()
-    assert cfg["model"]["starter_neutralized_base"] is False
+    cfg = {**cfg, "model": {**cfg["model"], "starter_neutralized_base": False}}
     cases = [
         (_mk_team("H", 0.60, 50, 105, 3.9, pf=108), _mk_team("A", 0.50, 50, 100, 4.1),
          _mk_pitcher("Ace", 3.2), _mk_pitcher("Mid", 4.3)),
@@ -83,6 +85,21 @@ def test_neutralization_on_shifts_base_when_rotation_known(monkeypatch):
     assert on.home_win_prob < off.home_win_prob        # less credit double-counted
     # Away contributes 0 increment -> only home base moved.
     assert info["away_rotation_increment"] == 0.0
+
+
+def test_rotation_increment_centers_on_league_mean(monkeypatch):
+    """The increment is (league_mean_rate - team_rate)*run_to_wp, so it's
+    scale-agnostic (works for xFIP or the ERA proxy) and sums to ~0 across the
+    league. Unknown teams degrade to None."""
+    import mlb_value_bot.griffbet.team_extras as te
+    rates = {"Aces": 3.50, "Avg": 4.00, "Scrubs": 4.50}  # mean 4.00
+    monkeypatch.setattr(te, "team_rotation_rates", lambda season, config=None: rates)
+    cfg = load_griff_config()
+    rtw = cfg["model"]["pitcher_run_to_winpct"]
+    assert approx(te.rotation_winpct_increment("Aces", 2026, cfg), 0.5 * rtw)
+    assert approx(te.rotation_winpct_increment("Scrubs", 2026, cfg), -0.5 * rtw)
+    assert approx(te.rotation_winpct_increment("Avg", 2026, cfg), 0.0)
+    assert te.rotation_winpct_increment("Unknown", 2026, cfg) is None
 
 
 def test_neutralization_degrades_when_rotation_unknown(monkeypatch):
