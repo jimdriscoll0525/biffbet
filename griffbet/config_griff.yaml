@@ -103,7 +103,7 @@ model:
   # whose rotation rate is unavailable. This is the toggleable investigation
   # from the plan; `griff investigate-base` reports base_wp movement ON vs OFF
   # on ace-start vs back-end-start days for a sample of teams.
-  starter_neutralized_base: false
+  starter_neutralized_base: true
 
   market_blend:
     high_conf: 0.45
