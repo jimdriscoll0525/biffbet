@@ -109,6 +109,10 @@ def extract_training_data(extra_frames: list[pd.DataFrame] | None = None) -> pd.
     if not frames:
         return pd.DataFrame(columns=[*FEATURES, "market_devig_home", "home_won", "date"])
 
+    # GriffBet-owned feature store: backfilled Stage-4 features for games whose
+    # base row lives in BiffBet's frozen store. Joined in read-only by key.
+    feature_store = griff.get_all_features()
+
     seen: set[tuple] = set()
     rows: list[dict] = []
     # Prefer the longest-history source first (BiffBet), then fill gaps.
@@ -123,6 +127,14 @@ def extract_training_data(extra_frames: list[pd.DataFrame] | None = None) -> pd.
             feat = feature_vector(_reasoning(r.get("reasoning_json")))
             if feat is None:
                 continue
+            # Overlay backfilled Stage-4 features (the row's own reasoning wins
+            # when it has them -- live GriffBet rows -- else the feature store).
+            stored = feature_store.get(key)
+            if stored:
+                from mlb_value_bot.griffbet.features import GRIFF_FEATURE_KEYS
+                for k in GRIFF_FEATURE_KEYS:
+                    if feat.get(k, 0.0) == 0.0 and k in stored:
+                        feat[k] = float(stored[k] or 0.0)
             seen.add(key)
             row = {name: feat[name] for name in FEATURES}
             row["market_devig_home"] = feat["_market_devig_home"]

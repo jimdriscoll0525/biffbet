@@ -122,6 +122,57 @@ def weather_features(home_team: str, game_date: str, config: dict) -> dict:
     return out
 
 
+def lineup_features_from_reasoning(reasoning: dict) -> dict:
+    """Reconstruct lineup features from a stored reasoning.lineup block (what was
+    known at bet time -- LOOK-AHEAD-FREE, unlike re-fetching final lineups)."""
+    lu = reasoning.get("lineup") or {}
+    home, away = lu.get("home") or {}, lu.get("away") or {}
+    both_confirmed = home.get("status") == "confirmed" and away.get("status") == "confirmed"
+    if not both_confirmed:
+        return {"lineup_confirmed": 0.0, "keybats_net": 0.0}
+
+    def _missing(side: dict) -> float:
+        m = side.get("missing_key_bats")
+        if isinstance(m, list):
+            return float(len(m))
+        tot, pres = side.get("key_bats_total"), side.get("key_bats_present")
+        return float((tot or 0) - (pres or 0))
+
+    return {"lineup_confirmed": 1.0, "keybats_net": _missing(away) - _missing(home)}
+
+
+def weather_archive(home_team: str, game_date: str, config: dict) -> dict:
+    """Historical weather for a past game from Open-Meteo's ARCHIVE API (free, no
+    key). Same shape/scaling as the live weather_features. Degrade-safe."""
+    cfg = config.get("griff_features", {}).get("weather", {})
+    if not cfg.get("enabled", True):
+        return {"temp": 0.0, "wind": 0.0}
+    coords = _PARK_COORDS.get(home_team)
+    if coords is None:
+        return {"temp": 0.0, "wind": 0.0}
+    out = {"temp": 0.0, "wind": 0.0}
+    try:
+        import requests
+        lat, lon = coords
+        resp = requests.get(
+            "https://archive-api.open-meteo.com/v1/archive",
+            params={"latitude": lat, "longitude": lon, "start_date": game_date,
+                    "end_date": game_date, "daily": "temperature_2m_mean,wind_speed_10m_max"},
+            timeout=float(cfg.get("timeout", 10)),
+        )
+        if resp.status_code < 300:
+            daily = resp.json().get("daily", {})
+            temps = daily.get("temperature_2m_mean") or []
+            winds = daily.get("wind_speed_10m_max") or []
+            if temps and temps[0] is not None:
+                out["temp"] = round(float(temps[0]) - 20.0, 2)
+            if winds and winds[0] is not None:
+                out["wind"] = round(float(winds[0]) / 10.0, 3)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("weather archive failed for %s %s (%s)", home_team, game_date, exc)
+    return out
+
+
 def extra_features(home_pp, away_pp, home_lu, away_lu, home_team: str,
                    game_date: str, config: dict) -> dict:
     """All Stage-4 features for one game, keyed by GRIFF_FEATURE_KEYS."""

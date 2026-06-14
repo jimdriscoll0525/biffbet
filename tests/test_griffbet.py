@@ -441,6 +441,56 @@ def test_extractor_reads_griff_features_and_defaults_missing():
     assert all(approx(f2[k], 0.0) for k in GRIFF_FEATURE_KEYS)
 
 
+def test_lineup_features_from_reasoning():
+    from mlb_value_bot.griffbet.features import lineup_features_from_reasoning
+    both = {"lineup": {"home": {"status": "confirmed", "missing_key_bats": ["X"]},
+                       "away": {"status": "confirmed", "missing_key_bats": ["Y", "Z"]}}}
+    f = lineup_features_from_reasoning(both)
+    assert f["lineup_confirmed"] == 1.0 and approx(f["keybats_net"], 1.0)   # 2 away - 1 home
+    proj = {"lineup": {"home": {"status": "projected"}, "away": {"status": "confirmed"}}}
+    assert lineup_features_from_reasoning(proj) == {"lineup_confirmed": 0.0, "keybats_net": 0.0}
+    assert lineup_features_from_reasoning({}) == {"lineup_confirmed": 0.0, "keybats_net": 0.0}
+
+
+def test_feature_store_join_in_extractor(monkeypatch):
+    """Backfilled features in GriffBet's feature store are joined into training
+    rows whose base reasoning lacks them (e.g. BiffBet-only historical games)."""
+    import importlib
+    import mlb_value_bot.utils as utils
+    from pathlib import Path
+    import tempfile
+    utils.DB_PATH = Path(tempfile.mkdtemp()) / "biff.db"
+    griff_tracking = importlib.reload(importlib.import_module("mlb_value_bot.griffbet.tracking"))
+    griff_tracking.GRIFF_DB_PATH = Path(tempfile.mkdtemp()) / "griff.db"
+
+    # A graded BiffBet row WITHOUT a griff_features block.
+    import mlb_value_bot.tracking.recommendations as biff
+    biff = importlib.reload(biff)
+    rec = biff.RecommendationRecord(
+        date="2026-05-25", game_id=11, home_team="H", away_team="A",
+        recommended_side="home", model_prob=0.55, market_prob_devigged=0.52,
+        american_odds=-110, decimal_odds=ev.american_to_decimal(-110), ev_pct=0.05,
+        kelly_stake=0.005, confidence=70.0,
+        reasoning={"market_anchor": {"market_devig_home_prob": 0.52}, "components": []},
+    )
+    rid = biff.upsert_recommendation(rec)
+    biff.update_result(rid, "win", 0.004)
+
+    # Backfill a feature for that game into the GriffBet feature store.
+    griff_tracking.upsert_features("2026-05-25", 11, {"whiff_net": 0.07, "temp": 5.0})
+
+    from mlb_value_bot.griffbet.residual_model import extract_training_data
+    df = extract_training_data()
+    row = df[df["game_id"].astype(int) == 11] if "game_id" in df.columns else df
+    # game_id isn't a column; just check the single extracted row picked up the join.
+    assert len(df) == 1
+    assert approx(float(df.iloc[0]["whiff_net"]), 0.07)
+    assert approx(float(df.iloc[0]["temp"]), 5.0)
+    assert int(df.iloc[0]["home_won"]) == 1
+    importlib.reload(biff)
+    importlib.reload(griff_tracking)
+
+
 # --- Self-running harness (mirrors test_core.py) -----------------------------
 def _run_all():
     import inspect, sys

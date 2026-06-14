@@ -97,13 +97,30 @@ def train() -> None:
             click.echo(f"    {a['feature']:18s} delta_log_loss {a['delta_vs_full']:+.4f}")
 
 
+@cli.command()
+@click.option("--limit", type=int, default=None, help="Cap games (for a quick test).")
+def backfill(limit: int | None) -> None:
+    """Backfill Stage-4 features for historical graded games (one-time)."""
+    from mlb_value_bot.griffbet.backfill import backfill as run_backfill
+
+    config = load_griff_config()
+    n = run_backfill(config, limit=limit)
+    click.echo(
+        f"Backfilled {n['games']} graded game(s): "
+        f"pitcher pitch-quality on {n['pitcher_ok']}, "
+        f"confirmed lineups on {n['lineup_confirmed']}, weather on {n['weather_ok']}."
+    )
+    click.echo("Run `griff train` to fold the backfilled features into the model.")
+
+
 @cli.command(name="pull")
 def pull_cmd() -> None:
     """Rebuild GriffBet's local DB from Supabase."""
-    from mlb_value_bot.griffbet.sync_griff import pull_recommendations
+    from mlb_value_bot.griffbet.sync_griff import pull_features, pull_recommendations
 
     n = pull_recommendations()
-    click.echo(f"Pulled {n} GriffBet recommendation(s) from Supabase.")
+    nf = pull_features()
+    click.echo(f"Pulled {n} GriffBet recommendation(s) and {nf} feature row(s) from Supabase.")
 
 
 @cli.command(name="sync")

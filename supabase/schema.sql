@@ -185,8 +185,25 @@ create table if not exists public.referee_snapshot (
     computed_at  timestamptz not null default now()
 );
 
+-- GriffBet feature store: Stage-4 features (incl. historical backfill) for any
+-- (date, game_id), so the production trainer sees backfilled features. Read by
+-- the engine only (not the public site).
+create table if not exists public.griffbet_game_features (
+    date          date        not null,
+    game_id       bigint      not null,
+    features      jsonb       not null,
+    source        text,
+    updated_at    timestamptz not null default now(),
+    primary key (date, game_id)
+);
+
 alter table public.griffbet_recommendations enable row level security;
 alter table public.referee_snapshot         enable row level security;
+alter table public.griffbet_game_features   enable row level security;
+drop policy if exists "public read griffbet features" on public.griffbet_game_features;
+create policy "public read griffbet features"
+    on public.griffbet_game_features for select
+    to anon, authenticated using (true);
 
 drop policy if exists "public read griffbet recs" on public.griffbet_recommendations;
 create policy "public read griffbet recs"

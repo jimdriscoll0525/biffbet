@@ -67,6 +67,21 @@ CREATE TABLE IF NOT EXISTS griff_recommendations (
 );
 """
 
+# GriffBet-owned feature store. Holds the Stage-4 griff_features block for ANY
+# game (date, game_id), including historical games that live only in BiffBet's
+# frozen store. The training extractor joins this in, so backfilled features
+# reach the model WITHOUT ever writing to BiffBet's data.
+_FEATURE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS griff_game_features (
+    date          TEXT NOT NULL,
+    game_id       INTEGER NOT NULL,
+    features_json TEXT NOT NULL,
+    source        TEXT,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (date, game_id)
+);
+"""
+
 
 @dataclass
 class GriffRecord:
@@ -110,6 +125,7 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        conn.executescript(_FEATURE_SCHEMA)
 
 
 def _clv(open_price: int | None, close_price: int | None) -> float | None:
@@ -298,6 +314,59 @@ def get_for_date(game_date: str) -> list[sqlite3.Row]:
     init_db()
     with connect() as conn:
         return conn.execute("SELECT * FROM griff_recommendations WHERE date=?", (game_date,)).fetchall()
+
+
+def upsert_features(date: str, game_id: int, features: dict, source: str = "backfill") -> None:
+    """Store a Stage-4 griff_features block for a game in the feature store."""
+    init_db()
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO griff_game_features (date, game_id, features_json, source, updated_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(date, game_id) DO UPDATE SET
+                 features_json=excluded.features_json, source=excluded.source,
+                 updated_at=excluded.updated_at""",
+            (date, int(game_id), json.dumps(features), source, _now()),
+        )
+
+
+def get_all_features() -> dict[tuple, dict]:
+    """{(date, game_id): features_dict} from the feature store (for training)."""
+    init_db()
+    out: dict[tuple, dict] = {}
+    with connect() as conn:
+        for r in conn.execute("SELECT date, game_id, features_json FROM griff_game_features"):
+            try:
+                out[(r["date"], int(r["game_id"]))] = json.loads(r["features_json"])
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def all_feature_rows() -> list[dict]:
+    """Raw feature-store rows for syncing to Supabase."""
+    init_db()
+    with connect() as conn:
+        return [
+            {"date": r["date"], "game_id": int(r["game_id"]),
+             "features": json.loads(r["features_json"]),
+             "source": r["source"], "updated_at": r["updated_at"]}
+            for r in conn.execute("SELECT * FROM griff_game_features")
+        ]
+
+
+def upsert_feature_row(date: str, game_id: int, features: dict, source: str, updated_at: str) -> None:
+    """Insert a feature-store row verbatim (used by the Supabase pull)."""
+    init_db()
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO griff_game_features (date, game_id, features_json, source, updated_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(date, game_id) DO UPDATE SET
+                 features_json=excluded.features_json, source=excluded.source,
+                 updated_at=excluded.updated_at""",
+            (date, int(game_id), json.dumps(features), source, updated_at),
+        )
 
 
 def to_dataframe(since: str | None = None) -> pd.DataFrame:

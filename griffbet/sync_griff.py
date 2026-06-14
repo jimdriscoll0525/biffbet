@@ -75,6 +75,35 @@ def push_recommendations(url: str, key: str, since: str | None = None) -> int:
     return len(rows)
 
 
+def push_features(url: str, key: str) -> int:
+    """Push the GriffBet feature store (incl. historical backfill) to Supabase so
+    the production trainer sees it."""
+    rows = [{"date": r["date"], "game_id": r["game_id"], "features": _clean(r["features"]),
+             "source": r["source"], "updated_at": r["updated_at"]}
+            for r in gtrack.all_feature_rows()]
+    for start in range(0, len(rows), _BATCH):
+        _post(url, key, "griffbet_game_features", rows[start:start + _BATCH],
+              on_conflict="date,game_id")
+    log.info("Synced %d GriffBet feature row(s) to Supabase.", len(rows))
+    return len(rows)
+
+
+def pull_features() -> int:
+    """Rebuild the local feature store from Supabase (so CI training sees the
+    backfill). Tolerant: returns 0 if the table doesn't exist yet."""
+    url, key = _credentials()
+    try:
+        rows = _get_all(url, key, "griffbet_game_features")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("feature-store pull skipped (%s)", exc)
+        return 0
+    for r in rows:
+        gtrack.upsert_feature_row(r["date"], int(r["game_id"]), r.get("features") or {},
+                                  r.get("source") or "sync", r.get("updated_at") or "")
+    log.info("Pulled %d GriffBet feature row(s) from Supabase.", len(rows))
+    return len(rows)
+
+
 def push_referee(url: str, key: str, referee: dict) -> int:
     payload = [{
         "scope": "all",
@@ -90,6 +119,10 @@ def push_all(referee: dict | None = None, since: str | None = None) -> dict:
     url, key = _credentials()
     n = push_recommendations(url, key, since=since)
     out = {"recommendations": n}
+    try:
+        out["features"] = push_features(url, key)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("feature-store push skipped (%s)", exc)
     if referee is not None:
         out["referee"] = push_referee(url, key, referee)
     return out
