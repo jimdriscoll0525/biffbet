@@ -1,0 +1,298 @@
+# =============================================================================
+# GriffBet configuration — FULLY INDEPENDENT of BiffBet's config.yaml.
+#
+# GriffBet is the challenger. This file is a standalone copy of BiffBet's config
+# structure with GriffBet's intended differences applied. It NEVER reads from or
+# writes to BiffBet's config. Tune GriffBet here without touching the champion.
+#
+# Differences from BiffBet (everything else is intentionally identical so the
+# only divergence is deliberate, not accidental drift):
+#   * model.starter_neutralized_base       (NEW, default false)   -- §B
+#   * adjusted_ev.sharp_fade_large_reduction: 0.0  (omit the dead -2pp haircut)
+#   * discipline.*                         (NEW)                  -- §C
+#   * referee.*                            (NEW)                  -- §E/§F
+#   * sharp_close.*                        (NEW)                  -- §D
+#   * logging.file -> storage/griffbet.log (separate log)
+# =============================================================================
+
+odds_api:
+  base_url: "https://api.the-odds-api.com/v4"
+  sport_key: "baseball_mlb"
+  regions: "us,uk"
+  markets: "h2h"
+  odds_format: "american"
+  bookmakers:
+    - "draftkings"
+    - "fanduel"
+    - "betmgm"
+    - "pinnacle"
+    - "betonlineag"
+    - "lowvig"
+  bet_bookmaker: "draftkings"
+  sharp_bookmakers:
+    - "pinnacle"
+    - "betonlineag"
+    - "lowvig"
+  square_bookmakers:
+    - "draftkings"
+    - "fanduel"
+    - "betmgm"
+  request_timeout_seconds: 20
+
+mlb_api:
+  base_url: "https://statsapi.mlb.com/api"
+  request_timeout_seconds: 20
+
+cache:
+  ttl_hours: 24
+
+# GriffBet shares the raw-data parquet cache with BiffBet (those frames are
+# model-agnostic inputs, not model outputs), so it reads the same FanGraphs CSVs.
+fangraphs_csv:
+  enabled: true
+  dir: "storage/fangraphs"
+  pitching_filename: "pitching_{season}.csv"
+  batting_filename: "batting_{season}.csv"
+
+league:
+  avg_xfip: 4.00
+  avg_siera: 4.00
+  avg_bullpen_fip: 4.10
+  runs_per_win: 10.0
+  runs_per_game: 4.5
+  avg_xwoba: 0.315
+  xwoba_to_run9: 40.0
+
+# -----------------------------------------------------------------------------
+# Win-probability model
+# -----------------------------------------------------------------------------
+model:
+  pitcher_stat: "xfip"
+  team_regression_games: 30
+  pitcher_run_to_winpct: 0.065
+  starter_clamp: 0.15
+  bullpen_run_to_winpct: 0.022
+  bullpen_fatigue_clamp: 0.03
+  bullpen_fatigue_scale: 0.012
+  lineup_per_missing_bat_scale: 0.005
+  lineup_clamp: 0.02
+  form_scale: 0.5
+  form_recent_weight: 0.6
+  form_normal_cap: 0.015
+  form_extreme_cap: 0.025
+  form_extreme_min_bip_14d: 30
+  form_extreme_min_bip_30d: 70
+  form_fragile_w14_share: 0.60
+  form_windows:
+    d14: 0.5
+    d30: 0.3
+    season: 0.2
+  form_min_bip:
+    d14: 25
+    d30: 60
+
+  # --- GriffBet difference: starter-neutralized base rate (default OFF) -------
+  # When false, base_wp is exactly BiffBet's: log5 of the two teams' regressed
+  # season win%. When true, GriffBet first STRIPS each team's season
+  # rotation-average starting pitching out of its regressed win% (the rotation
+  # quality is already baked into the team's win-loss record), so the starter
+  # component carries the FULL, non-overlapping starter signal instead of
+  # partially double-counting it. Rotation strength comes from
+  # griffbet.team_extras (rotation-average xFIP vs league avg -> win% via the
+  # same pitcher_run_to_winpct path). Degrades to OFF-behavior for any team
+  # whose rotation rate is unavailable. This is the toggleable investigation
+  # from the plan; `griff investigate-base` reports base_wp movement ON vs OFF
+  # on ace-start vs back-end-start days for a sample of teams.
+  starter_neutralized_base: false
+
+  market_blend:
+    high_conf: 0.45
+    mid_conf: 0.35
+    low_conf: 0.25
+    high_threshold: 85.0
+    mid_threshold: 70.0
+
+  statcast_regression_pa: 250
+
+  weights:
+    starter: 1.0
+    bullpen: 1.0
+    bullpen_fatigue: 1.0
+    lineup: 1.0
+    park: 0.25
+    home_field: 1.0
+    form: 1.0
+
+  default_park_hfa: 0.025
+  park_hfa:
+    "Colorado Rockies": 0.045
+    "Boston Red Sox": 0.030
+    "New York Yankees": 0.028
+    "Los Angeles Dodgers": 0.025
+    "Kansas City Royals": 0.023
+  home_field_advantage: 0.035
+  prob_floor: 0.02
+  prob_ceiling: 0.98
+
+ev:
+  threshold: 0.03
+  devig_method: "power"
+
+sanity:
+  max_abs_odds: 800
+  max_ev: 0.30
+  max_model_market_divergence: 0.15
+  max_sharp_disagreement_pp: 4.0
+
+kelly:
+  fraction: 0.25
+  max_bankroll_fraction: 0.02
+
+# -----------------------------------------------------------------------------
+# Adjusted EV — GriffBet OMITS the dead "-2pp fade past 5pp" haircut.
+# Above sanity.max_sharp_disagreement_pp (4.0) the game is SKIPPED anyway, so
+# the large-fade band [5pp, skip) never actually fires; the haircut was dead
+# code. GriffBet's _compute_adjusted_ev (forked) never references the large
+# reduction, and this 0.0 makes the omission belt-and-suspenders.
+# -----------------------------------------------------------------------------
+adjusted_ev:
+  sharp_support_pp: 3.0
+  sharp_support_boost: 0.010
+  sharp_fade_pp: 3.0
+  sharp_fade_reduction: 0.010
+  sharp_fade_large_pp: 5.0
+  sharp_fade_large_reduction: 0.0    # GriffBet: omitted (was BiffBet's dead -2pp)
+  fragile_reduction: 0.010
+
+bet_sizing:
+  small_ev: 0.02
+  standard_ev: 0.05
+  strong_ev: 0.08
+  downgrade_confidence: 60
+  kelly_caps:
+    pass: 0.0
+    small: 0.005
+    standard: 0.010
+    strong: 0.020
+
+confidence:
+  weights:
+    data_completeness: 0.30
+    sample_size: 0.20
+    edge_magnitude: 0.25
+    component_agreement: 0.25
+  ip_full_confidence: 60.0
+  edge_full_confidence: 0.10
+
+# -----------------------------------------------------------------------------
+# Discipline (GriffBet ONLY). Applied AFTER per-bet quarter-Kelly + tier caps,
+# in this order: (1) correlation haircut, then (2) slate exposure cap. BiffBet
+# keeps its per-bet-only sizing as the control.
+# -----------------------------------------------------------------------------
+discipline:
+  # Slate-level daily exposure cap. If the TOTAL committed stake across the
+  # slate exceeds this fraction of bankroll, scale ALL stakes down
+  # proportionally so the sum equals the cap. 0.05 = never risk >5% of bankroll
+  # on a single day's slate, no matter how many edges show up.
+  max_slate_exposure: 0.05
+  correlation:
+    # When the number of committed bets on a slate exceeds this, apply a small
+    # per-bet stake reduction -- a crowded slate is more correlated (shared
+    # weather/umpire/leaguewide-offense regime) than independent coin flips,
+    # so Kelly (which assumes independence) over-bets it. 4 is a sane start:
+    # a typical +EV slate is 1-3 bets; 5+ is "crowded".
+    bet_count_threshold: 4
+    # Flat fractional haircut applied to each bet's stake once the slate is
+    # crowded (count > threshold). 0.10 = shave 10% off every stake.
+    per_bet_reduction: 0.10
+
+# -----------------------------------------------------------------------------
+# Sharp closing line (GriffBet ONLY). On the near-first-pitch re-pricing run,
+# GriffBet captures the SHARP closing line to grade CLV against (the sharp close
+# is the truest "true price"). Books are tried in priority order; the first one
+# that quoted both sides of the game wins. Pinnacle first, then other
+# sharp-tagged books. The best-available close across ALL books is also stored
+# as "the price realistically obtainable".
+# -----------------------------------------------------------------------------
+sharp_close:
+  priority:
+    - "pinnacle"
+    - "betonlineag"
+    - "lowvig"
+
+# -----------------------------------------------------------------------------
+# Referee / head-to-head (GriffBet ONLY). The cross-model reporting layer and
+# the H2H panel read this.
+# -----------------------------------------------------------------------------
+referee:
+  # Until at least this many GriffBet bets are graded, the H2H panel shows a
+  # visible small-sample warning and does NOT invite win/loss comparison.
+  min_graded_bets: 100
+  # Reliability-curve buckets for calibration (predicted-prob band edges).
+  reliability_bands: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  # Predicted-EV band edges (decimal fractions) for the monotonicity table.
+  ev_bands: [-1.0, 0.0, 0.03, 0.05, 0.08, 0.12, 1.0]
+
+park_factors:
+  "Colorado Rockies": 112
+  "Boston Red Sox": 108
+  "Cincinnati Reds": 106
+  "Kansas City Royals": 104
+  "Arizona Diamondbacks": 103
+  "Philadelphia Phillies": 102
+  "Baltimore Orioles": 102
+  "Texas Rangers": 102
+  "Los Angeles Angels": 101
+  "Toronto Blue Jays": 101
+  "Atlanta Braves": 101
+  "Chicago Cubs": 100
+  "Minnesota Twins": 100
+  "Washington Nationals": 100
+  "Houston Astros": 100
+  "St. Louis Cardinals": 99
+  "Pittsburgh Pirates": 99
+  "Chicago White Sox": 99
+  "New York Yankees": 99
+  "Milwaukee Brewers": 98
+  "Los Angeles Dodgers": 98
+  "Detroit Tigers": 98
+  "New York Mets": 97
+  "Tampa Bay Rays": 97
+  "Cleveland Guardians": 97
+  "Athletics": 96
+  "San Diego Padres": 96
+  "Seattle Mariners": 95
+  "San Francisco Giants": 94
+  "Miami Marlins": 94
+
+default_park_factor: 100
+
+bullpen_fatigue:
+  enabled: true
+  leverage_top_n: 3
+  min_appearances_for_leverage: 8
+  pitch_threshold_unavailable: 35
+  appearance_threshold: 3
+  lookback_days: 5
+  penalty_by_unavailable: [0.0, -0.005, -0.015, -0.030]
+  unavailable_confidence_penalty_per_team: 2.0
+
+lineup:
+  enabled: true
+  hours_before_first_pitch_to_check: 3.0
+  key_bats_top_n: 3
+  min_pa_for_key_bats: 100
+  confidence_penalty:
+    one_projected: 3.0
+    both_projected: 5.0
+    data_unavailable: 6.0
+
+stability:
+  stable_share_min: 0.60
+  fragile_share_min: 0.50
+  sharp_fade_fragile_pp: 3.0
+  missing_component_fragile_n: 2
+
+logging:
+  level: "INFO"
+  file: "storage/griffbet.log"

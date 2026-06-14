@@ -48,3 +48,20 @@ jobs:
           python -m mlb_value_bot results || echo "results: nothing to settle"
           python -m mlb_value_bot today
           python -m mlb_value_bot sync
+
+      # GriffBet (challenger) — ADDITIVE. Runs the same pull -> grade -> slate ->
+      # sync flow on GriffBet's independent config + store + Supabase tables,
+      # after BiffBet. The `sync` step also computes + pushes the referee
+      # snapshot (cross-model report). BiffBet's steps above are unchanged; a
+      # GriffBet failure must not mask BiffBet's run, so each step is tolerant.
+      - name: Run GriffBet pipeline (pull -> grade -> slate -> sync)
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          BANKROLL: ${{ secrets.BANKROLL }}
+        run: |
+          python -m mlb_value_bot.griffbet pull            || echo "griff pull: skipped"
+          python -m mlb_value_bot.griffbet results         || echo "griff results: nothing to settle"
+          python -m mlb_value_bot.griffbet today            || echo "griff today: skipped"
+          python -m mlb_value_bot.griffbet sync             || echo "griff sync: skipped"

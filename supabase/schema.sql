@@ -122,3 +122,80 @@ create policy "public read performance"
     on public.performance_snapshot for select
     to anon, authenticated
     using (true);
+
+-- ===========================================================================
+-- GriffBet (the challenger) — ADDITIVE. These tables are entirely separate
+-- from BiffBet's above; BiffBet's schema is unchanged. Run this in the same
+-- Supabase project. The GriffBet engine writes via the same service-role key
+-- (bypasses RLS); the public site reads via the anon key under SELECT-only RLS.
+-- ===========================================================================
+
+-- GriffBet recommendations: a structural SUPERSET of public.recommendations
+-- with the CLV split (raw-model vs blended pick streams) and the sharp closing
+-- line + two sharp CLV streams. Keyed on (date, game_id) like BiffBet, but in
+-- its OWN table so the two models never collide.
+create table if not exists public.griffbet_recommendations (
+    id                    bigint generated always as identity primary key,
+    date                  date             not null,
+    game_id               bigint           not null,
+    home_team             text             not null,
+    away_team             text             not null,
+    recommended_side      text             not null check (recommended_side in ('home', 'away')),
+    model_prob            double precision not null,   -- blended pick-side prob (EV basis)
+    market_prob_devigged  double precision not null,
+    american_odds         integer          not null,   -- blended bet price
+    decimal_odds          double precision not null,
+    ev_pct                double precision not null,
+    kelly_stake           double precision not null,   -- AFTER discipline
+    confidence            double precision not null,
+    reasoning             jsonb,
+    -- CLV split -----------------------------------------------------------
+    raw_model_prob        double precision,            -- raw (pre-blend) home prob
+    blended_prob          double precision,            -- blended home prob
+    raw_pick_side         text,                        -- side the raw model would bet
+    raw_pick_open         integer,                     -- raw-pick price at commit
+    -- Opening / best-available ("obtainable") close on the blended side ----
+    opening_line          integer,
+    closing_line          integer,
+    clv_pct               double precision,            -- blended open vs best close
+    -- Sharp close (Pinnacle-preferred) + the two sharp CLV streams --------
+    sharp_close_book      text,
+    sharp_close_home_line integer,
+    sharp_close_away_line integer,
+    clv_raw_vs_sharp      double precision,
+    clv_blended_vs_sharp  double precision,
+    -- Grading -------------------------------------------------------------
+    result                text             not null default 'pending',
+    profit_loss           double precision,
+    is_value              boolean          not null default true,
+    created_at            timestamptz      not null default now(),
+    updated_at            timestamptz      not null default now(),
+    constraint griffbet_recommendations_date_game_id_key unique (date, game_id)
+);
+
+create index if not exists griffbet_recommendations_date_idx     on public.griffbet_recommendations (date desc);
+create index if not exists griffbet_recommendations_result_idx   on public.griffbet_recommendations (result);
+create index if not exists griffbet_recommendations_is_value_idx on public.griffbet_recommendations (is_value);
+
+-- Referee snapshot: the cross-model report (calibration, EV monotonicity, CLV)
+-- produced by griffbet.referee. One row per scope ('all' = lifetime).
+create table if not exists public.referee_snapshot (
+    scope        text        primary key,
+    data         jsonb       not null,
+    computed_at  timestamptz not null default now()
+);
+
+alter table public.griffbet_recommendations enable row level security;
+alter table public.referee_snapshot         enable row level security;
+
+drop policy if exists "public read griffbet recs" on public.griffbet_recommendations;
+create policy "public read griffbet recs"
+    on public.griffbet_recommendations for select
+    to anon, authenticated
+    using (true);
+
+drop policy if exists "public read referee" on public.referee_snapshot;
+create policy "public read referee"
+    on public.referee_snapshot for select
+    to anon, authenticated
+    using (true);
