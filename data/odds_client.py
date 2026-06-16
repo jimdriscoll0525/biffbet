@@ -78,15 +78,20 @@ class OddsClient:
         retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
     )
     def _get(self, url: str, params: dict) -> requests.Response:
+        from mlb_value_bot.data import fetch_ledger
         log.debug("GET %s params=%s", url, {k: v for k, v in params.items() if k != "apiKey"})
         resp = self.session.get(url, params=params, timeout=self.timeout)
         self._log_quota(resp)
         if resp.status_code == 429:
+            fetch_ledger.record("odds_api", "rate_limited", http_status=429)
             raise OddsAPIRateLimit("Odds API rate limit / quota exhausted (HTTP 429)")
         if resp.status_code == 401:
+            fetch_ledger.record("odds_api", "http_error", http_status=401)
             raise OddsAPIError("Odds API rejected the key (HTTP 401) — check ODDS_API_KEY")
         if resp.status_code >= 400:
+            fetch_ledger.record("odds_api", "http_error", http_status=resp.status_code)
             raise OddsAPIError(f"Odds API error {resp.status_code}: {resp.text[:300]}")
+        fetch_ledger.record("odds_api", "ok", http_status=resp.status_code)
         return resp
 
     @staticmethod

@@ -86,6 +86,11 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
     threshold = min_ev if min_ev is not None else float(config["ev"]["threshold"])
     bankroll = get_bankroll()
 
+    # Diagnostic provenance: clear the output-neutral fetch ledger so it reflects
+    # only this run (used after save to label WHY any component is unavailable).
+    from mlb_value_bot.data import fetch_ledger
+    fetch_ledger.reset()
+
     try:
         analyses = analyze_slate(game_date, config=config)
     except Exception as exc:
@@ -144,6 +149,29 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
                 f"[dim]Refreshed closing line on {n_refreshed} committed pick(s) "
                 f"whose game was skipped this run.[/]"
             )
+
+    # Data-provenance: label WHY each unavailable component is missing
+    # (legitimate absence vs real fetch failure) and merge an additive
+    # data_health block into reasoning_json. Purely diagnostic -- never changes a
+    # probability, component value, EV, or pick. Guarded so it can't break a run.
+    if save and evaluable:
+        try:
+            from mlb_value_bot.diagnostics.provenance import annotate_slate
+            from mlb_value_bot.utils import DB_PATH
+            health = annotate_slate(evaluable, DB_PATH, "recommendations", game_date, config)
+            if health["fetch_failures"] or health["stale"]:
+                console.print(
+                    f"[bold red]Data health: {health['fetch_failures']} fetch failure(s), "
+                    f"{health['stale']} stale across {health['games']} game(s).[/] "
+                    f"{health['details']}"
+                )
+            else:
+                console.print(
+                    f"[dim]Data health: all absences across {health['games']} game(s) are "
+                    f"legitimate (no fetch failures).[/]"
+                )
+        except Exception as exc:  # noqa: BLE001 -- diagnostics must never break a run
+            log.warning("provenance annotation failed (%s)", exc)
 
 
 def _render_slate_table(analyses: list[GameAnalysis], threshold: float, bankroll: float, game_date: str) -> None:

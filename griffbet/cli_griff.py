@@ -32,6 +32,9 @@ def today(date_: str | None, save: bool) -> None:
         save_slate_griff,
     )
 
+    from mlb_value_bot.data import fetch_ledger
+    fetch_ledger.reset()   # output-neutral fetch ledger for provenance (below)
+
     config = load_griff_config()
     game_date = date_ or date.today().isoformat()
     threshold = float(config["ev"]["threshold"])
@@ -55,6 +58,16 @@ def today(date_: str | None, save: bool) -> None:
         n_ref = refresh_skipped_closing_lines_griff(analyses, game_date)
         click.echo(f"Saved {total} GriffBet row(s) ({n_value} bets); "
                    f"refreshed {n_ref} skipped-game closing line(s).")
+        # Data-provenance: label WHY components are unavailable (additive only).
+        try:
+            from mlb_value_bot.diagnostics.provenance import annotate_slate
+            from mlb_value_bot.griffbet import GRIFF_DB_PATH
+            health = annotate_slate(evaluable, GRIFF_DB_PATH, "griff_recommendations", game_date, config)
+            if health["fetch_failures"] or health["stale"]:
+                click.echo(f"Data health: {health['fetch_failures']} fetch failure(s), "
+                           f"{health['stale']} stale. {health['details']}")
+        except Exception as exc:  # noqa: BLE001 -- diagnostics must never break a run
+            log.warning("griff provenance annotation failed (%s)", exc)
 
 
 @cli.command()

@@ -113,10 +113,13 @@ class MLBClient:
         retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
     )
     def _get(self, path: str, params: dict | None = None) -> dict:
+        from mlb_value_bot.data import fetch_ledger
         url = f"{self.base_url}{path}"
         resp = self.session.get(url, params=params or {}, timeout=self.timeout)
         if resp.status_code >= 400:
+            fetch_ledger.record(path, "http_error", http_status=resp.status_code)
             raise RuntimeError(f"MLB API error {resp.status_code} for {url}: {resp.text[:200]}")
+        fetch_ledger.record(path, "ok", http_status=resp.status_code)
         return resp.json()
 
     # -- Schedule / probable pitchers ----------------------------------------

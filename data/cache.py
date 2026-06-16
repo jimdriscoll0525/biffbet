@@ -19,6 +19,7 @@ from typing import Callable
 
 import pandas as pd
 
+from mlb_value_bot.data import fetch_ledger
 from mlb_value_bot.utils import CACHE_DIR, ensure_dirs, get_logger, load_config
 
 log = get_logger("data.cache")
@@ -93,23 +94,30 @@ def cached_dataframe(
     if not force_refresh:
         hit = load_cached(key, ttl_seconds)
         if hit is not None:
+            fetch_ledger.record(key, "ok", key=key, detail="cache hit")
             return hit
 
     try:
         df = producer()
     except Exception as exc:
+        outcome, status = fetch_ledger.classify_exception(exc)
         stale = cache_path(key)
         if stale.exists():
             log.warning("producer failed for %s (%s); using STALE cache", key, exc)
+            fetch_ledger.record(key, outcome, http_status=status, detail=exc, stale=True, key=key)
             return pd.read_parquet(stale)
         # No cache to fall back on. Per the graceful-degradation contract, do NOT
         # crash the run: log loudly and return empty so the model degrades to
         # whatever data IS available (with correspondingly lower confidence).
         log.warning("producer failed for %s (%s); no cache -> degrading to empty", key, exc)
+        fetch_ledger.record(key, outcome, http_status=status, detail=exc, key=key)
         return pd.DataFrame()
 
     if df is not None and not df.empty:
         store_cached(key, df)
+        fetch_ledger.record(key, "ok", key=key)
+        return df
+    fetch_ledger.record(key, "empty", key=key)
     return df if df is not None else pd.DataFrame()
 
 
