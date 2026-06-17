@@ -49,6 +49,24 @@ _REC_COLUMNS = (
 )
 
 
+# Columns we push to the `totals_recommendations` table (parallel to the ML
+# table). Same rules: drop SQLite `id`, send `reasoning` as parsed jsonb.
+_TOTALS_REC_COLUMNS = (
+    "date", "game_id", "home_team", "away_team", "pick_side", "market_total",
+    "over_odds", "under_odds", "bet_odds", "decimal_odds", "model_p_over",
+    "market_devig_over", "blended_p_over", "model_prob", "market_prob_devigged",
+    "ev_pct", "kelly_stake", "confidence", "tier", "stability", "raw_model_total",
+    "expected_total", "paper", "opening_line", "opening_price", "opening_devig_p_side",
+    "closing_line", "closing_price", "sharp_close_book", "sharp_close_line",
+    "sharp_close_over", "sharp_close_under", "sharp_close_devig_p_side", "clv_pp",
+    "result", "profit_loss", "is_value", "created_at", "updated_at",
+)
+_TOTALS_INT_COLS = (
+    "game_id", "over_odds", "under_odds", "bet_odds", "opening_price",
+    "closing_price", "sharp_close_over", "sharp_close_under",
+)
+
+
 class SupabaseConfigError(RuntimeError):
     """Raised when the Supabase URL / service key are not configured."""
 
@@ -57,6 +75,7 @@ class SupabaseConfigError(RuntimeError):
 class SyncResult:
     recommendations: int
     performance_scopes: int
+    totals_recommendations: int = 0
 
 
 # --- credentials -------------------------------------------------------------
@@ -180,6 +199,43 @@ def push_recommendations(url: str, key: str, since: str | None = None) -> int:
     return len(rows)
 
 
+# --- totals recommendations --------------------------------------------------
+def _totals_rec_rows(since: str | None) -> list[dict]:
+    from mlb_value_bot.tracking import totals_recommendations as totals
+
+    df: pd.DataFrame = totals.to_dataframe(since=since)
+    if df.empty:
+        return []
+    rows: list[dict] = []
+    for _, r in df.iterrows():
+        row = {col: _clean(r.get(col)) for col in _TOTALS_REC_COLUMNS}
+        for col in _TOTALS_INT_COLS:
+            if row.get(col) is not None:
+                row[col] = int(row[col])
+        for boolcol in ("paper", "is_value"):
+            if row.get(boolcol) is not None:
+                row[boolcol] = bool(int(row[boolcol]))
+        row["paper"] = True if row.get("paper") is None else row["paper"]
+        raw = r.get("reasoning_json")
+        if isinstance(raw, str) and raw:
+            try:
+                row["reasoning"] = _clean(json.loads(raw))
+            except json.JSONDecodeError:
+                row["reasoning"] = None
+        else:
+            row["reasoning"] = None
+        rows.append(row)
+    return rows
+
+
+def push_totals_recommendations(url: str, key: str, since: str | None = None) -> int:
+    rows = _totals_rec_rows(since)
+    for start in range(0, len(rows), _BATCH):
+        _post(url, key, "totals_recommendations", rows[start:start + _BATCH], on_conflict="date,game_id")
+    log.info("Synced %d totals recommendation(s) to Supabase.", len(rows))
+    return len(rows)
+
+
 # --- performance snapshot ----------------------------------------------------
 def _segments_to_json(segments: dict[str, pd.DataFrame]) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {}
@@ -210,11 +266,21 @@ def push_performance(url: str, key: str, since: str | None = None) -> int:
 
 # --- entrypoint --------------------------------------------------------------
 def push_all(since: str | None = None) -> SyncResult:
-    """Push recommendations + the performance snapshot to Supabase."""
+    """Push recommendations + the performance snapshot to Supabase.
+
+    Also pushes the totals (over/under) recommendations to their own table when
+    the table exists. Tolerant: a missing totals table (schema not yet applied)
+    is logged and skipped, so the moneyline sync never fails because of totals.
+    """
     url, key = _credentials()
     n_recs = push_recommendations(url, key, since=since)
     n_perf = push_performance(url, key, since=since)
-    return SyncResult(recommendations=n_recs, performance_scopes=n_perf)
+    n_totals = 0
+    try:
+        n_totals = push_totals_recommendations(url, key, since=since)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("totals sync skipped (%s) — apply supabase/schema.sql totals table?", exc)
+    return SyncResult(recommendations=n_recs, performance_scopes=n_perf, totals_recommendations=n_totals)
 
 
 # --- pull (Supabase -> SQLite) -----------------------------------------------

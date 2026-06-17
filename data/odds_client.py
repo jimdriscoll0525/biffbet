@@ -110,10 +110,19 @@ class OddsClient:
             )
 
         url = f"{self.base_url}/sports/{self.sport_key}/odds"
+        # The bet-price path only ever reads h2h, but when totals are enabled we
+        # ask for both markets in ONE request (the over/under lines ride along in
+        # each event's raw bookmaker payload -> GameOdds.all_books, which
+        # analysis/totals_market.py parses). The Odds API bills per market x
+        # region, so this ~doubles the per-call quota cost; toggle via
+        # odds_api.totals_market.
+        markets = self._odds_cfg.get("markets", "h2h")
+        if self._odds_cfg.get("totals_market", False) and "totals" not in markets:
+            markets = f"{markets},totals"
         params = {
             "apiKey": self.api_key,
             "regions": self._odds_cfg.get("regions", "us"),
-            "markets": self._odds_cfg.get("markets", "h2h"),
+            "markets": markets,
             "oddsFormat": self._odds_cfg.get("odds_format", "american"),
         }
         books = self._odds_cfg.get("bookmakers") or []

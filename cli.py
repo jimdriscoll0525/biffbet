@@ -173,6 +173,11 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
         except Exception as exc:  # noqa: BLE001 -- diagnostics must never break a run
             log.warning("provenance annotation failed (%s)", exc)
 
+    # Totals (over/under) -- a parallel, PAPER-ONLY market. Rendered + saved to
+    # its own tracking table; graded on CLV vs the totals close. Never affects
+    # the moneyline output above.
+    _render_totals(analyses, config, bankroll, game_date, save, show_all)
+
 
 def _render_slate_table(analyses: list[GameAnalysis], threshold: float, bankroll: float, game_date: str) -> None:
     title = f"MLB slate — {game_date}  (bankroll {bankroll:.0f}, EV threshold {threshold*100:.1f}%)"
@@ -257,6 +262,117 @@ def _render_skipped(skipped: list[GameAnalysis]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Totals (over/under) rendering -- a PARALLEL, PAPER-ONLY section.
+# ---------------------------------------------------------------------------
+def _render_totals_table(totals: list, threshold: float, bankroll: float, game_date: str) -> None:
+    paper = any(t.paper for t in totals) if totals else True
+    tag = "  [yellow](PAPER / SIMULATED)[/]" if paper else ""
+    table = Table(title=f"TOTALS slate — {game_date}{tag}", header_style="bold magenta", expand=False)
+    for col in ("Matchup", "Pick", "Line", "Price", "ProjTot", "Mdl o/u%", "Mkt o/u%", "EV%",
+                "Kelly%", "Stake", "Conf", "Stab"):
+        table.add_column(col)
+    for t in totals:
+        be = t.best_eval
+        if be is None:
+            continue
+        is_value = t.is_value(threshold)
+        style = "bold green" if is_value else "white"
+        held = "  [yellow]⚠wx[/]" if t.weather_held else ""
+        model_side = t.blended_over if t.pick_side == "over" else (
+            1 - t.blended_over if t.blended_over is not None else None)
+        mkt_side = t.market_devig_over if t.pick_side == "over" else (
+            1 - t.market_devig_over if t.market_devig_over is not None else None)
+        table.add_row(
+            f"{t.away_team} @ {t.home_team}",
+            f"[{style}]{t.pick_side}{held}[/]",
+            _fmt_num(t.market_total, 1),
+            _american(be.american_odds),
+            _fmt_num(t.rd.expected_total, 1) if t.rd else "-",
+            _fmt_pct(model_side),
+            _fmt_pct(mkt_side),
+            f"[{style}]{be.ev_pct * 100:+.1f}%[/]",
+            _fmt_pct(be.kelly_stake),
+            f"{be.kelly_stake * bankroll:,.0f}",
+            _fmt_num(t.confidence, 0),
+            (t.stability.label[:4] if t.stability else "-"),
+        )
+    console.print(table)
+
+
+def _render_totals_breakdowns(totals: list) -> None:
+    for t in totals:
+        be = t.best_eval
+        if be is None or t.rd is None:
+            continue
+        rd = t.rd
+        lines = [
+            f"[bold]{t.away_team} @ {t.home_team}[/]  pick [green]{t.pick_side} {t.market_total}[/] "
+            f"@ {be.american_odds:+d}   [yellow]{'PAPER' if t.paper else 'LIVE'}[/]",
+            f"  proj runs: away {rd.away_runs} – home {rd.home_runs}  | raw total {rd.raw_model_total} "
+            f"-> expected {rd.expected_total} (var {rd.variance})",
+        ]
+        for c in rd.components:
+            extra = c.get("runs", c.get("mult", ""))
+            lines.append(f"  - {c['name']:<12} {c.get('value','')}  {extra}")
+        if t.market_devig_over is not None:
+            lines.append(
+                f"  = blend: model P(over) {t.model_p_over} × {t.blend:g} + market {t.market_devig_over} × "
+                f"{1 - t.blend:g} -> [bold]{t.blended_over}[/]  (P(over), {t.blend_tier} conf {t.confidence:.0f})"
+            )
+        lines.append(
+            f"  EV {be.ev_pct * 100:+.1f}%  tier [bold]{t.tier}[/]  "
+            f"stability [bold]{t.stability.label.upper() if t.stability else '?'}[/]"
+            + (f"  signals: {', '.join(t.stability.hard_fragile_signals)}"
+               if t.stability and t.stability.hard_fragile_signals else "")
+        )
+        if t.sharp_close is not None:
+            lines.append(
+                f"  sharp close: {t.sharp_close.book} {t.sharp_close.line} "
+                f"(P(over) {t.sharp_close.devig_over}) — CLV graded vs this"
+            )
+        if t.flags:
+            lines.append(f"  [yellow]flags: {'; '.join(t.flags)}[/]")
+        console.print(Panel("\n".join(lines), border_style="magenta", expand=False))
+
+
+def _render_totals(analyses: list[GameAnalysis], config: dict, bankroll: float,
+                   game_date: str, save: bool, show_all: bool) -> None:
+    """Render + persist the totals slate (PAPER). No-op if totals disabled."""
+    if not config.get("totals", {}).get("enabled", False):
+        return
+    totals = [a.totals for a in analyses if getattr(a, "totals", None) is not None]
+    evaluable = [t for t in totals if t.best_eval is not None and not t.skipped_reason]
+    threshold = float(config["totals"].get("ev_threshold", 0.03))
+    value = [t for t in evaluable if t.is_value(threshold)]
+    skipped = [t for t in totals if t.best_eval is None or t.skipped_reason]
+
+    console.print()
+    _render_totals_table(evaluable if show_all else value, threshold, bankroll, game_date)
+    _render_totals_breakdowns(value)
+    if skipped:
+        st = Table(title="Skipped totals", header_style="dim", expand=False)
+        st.add_column("Matchup"); st.add_column("Reason")
+        for t in skipped:
+            st.add_row(f"{t.away_team} @ {t.home_team}", t.skipped_reason or "no totals market")
+        console.print(st)
+
+    paper = config["totals"].get("paper_only", True)
+    console.print(
+        f"[bold]{len(value)}[/] totals pick(s) at EV >= {threshold * 100:.1f}% "
+        f"out of {len(evaluable)} evaluable — [yellow]{'PAPER/SIMULATED' if paper else 'LIVE'}[/] "
+        f"(graded on CLV vs the totals close)."
+    )
+
+    if save and evaluable:
+        from mlb_value_bot.pipeline_totals import refresh_skipped_totals_closing, save_totals_slate
+        total, n_value = save_totals_slate(evaluable, threshold, game_date)
+        console.print(f"[green]Saved/updated {total} totals row(s) ({n_value} flagged value) to the tracking DB.[/]")
+        n_ref = refresh_skipped_totals_closing(totals, game_date)
+        if n_ref:
+            console.print(f"[dim]Refreshed totals close on {n_ref} committed paper pick(s) on skipped games.[/]")
+
+
+# ---------------------------------------------------------------------------
 # results
 # ---------------------------------------------------------------------------
 @cli.command()
@@ -308,6 +424,24 @@ def results(date_: str | None) -> None:
             title="Backfill total", border_style="magenta", expand=False,
         ))
 
+    # Totals (PAPER) grading -- separate table, separate ledger.
+    if load_config().get("totals", {}).get("enabled", False):
+        if date_:
+            t_summaries = [results_mod.grade_totals_date(date_)]
+        else:
+            t_summaries = results_mod.grade_all_open_totals(before=date.today().isoformat())
+        t_graded = sum(s.graded for s in t_summaries)
+        if t_graded or any(s.bets for s in t_summaries):
+            t_wins = sum(s.wins for s in t_summaries)
+            t_losses = sum(s.losses for s in t_summaries)
+            t_pl = sum(s.profit_loss for s in t_summaries)
+            console.print(Panel(
+                f"Totals settled (PAPER): [bold]{t_graded}[/]  ({t_wins}W-{t_losses}L)   "
+                f"Paper P/L: [bold]{t_pl:+.4f}[/] units\n"
+                f"[dim]Totals are graded on CLV vs the totals close, not record — see `performance`.[/]",
+                title="Totals — PAPER results", border_style="magenta", expand=False,
+            ))
+
 
 # ---------------------------------------------------------------------------
 # performance
@@ -336,6 +470,49 @@ def performance(since: str | None) -> None:
         if seg_df.empty:
             continue
         _render_segment(title, seg_df)
+
+    _render_totals_performance(since)
+
+
+def _render_totals_performance(since: str | None) -> None:
+    """Totals (PAPER) performance -- CLV vs the totals close is the headline."""
+    if not load_config().get("totals", {}).get("enabled", False):
+        return
+    from mlb_value_bot.tracking import totals_performance as tperf
+
+    report = tperf.compute_totals_performance(since=since)
+    o = report.overall
+    if o.get("bets", 0) == 0:
+        return
+    console.print(Panel(
+        f"Paper bets: [bold]{o['bets']}[/]   Settled: [bold]{o['settled']}[/]  "
+        f"({o['wins']}W-{o['losses']}L, {o.get('pushes', 0)} push)\n"
+        f"[bold]Avg CLV: {_fmt_num(o['avg_clv_pp'])} pp[/]  (vs sharp totals close, on {o['clv_tracked']} picks) "
+        f"— [dim]the gate to go live[/]\n"
+        f"CLV+ rate: {_fmt_pct(o.get('clv_positive_rate'))}   "
+        f"Paper Kelly ROI: {_fmt_pct(o['kelly_roi'])}   Hit rate: {_fmt_pct(o['hit_rate'])}",
+        title=f"TOTALS performance (PAPER){' since ' + since if since else ''}",
+        border_style="magenta", expand=False,
+    ))
+    for title, seg_df in report.segments.items():
+        if seg_df.empty:
+            continue
+        _render_totals_segment(title, seg_df)
+
+
+def _render_totals_segment(title: str, df) -> None:
+    table = Table(title=f"[totals] {title}", header_style="bold magenta")
+    seg_col = df.columns[0]
+    for col in (seg_col, "bets", "settled", "wins", "losses", "avg_clv_pp", "kelly_roi", "avg_ev_pct"):
+        if col in df.columns:
+            table.add_column(col)
+    for _, row in df.iterrows():
+        table.add_row(
+            str(row[seg_col]), str(int(row["bets"])), str(int(row["settled"])),
+            str(int(row["wins"])), str(int(row["losses"])),
+            _fmt_num(row["avg_clv_pp"]), _fmt_pct(row["kelly_roi"]), _fmt_num(row["avg_ev_pct"]),
+        )
+    console.print(table)
 
 
 def _render_segment(title: str, df) -> None:
@@ -485,6 +662,7 @@ def sync_cmd(since: str | None) -> None:
 
     console.print(Panel(
         f"Recommendations pushed: [bold]{result.recommendations}[/]\n"
+        f"Totals (paper) pushed:  [bold]{result.totals_recommendations}[/]\n"
         f"Performance snapshot(s): [bold]{result.performance_scopes}[/]",
         title="Synced to Supabase", border_style="green", expand=False,
     ))

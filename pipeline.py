@@ -82,6 +82,11 @@ class GameAnalysis:
     # line must never become a closing price. None on no-odds/unplayable skips.
     home_odds: int | None = None
     away_odds: int | None = None
+    # Totals (over/under) evaluation for this same game -- an INDEPENDENT pick
+    # (its own line/de-vig/sharp consensus/close). Attached by analyze_slate when
+    # config.totals.enabled; None otherwise. The moneyline fields above are
+    # unaffected by it. See pipeline_totals.TotalsAnalysis.
+    totals: "object | None" = None
 
     @property
     def best_eval(self) -> SideEvaluation | None:
@@ -187,6 +192,67 @@ def _lineup_to_dict(status) -> dict | None:
     }
 
 
+@dataclass
+class GameProfiles:
+    """The per-game metric profiles + status snapshots, built ONCE per game and
+    reused by both the moneyline (`evaluate_game`) and totals
+    (`pipeline_totals.evaluate_totals_game`) evaluations so a slate run does a
+    single set of pitcher/team/bullpen/lineup pulls. The moneyline and totals
+    models are otherwise independent -- they just share these inputs."""
+    home_pp: object
+    away_pp: object
+    home_tp: object
+    away_tp: object
+    home_bp: object | None = None
+    away_bp: object | None = None
+    home_lu: object | None = None
+    away_lu: object | None = None
+
+
+def _build_profiles(
+    scheduled: ScheduledGame,
+    team_provider: TeamMetricsProvider,
+    season: int,
+    as_of: date_cls,
+    config: dict,
+    bullpen_status_provider=None,
+    lineup_status_provider=None,
+) -> GameProfiles:
+    """Build the pitcher/team profiles + bullpen/lineup status snapshots for one
+    game. Extracted from `evaluate_game` so `analyze_slate` can build them once
+    and feed BOTH the moneyline and totals evaluators. Every input degrades
+    gracefully (missing pitcher -> empty profile; provider failure -> None)."""
+    home_pp = build_pitcher_profile(scheduled.home_pitcher.player_id, scheduled.home_pitcher.name, season, as_of)
+    away_pp = build_pitcher_profile(scheduled.away_pitcher.player_id, scheduled.away_pitcher.name, season, as_of)
+    home_tp = team_provider.build_team_profile(scheduled.home_team, is_home=True)
+    away_tp = team_provider.build_team_profile(scheduled.away_team, is_home=False)
+
+    home_bp = away_bp = None
+    if bullpen_status_provider is not None:
+        try:
+            home_bp = bullpen_status_provider(scheduled.home_team, scheduled.home_team_id)
+            away_bp = bullpen_status_provider(scheduled.away_team, scheduled.away_team_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bullpen status provider failed for game %s (%s)", scheduled.game_id, exc)
+
+    home_lu = away_lu = None
+    if lineup_status_provider is not None:
+        try:
+            home_lu = lineup_status_provider(
+                scheduled.home_team, scheduled.game_id, "home", scheduled.game_datetime,
+            )
+            away_lu = lineup_status_provider(
+                scheduled.away_team, scheduled.game_id, "away", scheduled.game_datetime,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("lineup status provider failed for game %s (%s)", scheduled.game_id, exc)
+
+    return GameProfiles(
+        home_pp=home_pp, away_pp=away_pp, home_tp=home_tp, away_tp=away_tp,
+        home_bp=home_bp, away_bp=away_bp, home_lu=home_lu, away_lu=away_lu,
+    )
+
+
 def _odds_by_team(game: GameOdds) -> dict[str, int]:
     out: dict[str, int] = {}
     if game.home:
@@ -240,6 +306,7 @@ def evaluate_game(
     config: dict | None = None,
     bullpen_status_provider=None,  # callable: (team_name, team_id) -> BullpenStatus | None
     lineup_status_provider=None,   # callable: (team_name, game_pk, side, first_pitch_iso) -> LineupStatus | None
+    profiles: GameProfiles | None = None,
 ) -> GameAnalysis:
     """Run the full model + EV evaluation for a single game.
 
@@ -250,6 +317,11 @@ def evaluate_game(
     per-game status is computed on demand and memoized. Pass None for
     either to fall back to the pre-feature behavior (component contributes
     0 with "data unavailable").
+
+    `profiles` is an optional prebuilt GameProfiles (see `_build_profiles`). When
+    provided (by `analyze_slate`, so the moneyline and totals evals share one
+    build) we reuse it; when None we build it here, preserving the standalone
+    behavior used by the backtester.
     """
     config = config or load_config()
     analysis = GameAnalysis(
@@ -293,37 +365,18 @@ def evaluate_game(
     analysis.home_odds = int(home_odds)
     analysis.away_odds = int(away_odds)
 
-    # Build metric profiles. Missing probable pitchers degrade gracefully:
-    # the starter/form components fall to 0 and confidence drops.
-    home_pp = build_pitcher_profile(scheduled.home_pitcher.player_id, scheduled.home_pitcher.name, season, as_of)
-    away_pp = build_pitcher_profile(scheduled.away_pitcher.player_id, scheduled.away_pitcher.name, season, as_of)
-    home_tp = team_provider.build_team_profile(scheduled.home_team, is_home=True)
-    away_tp = team_provider.build_team_profile(scheduled.away_team, is_home=False)
-
-    # Bullpen fatigue: optional, never fatal. Missing -> component contributes 0.
-    home_bp = None
-    away_bp = None
-    if bullpen_status_provider is not None:
-        try:
-            home_bp = bullpen_status_provider(scheduled.home_team, scheduled.home_team_id)
-            away_bp = bullpen_status_provider(scheduled.away_team, scheduled.away_team_id)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("bullpen status provider failed for game %s (%s)", scheduled.game_id, exc)
-
-    # Lineup status: optional, same shape. Drives the `lineup` component AND
-    # a confidence penalty when lineups are projected (not yet confirmed).
-    home_lu = None
-    away_lu = None
-    if lineup_status_provider is not None:
-        try:
-            home_lu = lineup_status_provider(
-                scheduled.home_team, scheduled.game_id, "home", scheduled.game_datetime,
-            )
-            away_lu = lineup_status_provider(
-                scheduled.away_team, scheduled.game_id, "away", scheduled.game_datetime,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("lineup status provider failed for game %s (%s)", scheduled.game_id, exc)
+    # Build metric profiles (or reuse the prebuilt set from analyze_slate).
+    # Missing probable pitchers degrade gracefully: the starter/form components
+    # fall to 0 and confidence drops.
+    if profiles is None:
+        profiles = _build_profiles(
+            scheduled, team_provider, season, as_of, config,
+            bullpen_status_provider, lineup_status_provider,
+        )
+    home_pp, away_pp = profiles.home_pp, profiles.away_pp
+    home_tp, away_tp = profiles.home_tp, profiles.away_tp
+    home_bp, away_bp = profiles.home_bp, profiles.away_bp
+    home_lu, away_lu = profiles.home_lu, profiles.away_lu
 
     wp = compute_win_probability(
         home_tp, away_tp, home_pp, away_pp, config,
@@ -892,14 +945,36 @@ def analyze_slate(
     # feed-live calls memoized so both sides share one fetch.
     lu_provider = _build_lineup_status_provider(mlb_client, season, config)
 
+    # Totals model (parallel, independent). Enabled via config.totals.enabled;
+    # reuses the SAME per-game profiles as the moneyline so the slate does one
+    # set of pulls. Imported lazily to avoid a module import cycle.
+    totals_enabled = bool(config.get("totals", {}).get("enabled", False))
+    if totals_enabled:
+        from mlb_value_bot.data.weather import weather_env
+        from mlb_value_bot.pipeline_totals import evaluate_totals_game
+
     analyses: list[GameAnalysis] = []
     for sched in schedule:
         matched = _match_odds(sched, odds)
-        analyses.append(evaluate_game(
+        # Build the per-game profiles ONCE (only for playable games -- skips
+        # don't need them) and feed both evaluators.
+        profiles = None
+        if sched.is_playable:
+            profiles = _build_profiles(
+                sched, provider, season, as_of, config, bp_provider, lu_provider,
+            )
+        analysis = evaluate_game(
             sched, matched, provider, season, as_of, config,
             bullpen_status_provider=bp_provider,
             lineup_status_provider=lu_provider,
-        ))
+            profiles=profiles,
+        )
+        if totals_enabled:
+            # Only fetch weather (an Open-Meteo call) when there are odds to bet
+            # against -- evaluate_totals_game skips early without them anyway.
+            weather = weather_env(sched.home_team, sched.game_date, config) if matched is not None else None
+            analysis.totals = evaluate_totals_game(sched, matched, profiles, weather, config)
+        analyses.append(analysis)
 
     # Rank: evaluable games by EV desc, skipped games last.
     def _sort_key(a: GameAnalysis) -> float:

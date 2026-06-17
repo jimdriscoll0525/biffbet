@@ -42,6 +42,9 @@ CFG = load_config()
 BANKROLL = get_bankroll()
 THRESHOLD = float(CFG["ev"]["threshold"])
 BLEND = CFG["model"].get("market_blend")
+TOTALS_ENABLED = bool(CFG.get("totals", {}).get("enabled", False))
+TOTALS_THRESHOLD = float(CFG.get("totals", {}).get("ev_threshold", 0.03))
+TOTALS_PAPER = bool(CFG.get("totals", {}).get("paper_only", True))
 
 
 # --- formatting helpers ------------------------------------------------------
@@ -117,6 +120,104 @@ def page_today() -> None:
             _render_saved_recs(df)
         else:
             st.info("No analysis yet for this date — click **Run / refresh analysis**.")
+
+    # Totals (over/under) -- a parallel, PAPER-ONLY market shown distinctly.
+    if TOTALS_ENABLED:
+        _render_totals_section(analyses, date_str, show_all)
+
+
+def _render_totals_section(analyses, date_str: str, show_all: bool) -> None:
+    st.divider()
+    badge = "🧪 PAPER / SIMULATED" if TOTALS_PAPER else "LIVE"
+    st.subheader(f"Totals (over/under) — {badge}")
+    st.caption("Independent market: own line, de-vig, sharp consensus, and close. "
+               "Graded on **CLV vs the totals close**, not record — paper until CLV proves out.")
+
+    if analyses:
+        totals = [a.totals for a in analyses if getattr(a, "totals", None) is not None]
+        evaluable = [t for t in totals if t.best_eval is not None and not t.skipped_reason]
+        value = [t for t in evaluable if t.is_value(TOTALS_THRESHOLD)]
+        rows = []
+        for t in (evaluable if show_all else value):
+            be = t.best_eval
+            model_side = t.blended_over if t.pick_side == "over" else (
+                None if t.blended_over is None else 1 - t.blended_over)
+            mkt_side = t.market_devig_over if t.pick_side == "over" else (
+                None if t.market_devig_over is None else 1 - t.market_devig_over)
+            rows.append({
+                "Matchup": f"{t.away_team} @ {t.home_team}",
+                "Pick": f"{t.pick_side} {t.market_total}" + ("  ⚠wx" if t.weather_held else ""),
+                "Price": int(be.american_odds),
+                "ProjTotal": t.rd.expected_total if t.rd else None,
+                "Model%": (model_side or 0) * 100,
+                "Mkt%": (mkt_side or 0) * 100,
+                "EV%": be.ev_pct * 100,
+                "Kelly%": be.kelly_stake * 100,
+                "Stake$": be.kelly_stake * BANKROLL,
+                "Conf": t.confidence,
+                "Stability": t.stability.label if t.stability else "—",
+                "Value": t.is_value(TOTALS_THRESHOLD),
+            })
+        if rows:
+            tdf = pd.DataFrame(rows)
+            fmt = {"Price": "{:+d}", "ProjTotal": "{:.1f}", "Model%": "{:.1f}", "Mkt%": "{:.1f}",
+                   "EV%": "{:+.1f}", "Kelly%": "{:.1f}", "Stake$": "{:,.0f}", "Conf": "{:.0f}"}
+            st.dataframe(_style(tdf, fmt, highlight_col="Value"), hide_index=True, width="stretch")
+            for t in value:
+                _render_totals_breakdown(t)
+        else:
+            st.info("No totals picks at the current threshold. Toggle **Show all games** to see the full board.")
+        return
+
+    # No live run -> read the saved totals table.
+    from mlb_value_bot.tracking import totals_recommendations as totals
+    tdf = totals.to_dataframe()
+    tdf = tdf[tdf["date"] == date_str] if not tdf.empty else tdf
+    if tdf.empty:
+        st.info("No totals saved for this date — click **Run / refresh analysis**.")
+        return
+    view = pd.DataFrame({
+        "Matchup": tdf["away_team"] + " @ " + tdf["home_team"],
+        "Pick": tdf["pick_side"] + " " + tdf["market_total"].astype(str),
+        "Price": tdf["bet_odds"].astype(int),
+        "ProjTotal": tdf["expected_total"],
+        "EV%": tdf["ev_pct"] * 100,
+        "Conf": tdf["confidence"],
+        "Stability": tdf["stability"],
+        "Result": tdf["result"],
+        "CLV(pp)": tdf["clv_pp"],
+        "Paper": tdf["paper"].astype(bool),
+    })
+    fmt = {"Price": "{:+d}", "ProjTotal": "{:.1f}", "EV%": "{:+.1f}", "Conf": "{:.0f}", "CLV(pp)": "{:+.2f}"}
+    st.dataframe(_style(view, fmt), hide_index=True, width="stretch")
+
+
+def _render_totals_breakdown(t) -> None:
+    be = t.best_eval
+    rd = t.rd
+    title = (f"{t.away_team} @ {t.home_team}  —  {t.pick_side} {t.market_total} @ {be.american_odds:+d}   "
+             f"({be.ev_pct*100:+.1f}% EV · {t.tier} · {t.stability.label if t.stability else '?'})")
+    with st.expander(title):
+        st.markdown(f"**Pitchers:** {t.away_pitcher or '?'} (away) vs {t.home_pitcher or '?'} (home)")
+        if rd is not None:
+            st.markdown(f"**Projected runs:** away {rd.away_runs} – home {rd.home_runs}  ·  "
+                        f"raw total {rd.raw_model_total} → expected **{rd.expected_total}** (var {rd.variance})")
+            comp = pd.DataFrame(rd.components)
+            st.dataframe(comp, hide_index=True, use_container_width=True)
+        if t.market_devig_over is not None:
+            st.markdown(
+                f"**Market anchor:** model P(over) {t.model_p_over} × {t.blend:g} + "
+                f"market {t.market_devig_over} × {1 - t.blend:g} → **{t.blended_over}** "
+                f"(P(over); {t.blend_tier} conf {t.confidence:.0f})"
+            )
+        if t.weather is not None:
+            st.markdown(f"**Weather:** {t.weather.note}  (×{t.weather.multiplier}"
+                        f"{', ⚠ unavailable' if not t.weather.available else ''})")
+        if t.sharp_close is not None:
+            st.markdown(f"**Sharp close:** {t.sharp_close.book} {t.sharp_close.line} "
+                        f"(P(over) {t.sharp_close.devig_over}) — CLV graded vs this")
+        if t.flags:
+            st.warning(" · ".join(t.flags))
 
 
 def _render_live_slate(analyses, show_all: bool) -> None:
@@ -283,6 +384,39 @@ def page_performance() -> None:
         if not chart_df.empty:
             cchart.caption("Avg CLV% by bucket")
             cchart.bar_chart(chart_df)
+
+    if TOTALS_ENABLED:
+        _render_totals_performance_page(since)
+
+
+def _render_totals_performance_page(since: str | None) -> None:
+    from mlb_value_bot.tracking import totals_performance as tperf
+
+    st.divider()
+    st.subheader("Totals (over/under) — 🧪 PAPER")
+    st.caption("**CLV vs the totals close (in pp)** is the gate to go live — not win/loss.")
+    report = tperf.compute_totals_performance(since=since)
+    o = report.overall
+    if o.get("bets", 0) == 0:
+        st.info("No totals picks recorded yet.")
+        return
+
+    def num(x, suffix=""):
+        return "—" if x is None or (isinstance(x, float) and pd.isna(x)) else f"{x:+.2f}{suffix}"
+
+    k = st.columns(6)
+    k[0].metric("Paper bets", o["bets"])
+    k[1].metric("Settled", o["settled"], f"{o['wins']}W-{o['losses']}L")
+    k[2].metric("Avg CLV (pp)", num(o["avg_clv_pp"]))
+    k[3].metric("CLV+ rate", "—" if pd.isna(o.get("clv_positive_rate", float("nan"))) else f"{o['clv_positive_rate']*100:.0f}%")
+    k[4].metric("Paper Kelly ROI", "—" if pd.isna(o["kelly_roi"]) else f"{o['kelly_roi']*100:+.1f}%")
+    k[5].metric("Hit rate", "—" if pd.isna(o["hit_rate"]) else f"{o['hit_rate']*100:.1f}%")
+
+    for title, seg in report.segments.items():
+        if seg.empty:
+            continue
+        st.markdown(f"**{title}**")
+        st.dataframe(seg, hide_index=True, width="stretch")
 
 
 # --- main --------------------------------------------------------------------

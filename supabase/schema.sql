@@ -124,6 +124,71 @@ create policy "public read performance"
     using (true);
 
 -- ===========================================================================
+-- TOTALS (over/under) — ADDITIVE, PAPER-ONLY. A parallel BiffBet market: its own
+-- line, de-vig, sharp consensus, and close. Keyed on (date, game_id) in its OWN
+-- table so it never collides with the moneyline `recommendations`. CLV is stored
+-- in PROBABILITY POINTS vs the sharp totals close (`clv_pp`), because the totals
+-- line moves (the moneyline's decimal-ratio CLV doesn't transfer). `paper` marks
+-- a simulated pick; the public site labels these PAPER until CLV proves out.
+-- ===========================================================================
+create table if not exists public.totals_recommendations (
+    id                       bigint generated always as identity primary key,
+    date                     date             not null,
+    game_id                  bigint           not null,
+    home_team                text             not null,
+    away_team                text             not null,
+    pick_side                text             not null check (pick_side in ('over', 'under')),
+    market_total             double precision,
+    over_odds                integer,
+    under_odds               integer,
+    bet_odds                 integer          not null,   -- picked-side price (EV basis)
+    decimal_odds             double precision not null,
+    model_p_over             double precision,            -- conditional model P(over)
+    market_devig_over        double precision,            -- de-vigged market P(over)
+    blended_p_over           double precision,
+    model_prob               double precision not null,   -- blended P(picked side)
+    market_prob_devigged     double precision not null,
+    ev_pct                   double precision not null,
+    kelly_stake              double precision not null,   -- fraction of bankroll (paper)
+    confidence               double precision not null,
+    tier                     text,
+    stability                text,
+    raw_model_total          double precision,
+    expected_total           double precision,
+    paper                    boolean          not null default true,
+    reasoning                jsonb,
+    -- CLV (probability-pp move vs the sharp totals close) --------------------
+    opening_line             double precision,
+    opening_price            integer,
+    opening_devig_p_side     double precision,            -- de-vig P(side) at commit
+    closing_line             double precision,
+    closing_price            integer,
+    sharp_close_book         text,
+    sharp_close_line         double precision,
+    sharp_close_over         integer,
+    sharp_close_under        integer,
+    sharp_close_devig_p_side double precision,            -- de-vig P(side) at sharp close
+    clv_pp                   double precision,            -- (close - entry) * 100 pp
+    result                   text             not null default 'pending',  -- pending|win|loss|push|void
+    profit_loss              double precision,            -- paper, bankroll-fraction units
+    is_value                 boolean          not null default true,
+    created_at               timestamptz      not null default now(),
+    updated_at               timestamptz      not null default now(),
+    constraint totals_recommendations_date_game_id_key unique (date, game_id)
+);
+
+create index if not exists totals_recommendations_date_idx     on public.totals_recommendations (date desc);
+create index if not exists totals_recommendations_result_idx   on public.totals_recommendations (result);
+create index if not exists totals_recommendations_is_value_idx on public.totals_recommendations (is_value);
+
+alter table public.totals_recommendations enable row level security;
+drop policy if exists "public read totals" on public.totals_recommendations;
+create policy "public read totals"
+    on public.totals_recommendations for select
+    to anon, authenticated
+    using (true);
+
+-- ===========================================================================
 -- GriffBet (the challenger) — ADDITIVE. These tables are entirely separate
 -- from BiffBet's above; BiffBet's schema is unchanged. Run this in the same
 -- Supabase project. The GriffBet engine writes via the same service-role key

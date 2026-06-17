@@ -17,8 +17,16 @@ odds_api:
   # us + uk gets us DraftKings/FanDuel/BetMGM (squares for bet price) plus
   # Pinnacle (sharp consensus). Adding more regions costs no quota.
   regions: "us,uk"
-  markets: "h2h"           # moneyline
+  markets: "h2h"           # moneyline (the bet-price path only ever reads h2h)
   odds_format: "american"
+  # When true, the SAME odds request also asks for the over/under (`totals`)
+  # market, so the totals model gets lines without a second HTTP call. The raw
+  # per-book payload is retained on GameOdds.all_books, where analysis/
+  # totals_market.py reads it -- the h2h bet-price path is unchanged. NOTE: The
+  # Odds API bills per market x region, so enabling this roughly DOUBLES the
+  # per-call quota cost (h2h x us,uk = 2 credits -> h2h,totals x us,uk = 4).
+  # Set false to run moneyline-only and save quota.
+  totals_market: true
   # Books we ASK the API for. Books not actually returned by your tier are
   # silently skipped (e.g. caesars/bookmaker/circa weren't on this tier on
   # 2026-05-28). The engine uses `bet_bookmaker` for the actual bet price
@@ -508,6 +516,125 @@ stability:
   # >= this many model components with available=False is a HARD fragile
   # signal regardless of which ones are driving the edge.
   missing_component_fragile_n: 2
+
+# =============================================================================
+# TOTALS (over/under runs) model -- a PARALLEL pipeline to the moneyline model.
+# Own line, own de-vig, own sharp consensus, own close. Anchored to the totals
+# market (our projected total is only ever a BOUNDED TILT off the market total).
+# PAPER-ONLY until CLV vs the totals close proves out (paper_only flips manually).
+# The moneyline model is unaffected by anything in this section.
+# =============================================================================
+totals:
+  enabled: true
+  # Hard paper-trade gate. While true, totals picks are SIMULATED: stakes are
+  # recorded for tracking but flagged paper and the UI marks them PAPER. Flip to
+  # false MANUALLY only after statistically significant positive CLV vs the
+  # totals close -- never on a win/loss hot streak.
+  paper_only: true
+  ev_threshold: 0.03
+
+  # Expected-runs build. staff_rate models BULLPEN INNINGS EXPLICITLY:
+  #   staff_rate = starter_rate*(SP_IP/9) + bullpen_FIP*((9-SP_IP)/9)
+  # SP_IP = the starter's season IP/GS, clamped to [min,max]; a short-outing
+  # starter -> more relief innings -> correctly more bullpen exposure.
+  starter_innings:
+    default_ip_per_start: 5.3   # used when a starter's IP/GS is unknown (TBD etc.)
+    min: 3.0
+    max: 7.0
+
+  league:
+    avg_total: 8.8              # league-average total runs (reference)
+    # Total-runs variance for the negative-binomial dispersion. MLB total runs
+    # are over-dispersed (var > mean), so Poisson under-estimates the tails.
+    total_variance: 22.0
+
+  distribution:
+    model: "negative_binomial"
+
+  # Bound the model's tilt off the market total. The absolute component build
+  # sets DIRECTION + bounded magnitude of our disagreement; the market sets the
+  # level. This is what stops starter quality (already in the market) from
+  # double-counting -- it nets ~0 tilt, leaving mainly weather / bullpen-innings.
+  max_tilt_runs: 1.5
+
+  # Weather / run environment (Open-Meteo, free, no key). Missing feed -> weather
+  # multiplier 1.0 + confidence drop + a "weather unavailable" flag (never bet a
+  # total blind to weather). Retractable roofs are treated OPEN by default (free
+  # data can't detect a closed retractable) and flagged.
+  weather:
+    enabled: true
+    timeout: 8
+    # Hard rule: "never bet a total blind to weather." When the feed is
+    # unavailable (feed down, unknown park) the weather component is zeroed
+    # (multiplier 1.0) AND the pick is held to ANALYSIS-ONLY (never a value bet,
+    # flagged "weather unavailable", classified fragile). A KNOWN no-weather
+    # state (fixed dome) is `available=True` and is NOT held back. Set false to
+    # allow betting totals without weather (not recommended).
+    require_for_bet: true
+    temp_ref_c: 20.0           # neutral temperature
+    temp_coef_per_c: 0.006     # run-env multiplier per degC above ref (warmer -> more offense)
+    wind_out_coef: 0.010       # per km/h of wind blowing OUT to center (boost)
+    wind_in_coef: 0.010        # per km/h blowing IN from center (suppress)
+    max_weather_tilt: 0.08     # clamp the weather multiplier to [1-x, 1+x]
+
+  # Totals market blend -- data-confidence tiered exactly like the moneyline.
+  market_blend:
+    high_conf: 0.45
+    mid_conf: 0.35
+    low_conf: 0.25
+    high_threshold: 85.0
+    mid_threshold: 70.0
+
+  sanity:
+    # Skip when our RAW projected total diverges from the market total by more
+    # than this many runs -- we're almost certainly missing what the market has
+    # (weather, a scratch), not finding edge.
+    max_total_divergence_runs: 1.75
+    # Skip when our pick side fades the sharp totals consensus beyond this (pp).
+    max_sharp_disagreement_pp: 4.0
+    market_total_min: 5.0
+    market_total_max: 16.0
+    max_ev: 0.30
+
+  kelly:
+    fraction: 0.25
+    max_bankroll_fraction: 0.02
+
+  bet_sizing:
+    small_ev: 0.02
+    standard_ev: 0.05
+    strong_ev: 0.08
+    downgrade_confidence: 60
+    kelly_caps: {pass: 0.0, small: 0.005, standard: 0.010, strong: 0.020}
+
+  stability:
+    stable_share_min: 0.60
+    fragile_share_min: 0.50
+    sharp_fade_fragile_pp: 3.0
+
+  # Totals data-confidence (0..100). Drives the totals market-blend tier table
+  # above (more model weight only when the inputs are trustworthy) and is shown
+  # on each pick. EV is deliberately EXCLUDED (same anti-feedback-loop rule as
+  # the moneyline): the blend is weighted by HOW GOOD THE DATA IS, never by the
+  # model's self-assessed edge. Weights are normalized at use.
+  confidence:
+    weights:
+      data_completeness: 0.40   # both starters known + wRC+/bullpen FIP present
+      weather: 0.25             # weather feed available (the dominant totals input)
+      lineups: 0.15             # both batting orders confirmed (not projected)
+      market_agreement: 0.20    # small raw-vs-market run gap -> we corroborate the market
+    # Run gap (|raw projected total - market total|) at which the
+    # market_agreement sub-score hits 0. At 0 gap it is 1.0.
+    divergence_full_runs: 1.75
+
+  discipline:
+    max_slate_exposure: 0.05
+    correlation:
+      bet_count_threshold: 4
+      per_bet_reduction: 0.10
+
+  odds:
+    sharp_close_priority: ["pinnacle", "betonlineag", "lowvig"]
 
 logging:
   level: "INFO"
