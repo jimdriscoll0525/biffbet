@@ -360,3 +360,82 @@ def pull_recommendations() -> int:
             )
     log.info("Pulled %d recommendation(s) from Supabase into local SQLite.", len(rows))
     return len(rows)
+
+
+def pull_totals_recommendations() -> int:
+    """Rebuild the local SQLite totals_recommendations from Supabase.
+
+    The hosted pipeline runs on an EPHEMERAL box (fresh SQLite each run), so
+    Supabase is the source of truth: this restores prior totals paper picks
+    (incl. results + the frozen opening de-vig + CLV) so `results` can grade
+    settled totals and `today` can refresh the sharp close near first pitch,
+    then `sync` pushes back. Idempotent upsert on (date, game_id). Tolerant:
+    returns 0 if the table doesn't exist yet (schema not applied).
+    """
+    url, key = _credentials()
+    try:
+        rows = _get_all(url, key, "totals_recommendations")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("totals pull skipped (%s) — apply supabase/schema.sql totals table?", exc)
+        return 0
+
+    from mlb_value_bot.tracking.totals_recommendations import connect, init_db
+
+    init_db()
+    with connect() as conn:
+        for r in rows:
+            reasoning = r.get("reasoning")
+            reasoning_json = json.dumps(reasoning) if reasoning is not None else None
+            # Supabase booleans -> SQLite 0/1; default paper=1 / is_value=1 for
+            # any legacy rows missing the column.
+            paper = 1 if r.get("paper") in (None, True, 1) else 0
+            is_value = 1 if r.get("is_value") in (None, True, 1) else 0
+            conn.execute(
+                """
+                INSERT INTO totals_recommendations
+                  (date, game_id, home_team, away_team, pick_side, market_total, over_odds,
+                   under_odds, bet_odds, decimal_odds, model_p_over, market_devig_over,
+                   blended_p_over, model_prob, market_prob_devigged, ev_pct, kelly_stake,
+                   confidence, tier, stability, raw_model_total, expected_total, paper,
+                   reasoning_json, opening_line, opening_price, opening_devig_p_side,
+                   closing_line, closing_price, sharp_close_book, sharp_close_line,
+                   sharp_close_over, sharp_close_under, sharp_close_devig_p_side, clv_pp,
+                   result, profit_loss, is_value, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(date, game_id) DO UPDATE SET
+                  home_team=excluded.home_team, away_team=excluded.away_team,
+                  pick_side=excluded.pick_side, market_total=excluded.market_total,
+                  over_odds=excluded.over_odds, under_odds=excluded.under_odds,
+                  bet_odds=excluded.bet_odds, decimal_odds=excluded.decimal_odds,
+                  model_p_over=excluded.model_p_over, market_devig_over=excluded.market_devig_over,
+                  blended_p_over=excluded.blended_p_over, model_prob=excluded.model_prob,
+                  market_prob_devigged=excluded.market_prob_devigged, ev_pct=excluded.ev_pct,
+                  kelly_stake=excluded.kelly_stake, confidence=excluded.confidence,
+                  tier=excluded.tier, stability=excluded.stability,
+                  raw_model_total=excluded.raw_model_total, expected_total=excluded.expected_total,
+                  paper=excluded.paper, reasoning_json=excluded.reasoning_json,
+                  opening_line=excluded.opening_line, opening_price=excluded.opening_price,
+                  opening_devig_p_side=excluded.opening_devig_p_side,
+                  closing_line=excluded.closing_line, closing_price=excluded.closing_price,
+                  sharp_close_book=excluded.sharp_close_book, sharp_close_line=excluded.sharp_close_line,
+                  sharp_close_over=excluded.sharp_close_over, sharp_close_under=excluded.sharp_close_under,
+                  sharp_close_devig_p_side=excluded.sharp_close_devig_p_side, clv_pp=excluded.clv_pp,
+                  result=excluded.result, profit_loss=excluded.profit_loss,
+                  is_value=excluded.is_value, updated_at=excluded.updated_at
+                """,
+                (
+                    r["date"], r["game_id"], r["home_team"], r["away_team"], r["pick_side"],
+                    r.get("market_total"), r.get("over_odds"), r.get("under_odds"), r["bet_odds"],
+                    r["decimal_odds"], r.get("model_p_over"), r.get("market_devig_over"),
+                    r.get("blended_p_over"), r["model_prob"], r["market_prob_devigged"], r["ev_pct"],
+                    r["kelly_stake"], r["confidence"], r.get("tier"), r.get("stability"),
+                    r.get("raw_model_total"), r.get("expected_total"), paper, reasoning_json,
+                    r.get("opening_line"), r.get("opening_price"), r.get("opening_devig_p_side"),
+                    r.get("closing_line"), r.get("closing_price"), r.get("sharp_close_book"),
+                    r.get("sharp_close_line"), r.get("sharp_close_over"), r.get("sharp_close_under"),
+                    r.get("sharp_close_devig_p_side"), r.get("clv_pp"), r.get("result", "pending"),
+                    r.get("profit_loss"), is_value, r.get("created_at"), r.get("updated_at"),
+                ),
+            )
+    log.info("Pulled %d totals recommendation(s) from Supabase into local SQLite.", len(rows))
+    return len(rows)

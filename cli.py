@@ -630,7 +630,11 @@ def data_status_cmd(season: int | None) -> None:
 @cli.command("pull")
 def pull_cmd() -> None:
     """Rebuild the local tracking DB from Supabase (used by the hosted pipeline)."""
-    from mlb_value_bot.sync.supabase_sync import SupabaseConfigError, pull_recommendations
+    from mlb_value_bot.sync.supabase_sync import (
+        SupabaseConfigError,
+        pull_recommendations,
+        pull_totals_recommendations,
+    )
 
     try:
         n = pull_recommendations()
@@ -642,6 +646,17 @@ def pull_cmd() -> None:
         log.exception("supabase pull failed")
         raise SystemExit(1)
     console.print(f"[green]Pulled {n} recommendation(s) from Supabase into local DB.[/]")
+
+    # Totals (paper) restore -- required so the ephemeral CI box can grade prior
+    # totals picks + keep their CLV moving. Tolerant: skips if disabled or the
+    # totals table isn't there yet, without failing the moneyline pull.
+    if load_config().get("totals", {}).get("enabled", False):
+        try:
+            n_t = pull_totals_recommendations()
+            console.print(f"[green]Pulled {n_t} totals (paper) row(s) from Supabase into local DB.[/]")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("totals pull skipped (%s)", exc)
+            console.print("[dim]Totals pull skipped (table not present or unreadable).[/]")
 
 
 @cli.command("sync")
