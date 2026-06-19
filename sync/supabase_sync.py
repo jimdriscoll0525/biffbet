@@ -29,7 +29,7 @@ import requests
 
 from mlb_value_bot.tracking import performance as perf
 from mlb_value_bot.tracking import recommendations as recs
-from mlb_value_bot.utils import get_env, get_logger
+from mlb_value_bot.utils import get_env, get_logger, load_config
 
 log = get_logger("sync.supabase")
 
@@ -269,17 +269,20 @@ def push_all(since: str | None = None) -> SyncResult:
     """Push recommendations + the performance snapshot to Supabase.
 
     Also pushes the totals (over/under) recommendations to their own table when
-    the table exists. Tolerant: a missing totals table (schema not yet applied)
-    is logged and skipped, so the moneyline sync never fails because of totals.
+    totals are enabled and the table exists. Gated on `totals.enabled` so push
+    and pull move together (see `pull_totals_recommendations`). Tolerant: a
+    missing totals table (schema not yet applied) is logged and skipped, so the
+    moneyline sync never fails because of totals.
     """
     url, key = _credentials()
     n_recs = push_recommendations(url, key, since=since)
     n_perf = push_performance(url, key, since=since)
     n_totals = 0
-    try:
-        n_totals = push_totals_recommendations(url, key, since=since)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("totals sync skipped (%s) — apply supabase/schema.sql totals table?", exc)
+    if load_config().get("totals", {}).get("enabled", False):
+        try:
+            n_totals = push_totals_recommendations(url, key, since=since)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("totals sync skipped (%s) — apply supabase/schema.sql totals table?", exc)
     return SyncResult(recommendations=n_recs, performance_scopes=n_perf, totals_recommendations=n_totals)
 
 
