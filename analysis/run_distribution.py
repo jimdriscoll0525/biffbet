@@ -30,9 +30,10 @@ class RunDistribution:
     market_total: float
     raw_model_total: float | None   # absolute build (for the divergence guard)
     expected_total: float | None    # market-recentered E[T] (distribution mean)
-    variance: float | None
-    p_over: float | None
-    p_under: float | None
+    anchor_mean: float | None = None  # market-implied MEAN (zero-tilt reference)
+    variance: float | None = None
+    p_over: float | None = None
+    p_under: float | None = None
     p_push: float = 0.0
     home_runs: float | None = None
     away_runs: float | None = None
@@ -168,21 +169,31 @@ def run_distribution(home_tp, away_tp, home_pp, away_pp, market_total,
     raw = er["raw_total"]
     line = float(market_total)
     max_tilt = float(tcfg.get("max_tilt_runs", 1.5))
-    tilt = max(-max_tilt, min(max_tilt, raw - market_total))
 
     # Calibrate the anchor mean to the market's P(over) (fall back to the line
     # itself when the market prob is unknown).
     anchor_mean = (_solve_mean_for_p_over(market_devig_over, line, tcfg)
                    if market_devig_over is not None else line)
+
+    # Tilt is MEAN-vs-MEAN: `raw` is a distribution mean, so it is compared to
+    # the market-implied mean (`anchor_mean`), NOT the posted line. The line
+    # sits near the distribution's MEDIAN, which for a right-skewed count
+    # distribution is ~0.8 runs BELOW the implied mean. Tilting off the line
+    # re-imports exactly the skew offset the anchor solve removes: measured on
+    # production data it made the tilt positive on 78% of games (raw > line)
+    # even though the raw projection was unbiased vs actual totals, which
+    # pushed P(over) > 0.5 on 83% of games and made ~97% of value picks OVERs.
+    tilt = max(-max_tilt, min(max_tilt, raw - anchor_mean))
     model_mean = anchor_mean + tilt
     p_over, p_under, p_push = _p_over_for_mean(model_mean, line, tcfg)
 
     return RunDistribution(
         market_total=line, raw_model_total=raw, expected_total=round(model_mean, 2),
+        anchor_mean=round(anchor_mean, 2),
         variance=round(_variance_for(model_mean, tcfg), 2),
         p_over=round(p_over, 4), p_under=round(p_under, 4), p_push=round(p_push, 4),
         home_runs=er["home_rs"], away_runs=er["away_rs"], components=er["components"],
         available=True,
-        notes=er["notes"] + [f"tilt {tilt:+.2f} off market (raw {raw:.2f} vs mkt {line:.1f}); "
-                             f"anchor mean {anchor_mean:.2f}"],
+        notes=er["notes"] + [f"tilt {tilt:+.2f} off anchor mean {anchor_mean:.2f} "
+                             f"(raw {raw:.2f}; mkt line {line:.1f})"],
     )

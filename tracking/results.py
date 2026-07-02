@@ -25,6 +25,7 @@ class GradingSummary:
     graded: int = 0
     wins: int = 0
     losses: int = 0
+    pushes: int = 0            # totals only: final total exactly on the line (stake back)
     voids: int = 0
     pending: int = 0           # still not final (in progress / no result yet)
     staked: float = 0.0        # total bankroll fraction staked on graded bets
@@ -151,7 +152,7 @@ def grade_totals_date(game_date: str, mlb_client: MLBClient | None = None) -> Gr
 
         if total_runs == line:                       # exact -> push (stake back)
             totals.update_result(bet["id"], "push", 0.0)
-            summary.voids += 1
+            summary.pushes += 1                      # a push is NOT a void (and never a loss)
             summary.bets.append(GradedBet(bet["id"], matchup, side, "push", 0.0))
             continue
 
@@ -174,8 +175,9 @@ def grade_totals_date(game_date: str, mlb_client: MLBClient | None = None) -> Gr
         summary.bets.append(GradedBet(bet["id"], matchup, f"{side} {line}", result_str, pl))
 
     log.info(
-        "Graded totals %s: %d settled (%dW-%dL), %d void/push, %d pending, P/L %.4f",
-        game_date, summary.graded, summary.wins, summary.losses, summary.voids, summary.pending, summary.profit_loss,
+        "Graded totals %s: %d settled (%dW-%dL-%dP), %d void, %d pending, P/L %.4f",
+        game_date, summary.graded, summary.wins, summary.losses, summary.pushes,
+        summary.voids, summary.pending, summary.profit_loss,
     )
     return summary
 

@@ -86,16 +86,41 @@ def test_market_anchor_calibration():
 
 def test_run_tilt_moves_prob_and_clamps():
     cfg = _cfg()
+    tcfg = cfg["totals"]
     wx = WX.WeatherEnv(1.0, True, 20, 0, 0, "open", "neutral")
-    # raw 9.0 vs market 8.5 -> +0.5 tilt over the anchor -> P(over) above market.
     rd = RD.run_distribution(_team(), _team(), _pitcher(), _pitcher(), 8.5, 0.50, wx, cfg)
-    assert rd.p_over > 0.50
-    # A wild raw build is clamped to market + max_tilt (1.5) over the anchor.
+    # The tilt is measured against the ANCHOR mean (market-implied mean), never
+    # the posted line: raw is a mean, the line is ~a median of a right-skewed
+    # count distribution (tilting off the line was the systematic-OVER bug).
+    anchor = RD._solve_mean_for_p_over(0.50, 8.5, tcfg)
+    assert approx(rd.anchor_mean, anchor, tol=0.01)
+    want_tilt = max(-1.5, min(1.5, rd.raw_model_total - anchor))
+    assert approx(rd.expected_total, anchor + want_tilt, tol=0.01)
+    assert (rd.p_over > 0.50) == (want_tilt > 0)               # prob follows the tilt sign
+    # A wild raw build is clamped to anchor + max_tilt (1.5).
     hot = RD.run_distribution(_team(wrc=180, pf=130), _team(wrc=180, pf=130),
                               _pitcher(xfip=6.0), _pitcher(xfip=6.0), 8.0, 0.50, wx, cfg)
     assert hot.raw_model_total > 11.0
-    # anchor mean ~ matches market 0.50 at line 8.0; +1.5 tilt -> expected_total ~ anchor+1.5
+    assert approx(hot.expected_total - hot.anchor_mean, 1.5, tol=0.01)
     assert hot.p_over > rd.p_over                              # bigger over-tilt -> higher P(over)
+
+
+def test_tilt_symmetry_no_over_bias():
+    """Regression for the systematic-OVER bug: a raw build equal to the
+    market-implied mean must reproduce the market's P(over) (zero tilt = agree
+    with the market), and equal-and-opposite raw tilts must move P(over) by
+    ~equal amounts in both directions. The old code tilted off the LINE, which
+    re-imported the ~+0.8-run mean-vs-median skew offset and made 97% of value
+    picks OVERs (172/27 lean on 199 production rows)."""
+    tcfg = _cfg()["totals"]
+    anchor = RD._solve_mean_for_p_over(0.50, 8.5, tcfg)
+    assert anchor > 8.5                                        # implied mean sits ABOVE the line
+    po0, pu0, _ = RD._p_over_for_mean(anchor, 8.5, tcfg)
+    assert approx(po0, 0.50, tol=1e-3)                         # zero tilt = market
+    po_up, _, _ = RD._p_over_for_mean(anchor + 1.0, 8.5, tcfg)
+    po_dn, _, _ = RD._p_over_for_mean(anchor - 1.0, 8.5, tcfg)
+    assert po_up > 0.5 > po_dn
+    assert abs((po_up - 0.5) - (0.5 - po_dn)) < 0.02           # ~symmetric moves
 
 
 def test_nb_is_overdispersed():
@@ -350,7 +375,34 @@ def test_grade_totals_over_under_push():
     df = T.to_dataframe().set_index("game_id")
     assert df.loc[611, "result"] == "win" and df.loc[611, "profit_loss"] > 0
     assert df.loc[612, "result"] == "push" and approx(float(df.loc[612, "profit_loss"]), 0.0)
-    assert summary.wins == 1 and summary.voids == 1
+    assert summary.wins == 1 and summary.pushes == 1 and summary.voids == 0
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def test_totals_performance_record_counts_pushes_separately():
+    """Regression: the totals W-L-P record breaks pushes out — a push is never a
+    loss, never a win, and is excluded from hit-rate/flat-ROI denominators."""
+    T, path = _totals_db()
+    sc = TM.SharpTotalsLine("pinnacle", 8.5, -110, -110, 0.5)
+    outcomes = {621: ("win", 0.005), 622: ("loss", -0.008), 623: ("loss", -0.008),
+                624: ("push", 0.0), 625: (None, None)}       # 625 stays pending
+    for gid in outcomes:
+        T.upsert_totals_recommendation(_rec(T, game_id=gid, sharp_close=sc))
+    ids = T.to_dataframe().set_index("game_id")["id"]
+    for gid, (res, pl) in outcomes.items():
+        if res is not None:
+            T.update_result(int(ids.loc[gid]), res, pl)
+
+    from mlb_value_bot.tracking import totals_performance as TP
+    rep = TP.compute_totals_performance()
+    o = rep.overall
+    assert o["bets"] == 5
+    assert o["wins"] == 1 and o["losses"] == 2 and o["pushes"] == 1
+    assert o["settled"] == 3                      # W+L only; push is stake-neutral
+    assert approx(o["hit_rate"], 1 / 3)           # push not in the denominator
     try:
         os.remove(path)
     except OSError:

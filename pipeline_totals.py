@@ -271,11 +271,15 @@ def evaluate_totals_game(scheduled, game_odds, profiles, weather, config=None) -
 
     # Sanity: raw-vs-market run divergence. A big gap almost always means we're
     # missing what the market has (weather, a scratch), not that we found edge.
+    # Measured against the market-implied MEAN (anchor), not the posted line --
+    # same mean-vs-median reasoning as the tilt: raw is a mean, the line is ~a
+    # median, so a line-based guard would be asymmetric (looser on overs).
     max_div = float(sanity.get("max_total_divergence_runs", 1.75))
-    divergence = abs(rd.raw_model_total - market_total)
+    anchor_ref = rd.anchor_mean if rd.anchor_mean is not None else market_total
+    divergence = abs(rd.raw_model_total - anchor_ref)
     if divergence > max_div:
         analysis.skipped_reason = (
-            f"raw projected total {rd.raw_model_total:.2f} vs market {market_total:.1f} "
+            f"raw projected total {rd.raw_model_total:.2f} vs market-implied mean {anchor_ref:.2f} "
             f"diverge by {divergence:.2f} > {max_div:.2f} runs - likely missing weather / a scratch"
         )
         return analysis

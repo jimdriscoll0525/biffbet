@@ -434,9 +434,10 @@ def results(date_: str | None) -> None:
         if t_graded or any(s.bets for s in t_summaries):
             t_wins = sum(s.wins for s in t_summaries)
             t_losses = sum(s.losses for s in t_summaries)
+            t_pushes = sum(s.pushes for s in t_summaries)
             t_pl = sum(s.profit_loss for s in t_summaries)
             console.print(Panel(
-                f"Totals settled (PAPER): [bold]{t_graded}[/]  ({t_wins}W-{t_losses}L)   "
+                f"Totals settled (PAPER): [bold]{t_graded}[/]  ({t_wins}W-{t_losses}L-{t_pushes}P)   "
                 f"Paper P/L: [bold]{t_pl:+.4f}[/] units\n"
                 f"[dim]Totals are graded on CLV vs the totals close, not record — see `performance`.[/]",
                 title="Totals — PAPER results", border_style="magenta", expand=False,
