@@ -283,6 +283,40 @@ def test_referee_sharp_clv_join_reports_gap():
     assert out["avg"] > 0      # -110 open beat sharp -125 close
 
 
+def test_referee_record_is_per_model():
+    """Regression: each model's W-L-P record is computed ONLY from its own
+    store -- the GriffBet page must never show BiffBet's record (and vice
+    versa). Also: is_value=0 analysis rows and pending picks never count."""
+    from mlb_value_bot.griffbet.referee import compute_referee, model_record
+
+    def _row(gid, result, is_value=1, **kw):
+        base = {"date": "2026-06-14", "game_id": gid, "is_value": is_value,
+                "result": result, "recommended_side": "home", "model_prob": 0.55,
+                "raw_model_prob": 0.54, "reasoning_json": None,
+                "american_odds": -110, "ev_pct": 0.04, "kelly_stake": 0.005,
+                "profit_loss": 0.004, "opening_line": -110, "clv_pct": 1.0}
+        base.update(kw)
+        return base
+
+    # BiffBet: 2-1 with one push; plus a non-value analysis win and a pending
+    # pick that must NOT count toward the record.
+    biff = pd.DataFrame([
+        _row(1, "win"), _row(2, "win"), _row(3, "loss"), _row(4, "push"),
+        _row(5, "win", is_value=0), _row(6, "pending"),
+    ])
+    # GriffBet: a distinct 1-2 record.
+    griff = pd.DataFrame([_row(7, "win"), _row(8, "loss"), _row(9, "loss")])
+
+    out = compute_referee(biff, griff, {})
+    assert out["models"]["biffbet"]["record"] == {
+        "wins": 2, "losses": 1, "pushes": 1, "voids": 0, "n_graded": 4}
+    assert out["models"]["griffbet"]["record"] == {
+        "wins": 1, "losses": 2, "pushes": 0, "voids": 0, "n_graded": 3}
+
+    # Direct helper: empty frame degrades to a zero record, never crashes.
+    assert model_record(pd.DataFrame())["n_graded"] == 0
+
+
 # --- Residual market-error engine --------------------------------------------
 def test_residual_predict_equals_market_when_beta_zero():
     """β all-zero (cold start) => p_home is exactly the market devig prob."""

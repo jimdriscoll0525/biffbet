@@ -4,7 +4,9 @@ over the same games.
 This module READS BiffBet's already-stored pick data (read-only; it never alters
 BiffBet's schema) and GriffBet's richer store, and produces calibration +
 EV-monotonicity + sliced metrics for BOTH, so they can be compared apples to
-apples on a process basis (NOT win/loss record).
+apples on a process basis. Each model also carries its OWN W-L-P record
+(computed strictly from its own store via `model_record`) so the site can show
+it -- clearly labeled, with the small-sample warning, never as the verdict.
 
 Probability calibration is produced separately for the RAW-model and BLENDED
 probabilities, both evaluated on the committed pick side. EV monotonicity buckets
@@ -171,6 +173,26 @@ def griffbet_series(df: pd.DataFrame) -> ModelSeries:
     return ModelSeries("griffbet", bets, blended, raw, outcomes)
 
 
+def model_record(df: pd.DataFrame) -> dict:
+    """W-L-P record over one model's OWN committed picks (is_value=1).
+
+    Counted strictly from the DataFrame passed in -- the caller is responsible
+    for passing each model its own store, so records can never blend across
+    models. Pushes/voids are stake-neutral and broken out, never losses.
+    """
+    empty = {"wins": 0, "losses": 0, "pushes": 0, "voids": 0, "n_graded": 0}
+    if df.empty or "result" not in df.columns:
+        return empty
+    bets = df[df.get("is_value", 1).fillna(1).astype(int) == 1]
+    res = bets["result"]
+    wins = int((res == "win").sum())
+    losses = int((res == "loss").sum())
+    pushes = int((res == "push").sum())
+    voids = int((res == "void").sum())
+    return {"wins": wins, "losses": losses, "pushes": pushes, "voids": voids,
+            "n_graded": wins + losses + pushes + voids}
+
+
 def _calibration(series: ModelSeries, bands: list[float]) -> dict:
     return {
         "n_graded": len(series.outcomes),
@@ -267,6 +289,7 @@ def compute_referee(
         "models": {
             "biffbet": {
                 "n_graded": len(biff.outcomes),
+                "record": model_record(biff_df),
                 "calibration": _calibration(biff, bands),
                 "ev_monotonicity": ev_monotonicity(biff_bets, ev_bands) if not biff_bets.empty else [],
                 "clv_vs_best": _clv_summary(biff_bets, "clv_pct"),
@@ -274,6 +297,7 @@ def compute_referee(
             },
             "griffbet": {
                 "n_graded": len(griff.outcomes),
+                "record": model_record(griff_df),
                 "calibration": _calibration(griff, bands),
                 "ev_monotonicity": ev_monotonicity(griff_bets, ev_bands) if not griff_bets.empty else [],
                 "clv_vs_best": _clv_summary(griff_bets, "clv_pct"),
