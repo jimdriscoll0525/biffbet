@@ -219,6 +219,18 @@ model:
     high_threshold: 85.0     # 0..100 scale
     mid_threshold: 70.0
 
+  # Overconfident-tail shrink (Issue-4 review, 2026-07-02). Calibration on all
+  # 432 analyzed games: the blended prob is honest up to ~65% predicted
+  # (55-60% band won 57%, 60-65% won 63%) but the 65-70% band won only 48%
+  # (n=27), and the conf-70-79 pick bucket went 11-16 (-6.06u). Beyond
+  # blend_shrink_above (symmetric: below 1-blend_shrink_above too) only
+  # blend_shrink_factor of the excess is kept:
+  #   p' = 0.65 + (p - 0.65) * 0.5      e.g. 0.73 -> 0.69
+  # EV/Kelly/sharp-fade all read the shrunk prob. Set blend_shrink_above: 1.0
+  # (or remove it) to disable. Recorded in reasoning.market_anchor.tail_shrink.
+  blend_shrink_above: 0.65
+  blend_shrink_factor: 0.5
+
   # Sample-size regression for the Statcast-derived rate (statcast_rate). Until a
   # pitcher has faced this many batters, his xwOBA-against is shrunk toward
   # league average, so a few hot/cold starts don't read as ace/replacement level.
@@ -234,8 +246,12 @@ model:
     bullpen: 1.0          # relief corps FIP differential
     bullpen_fatigue: 1.0  # leverage-arm availability today (added 2026-05-28)
     lineup: 1.0           # key bats in / out of today's confirmed lineup
-    park: 0.25            # ballpark run environment (mostly a totals factor;
-                          # small ML effect, kept low + tunable on purpose)
+    park: 0.0             # ballpark run environment. ZEROED 2026-07-02 (Issue-4
+                          # review): directional accuracy 50.0% on n=268 analyzed
+                          # games -- pure noise for the MONEYLINE. Still shown in
+                          # the breakdown at weight 0; the TOTALS model's park
+                          # factor is separate and unaffected. Re-raise only with
+                          # evidence it points at winners.
     home_field: 1.0       # constant home-field edge
     form: 1.0             # recent pitcher (last N starts) + offense (last 14d)
 
@@ -293,7 +309,33 @@ sanity:
   # sharps 3.5-5.0pp; the 4-5pp bucket went 4-6, -1.3% bankroll). Raw-EV
   # selection preferentially picks the games where we disagree with Pinnacle
   # the most, so the skip line moves down to cut that adverse-selection tail.
+  # KEPT at 4.0 on 2026-07-02 (Issue-4 review) after evaluating 3.0: full-slate
+  # data said sharps beat the blend 60/40 when they disagree by 2-4pp, BUT on
+  # actual graded picks that had already passed the new `filters:` below, the
+  # 3-4pp fade band went 11-5 (+5.3u) -- picks are price-shopped across books,
+  # so disagreeing with Pinnacle's probability can still beat the posted price.
+  # Tightening to 3.0 would have kept only 2 of 49 historical picks. Revisit
+  # with a bigger graded sample before moving this line again.
   max_sharp_disagreement_pp: 4.0
+
+# -----------------------------------------------------------------------------
+# Selection filters (Issue-4 review, 2026-07-02) — segments we do NOT bet,
+# decided on graded evidence. Unlike the sanity guards above (which SKIP a game
+# as bad data), a filtered game keeps its full analysis and is persisted +
+# shown, but forced to analysis-only (tier=pass, stake 0, is_value=false).
+# Each key is individually removable to disable that filter. Samples are small
+# (n=11 each) — revisit both when the graded count grows.
+# -----------------------------------------------------------------------------
+filters:
+  # No bets at this American price or shorter. Graded <=-150 favorites went
+  # 3-8 (-6.57u) — the single segment carrying the entire net loss — while
+  # CLV there stayed positive: the model may read these games fine, but the
+  # payoff asymmetry at short prices punishes every miss.
+  heavy_favorite_american: -150
+  # No bet when no sharp book priced the game. The "no sharp data" segment
+  # (5-6, -2.57u) was the ONLY segment with negative CLV (-0.69%): without a
+  # sharp anchor both the blend and the fade guard fly blind.
+  require_sharp_coverage: true
 
 kelly:
   fraction: 0.25          # quarter-Kelly

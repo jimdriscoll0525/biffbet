@@ -75,6 +75,14 @@ class GameAnalysis:
     # fragile edge) and is what the sizing tiers read. None until computed.
     adjusted_ev_pct: float | None = None
     adjusted_ev_reasons: list[str] = field(default_factory=list)
+    # Selection filters (Issue-4 review, 2026-07-02). Segments we no longer bet
+    # (heavy favorites, no sharp coverage). A filtered game is still evaluated,
+    # persisted, and shown -- but forced to analysis-only (tier=pass, stake 0,
+    # is_value=False). Empty list = no filter fired.
+    filter_reasons: list[str] = field(default_factory=list)
+    # Overconfident-tail shrink note (Issue-4 review): set when the blended prob
+    # exceeded model.blend_shrink_above and was shrunk back toward the band.
+    blend_shrink_note: str | None = None
     # Bet-book moneyline per side, kept even when a later sanity guard SKIPS
     # the game, so committed bets on skipped games can still get their closing
     # line refreshed (CLV is the primary metric; a skip must not freeze it).
@@ -109,6 +117,12 @@ class GameAnalysis:
             "data_confidence": self.data_confidence,
             "blended_home_prob": round(self.blended_home_prob, 4) if self.blended_home_prob is not None else None,
         }
+        if self.blend_shrink_note:
+            data["market_anchor"]["tail_shrink"] = self.blend_shrink_note
+        # Selection filters (Issue-4): why an otherwise-qualifying analysis was
+        # held to analysis-only. Omitted when no filter fired.
+        if self.filter_reasons:
+            data["selection_filters"] = list(self.filter_reasons)
         data["bet_sizing"] = {
             "tier": self.tier,
             "kelly_cap": self.tier_kelly_cap,
@@ -432,6 +446,14 @@ def evaluate_game(
     blend, blend_tier = resolve_market_blend(data_conf, config["model"])
     blended_home = blend * wp.home_win_prob + (1.0 - blend) * market_home
 
+    # Overconfident-tail shrink (Issue-4 review, 2026-07-02). Calibration on
+    # all 432 analyzed games: the blend is honest up to ~65% (55-60% band won
+    # 57%, 60-65% won 63%) but the 65-70% band won only 48% (n=27), and the
+    # conf-70-79 pick bucket went 11-16. Beyond model.blend_shrink_above we
+    # keep only blend_shrink_factor of the excess, symmetrically on both
+    # tails. EV/Kelly/sharp-fade all read the shrunk prob.
+    blended_home, shrink_note = _shrink_overconfident_tail(blended_home, config["model"])
+
     # Sanity guard (model/market divergence): if the RAW model and the
     # de-vigged market disagree by more than `max_model_market_divergence`,
     # the market is almost certainly reacting to information the model
@@ -563,6 +585,23 @@ def evaluate_game(
         analysis._tier_original_kelly = original_kelly  # type: ignore[attr-defined]
     evals[best_side].kelly_stake = capped_kelly
 
+    # Selection filters (Issue-4 review, 2026-07-02): segments we no longer
+    # bet, decided on graded evidence rather than model output. A filtered
+    # game keeps its full analysis (still persisted + rendered) but is forced
+    # to analysis-only: tier=pass and stake 0, so save_slate's
+    # `kelly_stake > 0` condition marks it is_value=False. This intentionally
+    # narrows the 06-05 "selection is raw-EV only" rule -- selection is now
+    # raw EV MINUS the filtered segments; haircuts still only size.
+    # (upsert_recommendation never downgrades an already-committed bet, so
+    # pre-filter picks are grandfathered by design.)
+    filter_reasons = _selection_filters(best_side, evals, market_intel, config)
+    if filter_reasons:
+        analysis.filter_reasons = filter_reasons
+        tier = "pass"
+        tier_reasons = tier_reasons + filter_reasons
+        evals[best_side].kelly_stake = 0.0
+
+    analysis.blend_shrink_note = shrink_note
     analysis.adjusted_ev_pct = adjusted_ev
     analysis.adjusted_ev_reasons = adjusted_ev_reasons
     analysis.tier_kelly_cap = kelly_cap
@@ -583,6 +622,64 @@ def evaluate_game(
     analysis.projected_score = proj_score
     analysis.stability = stability
     return analysis
+
+
+# --- Issue-4 selection filters + tail shrink (2026-07-02) ---------------------
+def _shrink_overconfident_tail(blended_home: float, mcfg: dict) -> tuple[float, str | None]:
+    """Shrink the blended home prob beyond `blend_shrink_above`, symmetrically.
+
+    Calibration evidence (all analyzed games): honest up to ~65% predicted,
+    48% actual in the 65-70% band (n=27). Beyond the band edge we keep only
+    `blend_shrink_factor` of the excess:
+        p' = hi + (p - hi) * factor        for p > hi
+        p' = lo + (p - lo) * factor        for p < lo,  lo = 1 - hi
+    Disabled when blend_shrink_above is absent/>=1.0. Returns (prob, note) --
+    note is None when no shrink applied (in-band).
+    """
+    hi = float(mcfg.get("blend_shrink_above", 1.0))
+    if hi >= 1.0:
+        return blended_home, None
+    factor = float(mcfg.get("blend_shrink_factor", 0.5))
+    lo = 1.0 - hi
+    if blended_home > hi:
+        shrunk = hi + (blended_home - hi) * factor
+    elif blended_home < lo:
+        shrunk = lo + (blended_home - lo) * factor
+    else:
+        return blended_home, None
+    note = (f"tail shrink: blended home {blended_home:.4f} -> {shrunk:.4f} "
+            f"(beyond {hi:.2f}/{lo:.2f} band, x{factor:g} excess kept)")
+    return round(shrunk, 6), note
+
+
+def _selection_filters(best_side: str, evals: dict, market_intel, config: dict) -> list[str]:
+    """Segments we do not bet (Issue-4 graded evidence). Returns the list of
+    fired filter reasons; empty = bettable. Config keys under `filters:` --
+    each filter is individually disable-able (absent key = off).
+
+    - heavy_favorite_american: no bets at this American price or shorter.
+      Graded <=-150 favorites went 3-8 (-6.57u), the single segment carrying
+      the entire net loss. (n=11 -- revisit when the sample grows.)
+    - require_sharp_coverage: no bet when no sharp book priced the game.
+      The "no sharp data" segment was the only one with negative CLV (-0.69%).
+    """
+    fcfg = config.get("filters", {})
+    reasons: list[str] = []
+
+    heavy = fcfg.get("heavy_favorite_american")
+    price = evals[best_side].american_odds
+    if heavy is not None and price <= float(heavy):
+        reasons.append(
+            f"filtered: heavy favorite {price:+d} (at or below {int(heavy):+d})"
+        )
+
+    if bool(fcfg.get("require_sharp_coverage", False)):
+        no_sharp = (market_intel is None or not getattr(market_intel, "available", False)
+                    or getattr(market_intel, "sharp_devig_home", None) is None)
+        if no_sharp:
+            reasons.append("filtered: no sharp book priced this game")
+
+    return reasons
 
 
 # --- Adjusted EV -------------------------------------------------------------

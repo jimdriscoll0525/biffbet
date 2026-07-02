@@ -152,12 +152,16 @@ def test_golden_win_probability_locks_current_math():
     # home_win_prob shifted by -0.005 on 2026-05-30 when the form normal cap
     # tightened from +/-5% to +/-1.5% (Step 1). Raw form diff is still 0.020
     # (legacy single-window path with recent=0.360 vs 0.320), but it now
-    # clamps to 0.015. Everything else is unchanged.
-    assert approx(res.home_win_prob, 0.654446, tol=1e-5), res.home_win_prob
+    # clamps to 0.015.
+    # Shifted again by -0.00075 on 2026-07-02 (Issue-4 review): the park weight
+    # was ZEROED (directional accuracy 50.0% on n=268 analyzed games -- noise
+    # for the moneyline), removing this fixture's +0.000750 park delta.
+    assert approx(res.home_win_prob, 0.653696, tol=1e-5), res.home_win_prob
     deltas = {c.name: c.weighted_delta for c in res.components}
     assert approx(deltas["starter"], 0.051895, tol=1e-5), deltas["starter"]
     assert approx(deltas["bullpen"], 0.011000, tol=1e-5), deltas["bullpen"]
-    assert approx(deltas["park"], 0.000750, tol=1e-5), deltas["park"]
+    # Park: still computed + displayed, but weight 0 -> contributes nothing.
+    assert approx(deltas["park"], 0.0, tol=1e-9), deltas["park"]
     # home_field is now the park-specific DEFAULT (team "H" isn't in park_hfa);
     # changed 0.035 -> 0.025 on 2026-05-27 with park-specific HFA.
     assert approx(deltas["home_field"], 0.025000, tol=1e-5), deltas["home_field"]
@@ -804,6 +808,58 @@ def test_adjusted_ev_fragile_reduces():
     assert math.isclose(adj, 0.06 - 0.015)
     assert len(reasons) == 1
     assert any("fragile" in r for r in reasons)
+
+
+# --- Issue-4 selection filters + tail shrink (2026-07-02) -------------------
+def test_shrink_overconfident_tail_symmetric_and_disabled_by_default():
+    """Beyond the band edge only `factor` of the excess is kept, symmetrically
+    on both tails; in-band probs and a missing config key are no-ops."""
+    from mlb_value_bot.pipeline import _shrink_overconfident_tail
+    mcfg = {"blend_shrink_above": 0.65, "blend_shrink_factor": 0.5}
+    # 0.73 home -> 0.65 + 0.08*0.5 = 0.69
+    p, note = _shrink_overconfident_tail(0.73, mcfg)
+    assert math.isclose(p, 0.69) and note is not None and "tail shrink" in note
+    # Mirror tail: 0.27 home (i.e. 0.73 away) -> 0.35 - 0.08*0.5 = 0.31
+    p2, note2 = _shrink_overconfident_tail(0.27, mcfg)
+    assert math.isclose(p2, 0.31) and note2 is not None
+    assert math.isclose((p - 0.5), -(p2 - 0.5))          # symmetric around 0.5
+    # In-band -> untouched, no note.
+    p3, note3 = _shrink_overconfident_tail(0.60, mcfg)
+    assert p3 == 0.60 and note3 is None
+    # No config key -> disabled entirely (never silently shrink).
+    p4, note4 = _shrink_overconfident_tail(0.90, {})
+    assert p4 == 0.90 and note4 is None
+
+
+def test_selection_filters_heavy_favorite_and_sharp_coverage():
+    """Regression (Issue-4 filters): heavy favorites and games without sharp
+    coverage are held to analysis-only; each filter is config-gated."""
+    from types import SimpleNamespace
+    from mlb_value_bot.pipeline import _selection_filters
+
+    def _evals(odds):
+        return {"home": SimpleNamespace(american_odds=odds)}
+
+    sharp_ok = SimpleNamespace(available=True, sharp_devig_home=0.55)
+    no_sharp = SimpleNamespace(available=True, sharp_devig_home=None)
+    cfg = {"filters": {"heavy_favorite_american": -150, "require_sharp_coverage": True}}
+
+    # -160 favorite -> filtered; -140 with sharp coverage -> clean.
+    fired = _selection_filters("home", _evals(-160), sharp_ok, cfg)
+    assert len(fired) == 1 and "heavy favorite" in fired[0]
+    assert _selection_filters("home", _evals(-140), sharp_ok, cfg) == []
+    # Boundary: exactly -150 is filtered (at or below).
+    assert _selection_filters("home", _evals(-150), sharp_ok, cfg)
+    # No sharp price on the board -> filtered (dog price, so only one reason).
+    fired2 = _selection_filters("home", _evals(120), no_sharp, cfg)
+    assert len(fired2) == 1 and "sharp" in fired2[0]
+    # market_intel entirely unavailable counts as no coverage too.
+    fired3 = _selection_filters("home", _evals(120), SimpleNamespace(available=False), cfg)
+    assert fired3 and "sharp" in fired3[0]
+    # Both filters can stack on one game.
+    assert len(_selection_filters("home", _evals(-200), no_sharp, cfg)) == 2
+    # Config off -> no filters fire at all.
+    assert _selection_filters("home", _evals(-300), no_sharp, {}) == []
 
 
 # --- Bet sizing tiers + Kelly caps (Step 5, 2026-05-30) --------------------
