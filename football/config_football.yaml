@@ -1,0 +1,212 @@
+# ============================================================================
+# Football (NFL + college FBS) — independent config.
+# Every football tunable lives HERE (never in code, never in config.yaml).
+# The model is matchup-exploitation based: strong unit vs weak opposing unit,
+# bet on spreads AND totals. PAPER-ONLY until CLV proves out.
+# ============================================================================
+
+leagues:
+  nfl:
+    enabled: true
+    sport_key: "americanfootball_nfl"
+  cfb:
+    enabled: true
+    sport_key: "americanfootball_ncaaf"
+    # DECIDED scope (2026-07-04): evaluate every FBS game that carries a
+    # DraftKings line — the odds feed is the slate filter. Quality control is
+    # the G5 variance haircut + the EV gate, not a curated team list.
+    fbs_only: true
+
+odds_api:
+  # Reuses the shared OddsClient + ODDS_API_KEY. Same books/regions as MLB
+  # (us,uk is the proven combo that returns Pinnacle on this key's tier).
+  base_url: "https://api.the-odds-api.com/v4"
+  regions: "us,uk"
+  # spreads + totals are the v1 markets. h2h (moneyline) is deliberately
+  # deferred: The Odds API bills per market x region, so spreads,totals x
+  # us,uk = 4 credits per league per snapshot; adding h2h would make it 6.
+  markets: "spreads,totals"
+  odds_format: "american"
+  bookmakers:
+    - "draftkings"         # bet price (also a square)
+    - "fanduel"            # square consensus
+    - "betmgm"             # square consensus
+    - "pinnacle"           # gold-standard sharp consensus (uk region)
+    - "betonlineag"        # sharp offshore
+    - "lowvig"             # sharp
+  bet_bookmaker: "draftkings"
+  sharp_bookmakers: ["pinnacle", "betonlineag", "lowvig"]
+  square_bookmakers: ["draftkings", "fanduel", "betmgm"]
+  request_timeout_seconds: 20
+
+cfbd:
+  # CollegeFootballData API v2. Key: CFBD_API_KEY in .env. Free tier =
+  # 1,000 calls/MONTH (monthly quota, not throttle) — every response's call
+  # count is logged; upgrade to Tier 2 ($5/mo, 30k) only if we hit the wall.
+  base_url: "https://apinext.collegefootballdata.com"
+  request_timeout_seconds: 30
+  # Season-shaped pulls (stats, PPA, SP+, returning production, venues) are
+  # cached hard for a week — they only move materially between game weeks.
+  season_stats_ttl_days: 7
+
+nfl_data:
+  # nflverse via nflreadpy (free, no key). Play-by-play is the unit-stat
+  # source of truth (EPA per play lives there); schedules carry roof +
+  # final scores (grading); snap counts feed the OL-continuity proxy;
+  # FTN charting feeds the pressure proxy (blitz/pass-rusher counts).
+  pbp_ttl_hours: 12
+  schedules_ttl_hours: 3          # scores/roof refresh on game days
+  snap_counts_ttl_hours: 12
+  ftn_ttl_hours: 12
+
+# --- Matchup scoring ---------------------------------------------------------
+percentiles:
+  # Percentile pools are PER LEAGUE: NFL teams rank against NFL, FBS against
+  # FBS. Never mixed (regression test locks this).
+  strong_threshold: 75             # top quartile = "strong"
+  weak_threshold: 25               # bottom quartile = "weak"
+  # Early-season blending: percentiles on 1-3 games are noise, so unit stats
+  # are blended with the PRIOR season's by week. Linear decay between the
+  # anchors below; 0 from prior_out_week onward.
+  prior_weight_week1: 0.8
+  prior_out_week: 7
+
+matchup:
+  # Phase weights for combining pass/rush edges into a game edge. Shifted
+  # toward the phase the expected game script favors, capped by script_shift.
+  phase_weight_pass: 0.60
+  phase_weight_rush: 0.40
+  script_shift_max: 0.15
+  # |edge| below the neutral band = no archetype (strong-vs-strong and
+  # weak-vs-weak land here by construction).
+  neutral_band: 10.0
+  # A team holding BOTH the pass and rush edge is the highest-conviction
+  # archetype; its game edge gets this multiplicative bonus.
+  dual_edge_bonus: 0.15
+  # Turnover-profile pairing: flag when a high-takeaway defense (top quartile)
+  # meets a turnover-prone offense (bottom quartile giveaways).
+  turnover_flag_threshold: 75
+
+ol_layer:
+  # Offensive-line modifier applied to BOTH phase edges. Pass protection is a
+  # PROXY (labeled as such in the UI): sack rate per dropback + FTN blitz /
+  # pass-rusher context + QB-hit rate — real pressure data isn't free in-season.
+  pressure_elite: 0.15             # proxy-pressure/dropback below this = elite
+  pressure_poor: 0.28              # above this = liability
+  ypc_good_nfl: 4.5
+  ypc_bad_nfl: 4.0
+  ypc_good_cfb: 5.0                # FBS baseline, SP+-adjusted for competition
+  ypc_bad_cfb: 4.3
+  # Continuity dampener on otherwise-strong OL grades: NFL = week-over-week
+  # starting-OL snap-count deltas; CFB = returning production. Max fraction of
+  # the OL modifier that continuity trouble can strip.
+  continuity_dampener_max: 0.30
+  # OL grade (-1..+1) -> edge-point adjustment added to BOTH of the team's
+  # offensive phase edges (edges live on a ~-100..+100 percentile-point scale).
+  edge_points_scale: 10.0
+
+college:
+  # FBS outcomes are noisier than NFL: the same edge score produces lower
+  # confidence and a smaller displayed stake. Applied multiplicatively to
+  # Group-of-Five-involved matchups on top of the league-wide haircut.
+  league_confidence_mult: 0.90
+  g5_confidence_mult: 0.85
+  g5_stake_mult: 0.75
+  # Competition-level adjustment: unit percentiles are blended toward the
+  # school's SP+ percentile, correcting stats padded against weak schedules
+  # (a G5 team's 80th-pct rushing offense is not an SEC one's).
+  sp_blend: 0.30
+  power_conferences: ["SEC", "Big Ten", "Big 12", "ACC", "FBS Independents"]
+
+# --- Projections + EV --------------------------------------------------------
+projections:
+  # Model projection blended toward the de-vigged market: the market-heavy
+  # 35/65 split that worked for MLB. If output looks too edgy, LOWER this.
+  market_blend: 0.35
+  # Transparent expected-points build: league base points per team, +/- the
+  # phase-weighted EPA/play (offense vs what the opponent allows) times plays,
+  # + a red-zone efficiency kicker, + home-field advantage on the margin.
+  base_pts_nfl: 22.5
+  base_pts_cfb: 28.5
+  hfa_pts_nfl: 1.5
+  hfa_pts_cfb: 2.5
+  rz_coef_pts: 8.0                 # pts per unit of red-zone TD-rate edge vs pool avg
+  # Game-script lean: |sharp spread| / this many points = full shift of the
+  # phase weights toward the run game (blowout scripts are ground-heavy).
+  script_lean_full_spread: 21.0
+  # Over-bias guardrails (the MLB totals lesson): the model total's tilt is
+  # measured against the market-implied MEAN, and projections diverging
+  # further than the guard from the market are held to analysis-only.
+  max_total_divergence_pts: 6.0
+  max_spread_divergence_pts: 4.5
+  # Spread/total margin distribution sigma (pts) for cover/over probabilities.
+  nfl_margin_sigma: 13.2
+  nfl_total_sigma: 10.0
+  cfb_margin_sigma: 16.0
+  cfb_total_sigma: 12.5
+
+ev:
+  devig_method: "power"
+  threshold: 0.03                  # surface only EV > 3%
+  max_picks_per_game: 3            # at most one per market (spread/total/ml)
+
+adjusted_ev:
+  # THE single home for sharp-signal EV magnitude (the consolidation rule from
+  # the MLB side). Reverse line movement / sharp-fade is FLAGGED elsewhere but
+  # only adjusted HERE, once.
+  sharp_support_pp: 2.0            # sharp vs square gap (prob pts) to count
+  sharp_support_boost: 0.010
+  sharp_fade_reduction: 0.015
+  fragile_reduction: 0.010         # thin-data / proxy-heavy edge haircut
+
+betting:
+  paper_only: true                 # HARD GATE — flips manually on CLV proof
+  # Flat staking display during paper trading (fraction of bankroll): standard
+  # picks 1u, highest-conviction (dual-edge NFL) up to 2u. Guidance only.
+  flat_stake_pct: 0.01
+  flat_stake_pct_strong: 0.02
+
+weather:
+  # v1 requirement for OUTDOOR totals. Football weather is SUPPRESS-ONLY:
+  # wind kills passing efficiency + kicking, extreme cold kills scoring;
+  # domes/closed roofs are a no-op. The multiplier is <= 1.0 by construction
+  # (it can move a projection DOWN, never up) and clamped at 1 - max_tilt.
+  enabled: true
+  require_for_bet: true            # outdoor total w/o weather -> analysis-only
+  max_tilt: 0.06
+  wind_mph_start: 12.0             # suppression begins above this sustained wind
+  wind_coef_per_mph: 0.006
+  cold_f_start: 25.0               # suppression begins below this temp
+  cold_coef_per_f: 0.004
+  timeout: 8
+
+variance:
+  # Late-game explosiveness (Q4 garbage/comeback scoring) is a VARIANCE
+  # adjustment: explosive offenses widen the outcome distribution, which cuts
+  # confidence on totals — it never bumps the projection itself.
+  explosive_epa_pctile: 80
+  explosive_confidence_mult: 0.90
+
+grading:
+  # A committed bet whose game still has no final this many days later is
+  # voided (canceled game; stake returned).
+  void_after_days: 10
+
+distribution_monitor:
+  # Pick-mix tripwire (the MLB over-bias lesson): rolling share of overs vs
+  # unders across the last `window` committed totals picks. Alert is symmetric
+  # and needs a minimum sample before it can fire.
+  window: 50
+  alert_share: 0.60                # alert when over% > 0.60 or < 0.40
+  min_picks: 25
+
+clv:
+  # CLV in PROBABILITY POINTS vs the de-vigged sharp close (totals-model
+  # convention) — the primary validation metric for going live.
+  sharp_book_priority: ["pinnacle", "betonlineag", "lowvig"]
+
+model_tag: "matchup_v1"
+
+logging:
+  level: "INFO"
+  file: "storage/football.log"

@@ -155,16 +155,39 @@ Add to these when touching `ev_calculator` or `win_probability`.
 - `cli.py` reconfigures stdout/stderr to UTF-8 at import (Windows console safety);
   Click help strings are kept ASCII.
 
-## Extending to NFL (planned)
+## Football (NFL + college FBS) — BUILT (2026-07, `football/`)
 
-The structure is sport-agnostic on purpose. To add NFL:
-1. New `data/nfl_client.py` (schedule/scores/QB designations) + an odds sport key
-   (`americanfootball_nfl`) — reuse `OddsClient` by parameterizing `sport_key`.
-2. New `analysis/nfl_win_probability.py` with its own components (QB rating,
-   EPA/play, rest, weather, HFA) but the **same `Component`/breakdown contract**.
-3. Reuse `ev_calculator`, `tracking/*`, `performance/*`, `backtest/*` unchanged —
-   they're sport-agnostic (they only see odds, probabilities, and results).
-4. Parameterize `pipeline.analyze_slate` by sport, or add `pipeline_nfl.py`.
+The planned NFL extension shipped as the `football/` subpackage — a
+GriffBet-style parallel engine (own `config_football.yaml`, own SQLite
+`storage/football.db`, own Supabase tables `football_recommendations` +
+`football_snapshot`, own CLI `python -m mlb_value_bot.football`), internally
+layered `cli -> pipeline_football -> analysis/* -> data/*` like the main repo.
+(Yes, the package name `mlb_value_bot` is now a misnomer; renaming isn't worth
+breaking the import path baked into daily.yml/sync/tests.)
+
+Key facts for future sessions:
+- **Model:** matchup exploitation — unit stats percentiled 0-100 WITHIN league
+  (NFL and FBS pools never mixed), quartile strong/weak archetypes, phase edge
+  = O_pct - D_pct (Jim's "O - (100 - D_badness)" with defense oriented
+  higher=better), OL proxy layer (sack+QB-hit rate + YPC + snap-count
+  continuity), projected spread+total from EPA/play x pace, blended 35/65
+  model/market. Bets SPREADS and TOTALS; moneyline deferred (credit cost).
+- **Data:** nflreadpy (free; injuries feed is DEAD post-2024 — continuity uses
+  snap deltas), CFBD v2 (`CFBD_API_KEY`, free tier = 1k calls/MONTH, cached
+  weekly), shared OddsClient with `americanfootball_nfl|ncaaf` (but football
+  does its OWN event parsing — `constants.normalize_team`'s nickname fallback
+  maps NY Giants -> SF Giants), Open-Meteo hourly at kickoff (SUPPRESS-ONLY
+  multiplier: wind/cold move totals DOWN, never up; outdoor total without
+  weather is held analysis-only).
+- **Guardrails carried over from the MLB lessons:** tilt measured vs the
+  market-implied MEAN + divergence guard (totals over-bias fix), sharp-fade EV
+  magnitude single-homed in `pipeline_football._compute_adjusted_ev`
+  (stability only flags), records ALWAYS filtered model_tag x league x market
+  (GriffBet record bug), rolling-50 over/under distribution monitor synced as
+  `football_snapshot` scopes (site shows an amber alert past 60/40).
+- **PAPER-ONLY** (`betting.paper_only`) until CLV vs the sharp close proves
+  out; CLV in probability points (`clv_pp`), opening frozen on first commit.
+- Tests in `tests/test_football.py` (fixtures only, no network/nflreadpy).
 Keep the same "transparent weighted components + CLV-first measurement" ethos.
 
 ## Conventions

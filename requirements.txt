@@ -10,6 +10,9 @@ tenacity>=8.2          # retry/backoff for every external API call
 # Baseball data
 pybaseball>=2.2        # Statcast + FanGraphs pulls
 
+# Football data (football/ subpackage only)
+nflreadpy>=0.1         # nflverse pbp/EPA, schedules, snap counts, FTN (pulls polars)
+
 # Config / env / CLI / output
 python-dotenv>=1.0
 PyYAML>=6.0

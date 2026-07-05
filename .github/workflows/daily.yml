@@ -9,7 +9,17 @@ on:
   # through the afternoon/closing window). GitHub's own `schedule:` cron was
   # too unreliable here (runs delayed up to ~3h, */30 ticks dropped), so it was
   # removed -- this workflow now runs ONLY on dispatch (cron-job.org + manual).
-  workflow_dispatch: {}
+  # `scope` lets cron-job.org tick sports independently (football's weekly
+  # cadence vs MLB's daily): POST {"ref":"main","inputs":{"scope":"football"}}
+  # for football-only runs (Sat/Sun closing windows), "mlb" for MLB-only, and
+  # the default "all" runs everything (the existing daily ticks stay valid).
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Which pipelines to run"
+        type: choice
+        default: all
+        options: [all, mlb, football]
 
 # Never let two runs clobber each other (they share the Supabase tables).
 concurrency:
@@ -38,6 +48,7 @@ jobs:
         run: pip install -r mlb_value_bot/requirements.txt
 
       - name: Run pipeline (pull -> grade -> slate -> sync)
+        if: ${{ inputs.scope != 'football' }}
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -55,6 +66,7 @@ jobs:
       # snapshot (cross-model report). BiffBet's steps above are unchanged; a
       # GriffBet failure must not mask BiffBet's run, so each step is tolerant.
       - name: Run GriffBet pipeline (pull -> grade -> slate -> sync)
+        if: ${{ inputs.scope != 'football' }}
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -66,3 +78,20 @@ jobs:
           python -m mlb_value_bot.griffbet train           || echo "griff train: skipped"
           python -m mlb_value_bot.griffbet today            || echo "griff today: skipped"
           python -m mlb_value_bot.griffbet sync             || echo "griff sync: skipped"
+
+      # Football (NFL + college FBS, PAPER) — ADDITIVE, same tolerant contract
+      # as GriffBet: a football failure must never mask the MLB run and vice
+      # versa. In-season cron-job.org ticks fire scope=football on the weekly
+      # line-capture cadence (Tue open, daily refresh, Thu/Sat/Sun/Mon closes).
+      - name: Run Football pipeline (pull -> grade -> slate -> sync)
+        if: ${{ inputs.scope != 'mlb' }}
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          python -m mlb_value_bot.football pull            || echo "football pull: skipped"
+          python -m mlb_value_bot.football results         || echo "football results: nothing to settle"
+          python -m mlb_value_bot.football today            || echo "football today: skipped"
+          python -m mlb_value_bot.football sync             || echo "football sync: skipped"

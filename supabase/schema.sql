@@ -281,3 +281,83 @@ create policy "public read referee"
     on public.referee_snapshot for select
     to anon, authenticated
     using (true);
+
+-- ============================================================================
+-- FOOTBALL (NFL + college FBS) — the matchup-exploitation model's tables.
+-- One row per (league, date, game_id, market). PAPER-ONLY until CLV proves
+-- out. Records are ALWAYS computed filtered by model_tag x league x market
+-- (engine-side, in football_snapshot scopes) — never from this table raw.
+-- ============================================================================
+create table if not exists public.football_recommendations (
+    id                       bigint generated always as identity primary key,
+    league                   text not null check (league in ('nfl','cfb')),
+    date                     date not null,
+    week                     integer,
+    game_id                  text not null,
+    market                   text not null check (market in ('spread','total','moneyline')),
+    home_team                text not null,
+    away_team                text not null,
+    pick_side                text not null check (pick_side in ('home','away','over','under')),
+    line                     double precision,      -- picked-side line (spread) / total
+    bet_odds                 integer not null,
+    decimal_odds             double precision not null,
+    model_prob               double precision not null,
+    market_prob_devigged     double precision not null,
+    p_push                   double precision,
+    ev_pct                   double precision not null,
+    adjusted_ev_pct          double precision,
+    flat_stake               double precision not null,
+    confidence               double precision not null,
+    tier                     text,
+    stability                text,
+    edge_score               double precision,
+    archetype                text,
+    projected_margin         double precision,
+    projected_total          double precision,
+    paper                    boolean not null default true,
+    model_tag                text not null default 'matchup_v1',
+    reasoning                jsonb,
+    opening_line             double precision,
+    opening_price            integer,
+    opening_devig_p_side     double precision,
+    closing_line             double precision,
+    closing_price            integer,
+    sharp_close_line         double precision,
+    sharp_close_devig_p_side double precision,
+    clv_pp                   double precision,      -- probability points vs sharp close
+    result                   text not null default 'pending'
+                             check (result in ('pending','win','loss','push','void')),
+    home_score               integer,
+    away_score               integer,
+    profit_loss              double precision,      -- bankroll-fraction units
+    is_value                 boolean not null default false,
+    created_at               timestamptz,
+    updated_at               timestamptz,
+    constraint football_recs_key unique (league, date, game_id, market)
+);
+create index if not exists football_recs_date_idx   on public.football_recommendations (date desc);
+create index if not exists football_recs_league_idx on public.football_recommendations (league);
+create index if not exists football_recs_result_idx on public.football_recommendations (result);
+
+-- Precomputed aggregates the site reads: record:<league>:<market>,
+-- distribution:<league>:total, calibration:<model_tag>, record:all:all.
+create table if not exists public.football_snapshot (
+    scope        text        primary key,
+    payload      jsonb       not null,
+    updated_at   timestamptz not null default now()
+);
+
+alter table public.football_recommendations enable row level security;
+alter table public.football_snapshot        enable row level security;
+
+drop policy if exists "public read football recs" on public.football_recommendations;
+create policy "public read football recs"
+    on public.football_recommendations for select
+    to anon, authenticated
+    using (true);
+
+drop policy if exists "public read football snapshot" on public.football_snapshot;
+create policy "public read football snapshot"
+    on public.football_snapshot for select
+    to anon, authenticated
+    using (true);
