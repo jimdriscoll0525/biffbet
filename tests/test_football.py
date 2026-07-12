@@ -15,7 +15,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from mlb_value_bot.football import season_for_date
+from mlb_value_bot.football import football_in_season, season_for_date
 
 
 # =============================================================================
@@ -26,6 +26,34 @@ def test_season_for_date_spans_january():
     assert season_for_date("2026-09-10") == 2026
     assert season_for_date("2027-01-11") == 2026   # playoffs belong to the prior season
     assert season_for_date("2026-07-04") == 2025
+
+
+class TestSeasonWindow:
+    CFG = {"season_window": {"start": "08-20", "end": "02-15"}}
+
+    def test_window_wraps_year_end_inclusive(self):
+        assert not football_in_season("2026-07-12", self.CFG)   # dead of summer
+        assert football_in_season("2026-08-20", self.CFG)       # start inclusive
+        assert football_in_season("2026-11-08", self.CFG)
+        assert football_in_season("2027-01-10", self.CFG)       # playoffs
+        assert football_in_season("2027-02-15", self.CFG)       # end inclusive
+        assert not football_in_season("2027-02-16", self.CFG)
+
+    def test_non_wrapping_window(self):
+        cfg = {"season_window": {"start": "06-01", "end": "08-01"}}
+        assert football_in_season("2026-07-12", cfg)
+        assert not football_in_season("2026-08-02", cfg)
+
+    def test_off_season_slate_never_touches_odds_api(self, monkeypatch):
+        from mlb_value_bot.football import pipeline_football
+        from mlb_value_bot.football.data import football_odds
+
+        def boom(*args, **kwargs):
+            raise AssertionError("Odds API must not be called off-season")
+
+        monkeypatch.setattr(football_odds, "fetch_league_odds", boom)
+        assert pipeline_football.evaluate_league_slate("nfl", "2026-07-12", self.CFG) == []
+        assert pipeline_football.evaluate_league_slate("cfb", "2026-07-12", self.CFG) == []
 
 
 class TestNflNames:

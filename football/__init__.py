@@ -43,3 +43,16 @@ def season_for_date(date_iso: str) -> int:
     game belongs to the prior calendar year's season)."""
     year, month = int(date_iso[:4]), int(date_iso[5:7])
     return year if month >= 8 else year - 1
+
+
+def football_in_season(date_iso: str, config: dict) -> bool:
+    """True when `date_iso` falls inside `season_window` (month-day bounds,
+    inclusive, wrapping the year end). Off-season, the pipeline skips the
+    Odds API pull entirely — credits are the scarce shared resource."""
+    window = config.get("season_window", {})
+    start = str(window.get("start", "08-20"))
+    end = str(window.get("end", "02-15"))
+    month_day = date_iso[5:10]
+    if start <= end:
+        return start <= month_day <= end
+    return month_day >= start or month_day <= end

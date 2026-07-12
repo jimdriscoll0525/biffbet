@@ -13,7 +13,7 @@ from datetime import date
 
 import click
 
-from mlb_value_bot.football import load_football_config, season_for_date
+from mlb_value_bot.football import football_in_season, load_football_config, season_for_date
 from mlb_value_bot.utils import get_logger
 
 log = get_logger("football.cli")
@@ -104,6 +104,10 @@ def today(date_: str | None, league_: str, save: bool) -> None:
 
     config = load_football_config()
     game_date = date_ or date.today().isoformat()
+    if not football_in_season(game_date, config):
+        click.echo(f"Football off-season ({game_date}): Odds API pull skipped "
+                   "(see season_window in config_football.yaml).")
+        return
     leagues = ["nfl", "cfb"] if league_ == "all" else [league_]
     paper = config.get("betting", {}).get("paper_only", True)
 

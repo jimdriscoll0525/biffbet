@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from mlb_value_bot.football import season_for_date  # noqa: F401  (used by CLI callers)
+from mlb_value_bot.football import football_in_season, season_for_date  # noqa: F401  (used by CLI callers)
 from mlb_value_bot.football.analysis import percentiles as pctl
 from mlb_value_bot.football.analysis import unit_stats as ustats
 from mlb_value_bot.football.analysis.matchup import GameMatchup, game_matchup
@@ -451,6 +451,10 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
 
     season = season_for_date(date_iso)
     if odds_games is None:
+        if not football_in_season(date_iso, config):
+            log.info("%s: %s is off-season; Odds API pull skipped "
+                     "(config season_window)", league, date_iso)
+            return []
         odds_games = football_odds.fetch_league_odds(league, config)
     if not odds_games:
         return []

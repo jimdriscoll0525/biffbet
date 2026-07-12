@@ -17,6 +17,15 @@ leagues:
     # the G5 variance haircut + the EV gate, not a curated team list.
     fbs_only: true
 
+season_window:
+  # Off-season credit gate (added 2026-07-12 after the shared ODDS_API_KEY
+  # burned its whole monthly quota mid-July): outside this window `today`
+  # skips the Odds API pull entirely — there is nothing to price, and the
+  # odds pull is football's ONLY credit spend. Month-day bounds, inclusive,
+  # wrapping the year end: CFB week 0 lands ~Aug 23, the Super Bowl mid-Feb.
+  start: "08-20"
+  end: "02-15"
+
 odds_api:
   # Reuses the shared OddsClient + ODDS_API_KEY. Same books/regions as MLB
   # (us,uk is the proven combo that returns Pinnacle on this key's tier).
