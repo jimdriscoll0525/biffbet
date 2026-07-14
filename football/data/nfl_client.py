@@ -32,6 +32,17 @@ _PBP_COLS = [
 ]
 
 
+# The pbp columns the live-totals drive priors read (drive_stats.py). Kept as
+# a SEPARATE trim + cache key so the matchup model's parquet stays lean.
+_PBP_DRIVE_COLS = [
+    "game_id", "season", "week", "posteam", "defteam", "season_type",
+    "fixed_drive", "fixed_drive_result", "drive_time_of_possession",
+    "drive_play_count", "game_seconds_remaining",
+    "posteam_score", "defteam_score", "posteam_score_post",
+    "qb_kneel", "pass", "rush", "yards_gained",
+]
+
+
 def _ttl_hours(config: dict, key: str, default: float) -> float:
     return float(config.get("nfl_data", {}).get(key, default)) * 3600.0
 
@@ -56,6 +67,19 @@ def pbp(season: int, config: dict, force_refresh: bool = False) -> pd.DataFrame:
     df = cached_dataframe(
         f"nfl_pbp_{season}",
         lambda: _load("load_pbp", season, _PBP_COLS),
+        ttl_seconds=_ttl_hours(config, "pbp_ttl_hours", 12),
+        force_refresh=force_refresh,
+    )
+    if not df.empty and "season_type" in df.columns:
+        df = df[df["season_type"] == "REG"]
+    return df
+
+
+def pbp_drives(season: int, config: dict, force_refresh: bool = False) -> pd.DataFrame:
+    """Regular-season play-by-play trimmed to the drive-stat columns."""
+    df = cached_dataframe(
+        f"nfl_pbp_drives_{season}",
+        lambda: _load("load_pbp", season, _PBP_DRIVE_COLS),
         ttl_seconds=_ttl_hours(config, "pbp_ttl_hours", 12),
         force_refresh=force_refresh,
     )

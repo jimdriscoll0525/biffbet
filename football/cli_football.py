@@ -185,6 +185,52 @@ def sync_cmd(since: str | None) -> None:
     click.echo(f"Synced football: {out}")
 
 
+@cli.command(name="drive-stats")
+@click.option("--season", type=int, default=None, help="Season year (default: inferred).")
+@click.option("--sync/--no-sync", "do_sync", default=False,
+              help="Also upsert the rows to Supabase football_team_drive_stats.")
+def drive_stats_cmd(season: int | None, do_sync: bool) -> None:
+    """Compute the live totals model's drive-stat priors (PPD, pace, explosive
+    rate) from nflverse pbp; optionally sync to Supabase. Free feed — safe
+    year-round."""
+    from mlb_value_bot.football.pipeline_football import _infer_week, build_drive_stats
+
+    config = load_football_config()
+    today = date.today().isoformat()
+    yr = season or season_for_date(today)
+    week = _infer_week(config, "nfl", yr, today)
+    stats = build_drive_stats("nfl", yr, week, config)
+    if stats.empty:
+        click.echo(f"No NFL drive stats for season {yr} (feed gap?).")
+        return
+    click.echo(f"NFL drive-stat priors (season {yr}, {len(stats)} teams):")
+    cols = ["ppd_off", "ppd_def_allowed", "drives_pg", "sec_per_play",
+            "explosive_play_rate", "pts_per_min_trailing"]
+    click.echo(stats[cols].round(3).to_string())
+    if do_sync:
+        from mlb_value_bot.football.sync_football import push_drive_stats
+        from mlb_value_bot.sync.supabase_sync import _credentials
+
+        url, key = _credentials()
+        n = push_drive_stats(url, key, config)
+        click.echo(f"Synced {n} drive-stat row(s) to Supabase.")
+
+
+@cli.command(name="grade-live")
+@click.option("--before", default=None, help="Grade recs dated before this (default: today).")
+def grade_live_cmd(before: str | None) -> None:
+    """Grade pending live in-game totals recommendations (live_total_v1)."""
+    from mlb_value_bot.football.tracking.football_live_results import grade_live
+
+    config = load_football_config()
+    s = grade_live(config, before=before)
+    if not s.dates and not s.pending:
+        click.echo("No pending live recommendations.")
+        return
+    click.echo(f"Live totals: {s.graded} settled ({s.wins}W-{s.losses}L-{s.pushes}P), "
+               f"{s.voids} void, {s.pending} pending across {len(s.dates)} date(s)")
+
+
 @cli.command()
 @click.option("--league", type=click.Choice(["nfl", "cfb"]), default="nfl")
 @click.option("--season", type=int, default=None, help="Season year (default: inferred).")

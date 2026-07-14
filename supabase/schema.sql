@@ -361,3 +361,120 @@ create policy "public read football snapshot"
     on public.football_snapshot for select
     to anon, authenticated
     using (true);
+
+-- ============================================================================
+-- LIVE TOTALS (live_total_v1) — the in-game NFL over/under projection tool.
+-- Priors are engine-computed (football/analysis/drive_stats.py, synced daily);
+-- snapshots + recommendations are written by the biffbet site's server routes
+-- (service-role key) on each "Update Over/Under" press. Grading is engine-side
+-- (football/tracking/football_live_results.py). CLV NOTE: clv_pts here is
+-- POINTS vs the self-captured closing live line — a deliberately different
+-- name/metric from the pregame clv_pp (probability points vs sharp close);
+-- never aggregate the two.
+-- ============================================================================
+
+-- (1) Team drive-stat priors — engine writes, site reads.
+create table if not exists public.football_team_drive_stats (
+    league               text not null check (league in ('nfl','cfb')),
+    season               integer not null,
+    team                 text not null,           -- nflverse abbr (KC, BUF, LA, ...)
+    games                integer not null,
+    ppd_off              double precision,        -- points per offensive drive
+    ppd_def_allowed      double precision,        -- points allowed per defensive drive
+    drives_pg            double precision,
+    plays_per_drive      double precision,
+    sec_per_play         double precision,
+    drive_sec_avg        double precision,
+    explosive_play_rate  double precision,        -- (pass>=20yd + rush>=10yd) / plays
+    pts_per_min_trailing double precision,        -- scoring rate while trailing
+    updated_at           timestamptz not null default now(),
+    primary key (league, season, team)
+);
+
+-- (2) One row per "Update Over/Under" press on the site.
+create table if not exists public.football_live_snapshots (
+    id                bigint generated always as identity primary key,
+    league            text not null default 'nfl' check (league in ('nfl','cfb')),
+    game_key          text not null,               -- ESPN event id (canonical live key)
+    date              date not null,
+    home_team         text not null,               -- ESPN abbr
+    away_team         text not null,
+    captured_at       timestamptz not null default now(),
+    quarter           integer,                     -- 1-4, 5 = OT
+    clock             text,                        -- "MM:SS" as displayed
+    seconds_remaining integer,                     -- regulation seconds left
+    home_score        integer not null,
+    away_score        integer not null,
+    possession        text check (possession in ('home','away')),
+    home_timeouts     integer,
+    away_timeouts     integer,
+    live_line         double precision,            -- manual entry; null = not entered
+    erp               double precision not null,   -- expected remaining points
+    projected_total   double precision not null,   -- current pts + ERP + OT component
+    edge              double precision,            -- projected_total - live_line
+    lean              text check (lean in ('over','under','pass')),
+    confidence_tier   text check (confidence_tier in ('high','medium','low')),
+    sentiment_delta   double precision,            -- vs previous snapshot
+    sentiment_cum     double precision,            -- rolling per-game cumulative
+    scoring_event     text,                        -- 'td7','td6','td8','fg3','safety2','multi','none'
+    flags             jsonb,                       -- badges: x_factor_alive, kneel_down_range, ...
+    inputs            jsonb,                       -- manual overrides + data_health provenance
+    model_tag         text not null default 'live_total_v1'
+);
+create index if not exists football_live_snap_game_idx
+    on public.football_live_snapshots (game_key, captured_at desc);
+create index if not exists football_live_snap_date_idx
+    on public.football_live_snapshots (date desc);
+
+-- (3) Recommendation log — one row per press that produced an over/under lean
+--     (passes live only in snapshots). PAPER-ONLY.
+create table if not exists public.football_live_recommendations (
+    id                bigint generated always as identity primary key,
+    league            text not null default 'nfl' check (league in ('nfl','cfb')),
+    date              date not null,
+    game_key          text not null,
+    home_team         text not null,
+    away_team         text not null,
+    snapshot_id       bigint references public.football_live_snapshots(id),
+    captured_at       timestamptz not null default now(),
+    live_line         double precision not null,
+    projected_total   double precision not null,
+    edge              double precision not null,
+    lean              text not null check (lean in ('over','under')),
+    confidence_tier   text not null check (confidence_tier in ('high','medium','low')),
+    badges            jsonb,
+    paper             boolean not null default true,
+    model_tag         text not null default 'live_total_v1',
+    result            text not null default 'pending'
+                      check (result in ('pending','win','loss','push','void')),
+    final_total       integer,
+    closing_live_line double precision,            -- last captured live_line for the game
+    clv_pts           double precision,            -- signed pts of line move in lean's favor
+    graded_at         timestamptz
+);
+create index if not exists football_live_recs_result_idx
+    on public.football_live_recommendations (result);
+create index if not exists football_live_recs_date_idx
+    on public.football_live_recommendations (date desc);
+
+alter table public.football_team_drive_stats     enable row level security;
+alter table public.football_live_snapshots       enable row level security;
+alter table public.football_live_recommendations enable row level security;
+
+drop policy if exists "public read drive stats" on public.football_team_drive_stats;
+create policy "public read drive stats"
+    on public.football_team_drive_stats for select
+    to anon, authenticated
+    using (true);
+
+drop policy if exists "public read live snapshots" on public.football_live_snapshots;
+create policy "public read live snapshots"
+    on public.football_live_snapshots for select
+    to anon, authenticated
+    using (true);
+
+drop policy if exists "public read live recs" on public.football_live_recommendations;
+create policy "public read live recs"
+    on public.football_live_recommendations for select
+    to anon, authenticated
+    using (true);

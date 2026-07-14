@@ -201,6 +201,22 @@ grading:
   # voided (canceled game; stake returned).
   void_after_days: 10
 
+live:
+  # Engine-side inputs for the site's live in-game over/under tool
+  # (live_total_v1, biffbet repo). Drive-stat priors are computed from nflverse
+  # pbp and synced daily to Supabase football_team_drive_stats; the live model
+  # itself (script multipliers, X-factor table, thresholds) is configured
+  # site-side in biffbet lib/live/config.ts. nflverse is free, so the drive
+  # sync runs year-round — NOT gated by season_window (that gate exists only
+  # to protect Odds API credits).
+  drive_stats:
+    explosive_pass_yards: 20
+    explosive_rush_yards: 10
+    min_games: 1
+  grading:
+    # Pending live recommendations with no final after this many days -> void.
+    void_after_days: 10
+
 distribution_monitor:
   # Pick-mix tripwire (the MLB over-bias lesson): rolling share of overs vs
   # unders across the last `window` committed totals picks. Alert is symmetric

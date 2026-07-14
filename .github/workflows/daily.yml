@@ -95,3 +95,18 @@ jobs:
           python -m mlb_value_bot.football results         || echo "football results: nothing to settle"
           python -m mlb_value_bot.football today            || echo "football today: skipped"
           python -m mlb_value_bot.football sync             || echo "football sync: skipped"
+
+      # Live totals (live_total_v1) — ADDITIVE. Grades the site-written live
+      # in-game over/under recommendations and refreshes the drive-stat priors
+      # the live model reads. Both use only free feeds (nflverse), so they run
+      # year-round and are NOT behind the season_window odds-credit gate.
+      # (`sync` above already pushes drive stats; the explicit step keeps the
+      # priors fresh even when the odds-driven sync short-circuits off-season.)
+      - name: Grade live totals + refresh drive priors
+        if: ${{ inputs.scope != 'mlb' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          python -m mlb_value_bot.football grade-live      || echo "grade-live: skipped"
+          python -m mlb_value_bot.football drive-stats --sync || echo "drive-stats: skipped"

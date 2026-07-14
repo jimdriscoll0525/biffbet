@@ -2,8 +2,10 @@
 Supabase. Reuses supabase_sync's proven plumbing (_credentials/_post/_clean/
 _get_all) by import; pushes football's OWN tables only:
 
-  * football_recommendations  (upsert on_conflict=league,date,game_id,market)
-  * football_snapshot         (upsert on_conflict=scope)
+  * football_recommendations    (upsert on_conflict=league,date,game_id,market)
+  * football_snapshot           (upsert on_conflict=scope)
+  * football_team_drive_stats   (upsert on_conflict=league,season,team) — the
+    live totals model's priors (live_total_v1; read by the biffbet site)
 
 Pull rebuilds the local SQLite store from Supabase (the ephemeral CI box's
 source of truth), mirroring pull_totals_recommendations.
@@ -11,6 +13,8 @@ source of truth), mirroring pull_totals_recommendations.
 from __future__ import annotations
 
 import json
+from datetime import date as _date
+from datetime import datetime, timezone
 
 from mlb_value_bot.football.tracking import football_performance, football_store
 from mlb_value_bot.sync.supabase_sync import _clean, _credentials, _get_all, _post
@@ -67,12 +71,81 @@ def push_snapshot(url: str, key: str, config: dict) -> int:
     return len(payload)
 
 
+def push_drive_stats(url: str, key: str, config: dict) -> int:
+    """Upsert the live totals model's drive-stat priors (NFL for v1). Runs
+    year-round: nflverse is free, so this is NOT behind the season_window
+    odds-credit gate."""
+    from mlb_value_bot.football import season_for_date
+    from mlb_value_bot.football.pipeline_football import _infer_week, build_drive_stats
+
+    today = _date.today().isoformat()
+    season = season_for_date(today)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    total = 0
+    for league in ("nfl",):
+        week = _infer_week(config, league, season, today)
+        stats = build_drive_stats(league, season, week, config)
+        if stats.empty:
+            log.info("No %s drive stats for season %d (feed gap?)", league, season)
+            continue
+        rows = []
+        for team, r in stats.iterrows():
+            row = {c: _clean(r[c]) for c in stats.columns}
+            row.update({"league": league, "season": season, "team": str(team),
+                        "games": int(r["games"]), "updated_at": now})
+            rows.append(row)
+        for start in range(0, len(rows), _BATCH):
+            _post(url, key, "football_team_drive_stats", rows[start:start + _BATCH],
+                  on_conflict="league,season,team")
+        total += len(rows)
+    log.info("Pushed %d drive-stat row(s)", total)
+    return total
+
+
 def push_all(config: dict, since: str | None = None) -> dict:
     url, key = _credentials()
-    return {
+    out = {
         "recommendations": push_recommendations(url, key, since),
         "snapshot_scopes": push_snapshot(url, key, config),
     }
+    # Tolerant: a missing table (schema not applied yet) must not fail the
+    # recommendations sync — same contract as the MLB totals push.
+    try:
+        out["drive_stats"] = push_drive_stats(url, key, config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("drive-stats sync skipped (%s) — apply supabase/schema.sql "
+                    "football_team_drive_stats?", exc)
+        out["drive_stats"] = 0
+    return out
+
+
+# --- live totals (live_total_v1) helpers --------------------------------------
+# The live tables are WRITTEN by the biffbet site's server routes; the engine
+# only reads them back for grading and patches the graded fields. Kept here so
+# this module stays the single football<->Supabase seam.
+
+def fetch_live_table(table: str) -> list[dict]:
+    """Read an entire live-totals table (football_live_recommendations /
+    football_live_snapshots)."""
+    url, key = _credentials()
+    return _get_all(url, key, table)
+
+
+def patch_live_recommendation(rec_id: int, fields: dict) -> None:
+    """Update one graded recommendation row by id."""
+    import requests
+
+    url, key = _credentials()
+    resp = requests.patch(
+        f"{url}/rest/v1/football_live_recommendations?id=eq.{int(rec_id)}",
+        headers={"apikey": key, "Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json", "Prefer": "return=minimal"},
+        data=json.dumps({k: _clean(v) for k, v in fields.items()}, default=str),
+        timeout=30,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(
+            f"Supabase live-rec patch failed ({resp.status_code}): {resp.text[:300]}")
 
 
 def pull_recommendations() -> int:

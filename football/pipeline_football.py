@@ -578,6 +578,24 @@ def project_game_for(ctx: LeagueContext, scored: ScoredGame, weather,
                         pool_rz_avg=pool_rz)
 
 
+def build_drive_stats(league: str, season: int, week: int, config: dict) -> pd.DataFrame:
+    """Drive-stat priors for the live totals model (live_total_v1), blended
+    with the prior season by week like the unit stats. NFL only for v1 —
+    other leagues return empty and the site falls back to league averages."""
+    from mlb_value_bot.football.analysis import drive_stats as dstats
+    from mlb_value_bot.football.data import nfl_client
+
+    if league != "nfl":
+        return pd.DataFrame()
+    current = dstats.nfl_drive_stats(nfl_client.pbp_drives(season, config), config)
+    prior = dstats.nfl_drive_stats(nfl_client.pbp_drives(season - 1, config), config) \
+        if pctl.prior_weight(week, config) > 0 or current.empty else pd.DataFrame()
+    blended = pctl.blend_with_prior(current, prior, week, config)
+    if blended.empty and not prior.empty:
+        blended = prior   # pre-season: run purely on last season
+    return blended
+
+
 def _infer_week(config: dict, league: str, season: int, date_iso: str) -> int:
     """Coarse in-season week estimate (only drives prior-blend weight and
     OL-continuity lookback): weeks since Sep 1 of the season year, clamped."""
