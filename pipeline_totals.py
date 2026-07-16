@@ -121,6 +121,10 @@ class TotalsAnalysis:
             data["run_distribution"] = {
                 "raw_model_total": rd.raw_model_total,
                 "expected_total": rd.expected_total,
+                # Mean provenance, explicit (not just prose in notes): the mean
+                # is anchor_mean + tilt, NOT the sum of the component runs.
+                "anchor_mean": rd.anchor_mean,
+                "tilt": rd.tilt,
                 "variance": rd.variance,
                 "home_runs": rd.home_runs,
                 "away_runs": rd.away_runs,

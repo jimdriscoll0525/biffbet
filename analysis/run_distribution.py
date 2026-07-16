@@ -31,6 +31,7 @@ class RunDistribution:
     raw_model_total: float | None   # absolute build (for the divergence guard)
     expected_total: float | None    # market-recentered E[T] (distribution mean)
     anchor_mean: float | None = None  # market-implied MEAN (zero-tilt reference)
+    tilt: float | None = None       # clamped raw-vs-anchor shift actually applied
     variance: float | None = None
     p_over: float | None = None
     p_under: float | None = None
@@ -189,7 +190,7 @@ def run_distribution(home_tp, away_tp, home_pp, away_pp, market_total,
 
     return RunDistribution(
         market_total=line, raw_model_total=raw, expected_total=round(model_mean, 2),
-        anchor_mean=round(anchor_mean, 2),
+        anchor_mean=round(anchor_mean, 2), tilt=round(tilt, 2),
         variance=round(_variance_for(model_mean, tcfg), 2),
         p_over=round(p_over, 4), p_under=round(p_under, 4), p_push=round(p_push, 4),
         home_runs=er["home_rs"], away_runs=er["away_rs"], components=er["components"],

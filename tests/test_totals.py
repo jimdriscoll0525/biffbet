@@ -409,6 +409,64 @@ def test_totals_performance_record_counts_pushes_separately():
         pass
 
 
+# --- production-card fixture: mean provenance + weather-applied-once ---------
+def test_card_fixture_mean_provenance_and_weather_applied_once():
+    """Regression fixture from the PHI card audited 2026-07-16 (line 9.5,
+    market P(over) 50.5%). Pins the pipeline order of operations so the site's
+    run breakdown always reconciles:
+
+      * park + weather are applied INSIDE the per-team runs (exactly once) --
+        the breakdown's multiplier rows are display-only;
+      * the distribution mean is anchor_mean + clamped tilt, NOT
+        sum(runs) x park x weather (the '8.57 x 1.02 = 8.7' reading of this
+        card was a numerical coincidence);
+      * variance scales off the FINAL mean.
+    """
+    cfg = _cfg()
+    tcfg = cfg["totals"]
+
+    home_tp = _team(wrc=94.0, bp=4.52, pf=102.0)
+    away_tp = _team(wrc=90.0, bp=4.08, pf=100.0)
+    home_pp = _pitcher(xfip=4.08, ip=106.0, gs=20)   # 5.3 ip/start exactly
+    away_pp = _pitcher(xfip=4.26, ip=106.0, gs=20)
+
+    class _Weather:
+        multiplier, note, available = 0.961, "28C, wind 10km/h in 9", True
+
+    er = RD.expected_runs(home_tp, away_tp, home_pp, away_pp, _Weather(), cfg)
+    # Per-team runs already include park (x1.020) AND weather (x0.961).
+    assert approx(er["home_rs"], 4.34, tol=0.01)
+    assert approx(er["away_rs"], 4.23, tol=0.01)
+    assert approx(er["raw_total"], 8.57, tol=0.02)
+    # Weather applied exactly once: removing it rescales raw by the multiplier.
+    er_nw = RD.expected_runs(home_tp, away_tp, home_pp, away_pp, None, cfg)
+    assert approx(er["raw_total"] / er_nw["raw_total"], 0.961, tol=0.002)
+
+    rd = RD.run_distribution(home_tp, away_tp, home_pp, away_pp, 9.5, 0.505,
+                             _Weather(), cfg)
+    # Mean provenance: anchor 10.23 (market-implied MEAN, above the line by the
+    # NB right-skew), raw-anchor = -1.66 clamped to -1.50, mean 8.73.
+    assert approx(rd.anchor_mean, 10.23, tol=0.02)
+    assert approx(rd.tilt, -float(tcfg["max_tilt_runs"]), tol=1e-9)  # clamp engaged
+    assert approx(rd.expected_total, 8.73, tol=0.02)
+    assert approx(rd.expected_total, rd.anchor_mean + rd.tilt, tol=0.011)
+    # Variance is scaled off the FINAL mean, consistently with the config ratio.
+    ratio = tcfg["league"]["total_variance"] / tcfg["league"]["avg_total"]
+    assert approx(rd.variance, rd.expected_total * ratio, tol=0.02)
+    assert approx(rd.variance, 21.81, tol=0.05)
+    assert approx(rd.p_over, 0.380, tol=0.005)
+
+    # The reasoning JSON must carry the provenance fields the site renders.
+    from mlb_value_bot.pipeline_totals import TotalsAnalysis
+    a = TotalsAnalysis(game_id=1, game_date="2026-07-15", home_team="H",
+                       away_team="A", status="S", home_pitcher=None,
+                       away_pitcher=None, rd=rd)
+    r = a.reasoning()["run_distribution"]
+    assert approx(r["anchor_mean"], rd.anchor_mean, tol=1e-9)
+    assert approx(r["tilt"], rd.tilt, tol=1e-9)
+    assert approx(r["expected_total"], rd.expected_total, tol=1e-9)
+
+
 def _run_all():
     import inspect
     import sys
