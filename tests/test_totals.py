@@ -467,6 +467,38 @@ def test_card_fixture_mean_provenance_and_weather_applied_once():
     assert approx(r["expected_total"], rd.expected_total, tol=1e-9)
 
 
+# --- results CLI: totals must grade even when the ML ledger is settled -------
+def test_results_grades_totals_even_with_no_open_ml_dates():
+    """2026-07-17 production bug: `results` early-returned when the MONEYLINE
+    sweep found no open dates, so the TOTALS sweep below it never ran and a
+    pending totals pick (PHI U9.5 on 7/16) sat ungraded through five
+    successful pipeline runs while the ML ledger happened to be fully settled.
+    """
+    from click.testing import CliRunner
+    from mlb_value_bot import cli as cli_mod
+    from mlb_value_bot.tracking import results as results_mod
+
+    called = {"totals": False}
+    orig_ml = results_mod.grade_all_open
+    orig_totals = results_mod.grade_all_open_totals
+    results_mod.grade_all_open = lambda before, **kw: []          # ML: nothing open
+
+    def _fake_totals(before, **kw):
+        called["totals"] = True
+        return []
+
+    results_mod.grade_all_open_totals = _fake_totals
+    try:
+        result = CliRunner().invoke(cli_mod.cli, ["results"])
+        assert result.exit_code == 0, result.output
+        assert called["totals"], (
+            "totals sweep must run even when no moneyline bets are open"
+        )
+    finally:
+        results_mod.grade_all_open = orig_ml
+        results_mod.grade_all_open_totals = orig_totals
+
+
 def _run_all():
     import inspect
     import sys

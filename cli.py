@@ -390,8 +390,10 @@ def results(date_: str | None) -> None:
     else:
         summaries = results_mod.grade_all_open(before=date.today().isoformat())
         if not summaries:
-            console.print("[dim]No past dates with open bets.[/]")
-            return
+            # No early return: the TOTALS sweep below must still run. An early
+            # return here (fixed 2026-07-17) left pending totals picks ungraded
+            # whenever the moneyline ledger happened to be fully settled.
+            console.print("[dim]No past dates with open moneyline bets.[/]")
 
     for summary in summaries:
         table = Table(title=f"Results — {summary.date}", header_style="bold cyan")
