@@ -79,19 +79,57 @@ class WeatherEnv:
     note: str
 
 
-def _fetch_open_meteo(lat: float, lon: float, timeout: float) -> dict | None:
-    try:
-        import requests
+class _OpenMeteoTransient(Exception):
+    """Server-side flake (5xx / 429) worth retrying."""
+
+
+def _get_open_meteo(lat: float, lon: float, timeout: float):
+    """One GET, wrapped in the same tenacity pattern as the other API clients.
+
+    2026-07-19: six of sixteen parks failed the single un-retried fetch in one
+    run, holding an otherwise-qualified totals pick to analysis-only. Retrying
+    transient failures (connection/timeout/5xx/429) recovers most of these.
+    """
+    import requests
+    from tenacity import (
+        retry,
+        retry_if_exception_type,
+        stop_after_attempt,
+        wait_exponential,
+    )
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=0.5, max=4),
+        retry=retry_if_exception_type(
+            (requests.ConnectionError, requests.Timeout, _OpenMeteoTransient)
+        ),
+    )
+    def _get():
         resp = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={"latitude": lat, "longitude": lon,
                     "current": "temperature_2m,wind_speed_10m,wind_direction_10m"},
             timeout=timeout,
         )
+        if resp.status_code == 429 or resp.status_code >= 500:
+            raise _OpenMeteoTransient(f"open-meteo HTTP {resp.status_code}")
+        return resp
+
+    return _get()
+
+
+def _fetch_open_meteo(lat: float, lon: float, timeout: float) -> dict | None:
+    try:
+        resp = _get_open_meteo(lat, lon, timeout)
         if resp.status_code < 300:
             return resp.json().get("current", {})
+        log.warning("open-meteo fetch failed (HTTP %s)", resp.status_code)
     except Exception as exc:  # noqa: BLE001
-        log.debug("open-meteo fetch failed (%s)", exc)
+        # WARNING (not debug): an exhausted retry here holds a totals pick to
+        # analysis-only, so it must be visible in the pipeline logs.
+        log.warning("open-meteo fetch failed after retries (%s)", exc)
     return None
 
 

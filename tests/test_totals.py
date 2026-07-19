@@ -467,6 +467,48 @@ def test_card_fixture_mean_provenance_and_weather_applied_once():
     assert approx(r["expected_total"], rd.expected_total, tol=1e-9)
 
 
+# --- weather fetch: transient failures retry instead of holding the pick -----
+def test_weather_fetch_retries_transient_failures():
+    """2026-07-19: six of sixteen parks failed the single un-retried
+    Open-Meteo fetch in one run, holding a qualified totals pick to
+    analysis-only. Two connection flakes must now recover on retry."""
+    import requests
+
+    calls = {"n": 0}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"current": {"temperature_2m": 25.0, "wind_speed_10m": 5.0,
+                                "wind_direction_10m": 100.0}}
+
+    def flaky_get(url, params=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise requests.ConnectionError("transient")
+        return _Resp()
+
+    orig = requests.get
+    requests.get = flaky_get
+    try:
+        cur = WX._fetch_open_meteo(39.9, -75.2, 2.0)
+    finally:
+        requests.get = orig
+    assert calls["n"] == 3
+    assert cur is not None and cur["temperature_2m"] == 25.0
+
+    # A hard failure (all attempts exhausted) still degrades to None, never raises.
+    def dead_get(url, params=None, timeout=None):
+        raise requests.ConnectionError("down")
+
+    requests.get = dead_get
+    try:
+        assert WX._fetch_open_meteo(39.9, -75.2, 2.0) is None
+    finally:
+        requests.get = orig
+
+
 # --- results CLI: totals must grade even when the ML ledger is settled -------
 def test_results_grades_totals_even_with_no_open_ml_dates():
     """2026-07-17 production bug: `results` early-returned when the MONEYLINE
