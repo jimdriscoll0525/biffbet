@@ -124,7 +124,14 @@ def _fetch_open_meteo(lat: float, lon: float, timeout: float) -> dict | None:
     try:
         resp = _get_open_meteo(lat, lon, timeout)
         if resp.status_code < 300:
-            return resp.json().get("current", {})
+            cur = resp.json().get("current", {})
+            if not cur or cur.get("temperature_2m") is None:
+                # 200 with an empty/partial body: the one failure mode that was
+                # fully silent (no HTTP error, no exception). Log the body so
+                # CI-only failures are diagnosable from the pipeline logs.
+                log.warning("open-meteo HTTP %s but no current weather (body: %.200s)",
+                            resp.status_code, resp.text)
+            return cur
         log.warning("open-meteo fetch failed (HTTP %s)", resp.status_code)
     except Exception as exc:  # noqa: BLE001
         # WARNING (not debug): an exhausted retry here holds a totals pick to
