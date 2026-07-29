@@ -490,6 +490,45 @@ def test_match_odds_picks_correct_day_in_a_series():
     assert _match_odds(sched, []) is None
 
 
+def test_match_odds_separates_doubleheader_games():
+    """Regression: 2026-07-28 CLE@CIN split doubleheader.
+
+    Both games share the team pair AND the date, so the old date-level
+    reference matched BOTH scheduled games to whichever event sat closer to
+    21:00 UTC — game 1 (true line -166) was priced and graded at game 2's +112.
+    With `game_datetime` present, each game must claim its own event, and a
+    game whose own event is missing must be skipped, not given its partner's.
+    """
+    from types import SimpleNamespace
+    from mlb_value_bot.pipeline import _match_odds
+    from mlb_value_bot.data.odds_client import GameOdds
+
+    game1 = SimpleNamespace(
+        home_team="Cincinnati Reds", away_team="Cleveland Guardians",
+        game_date="2026-07-28", game_datetime="2026-07-28T17:40:00Z",
+    )
+    game2 = SimpleNamespace(
+        home_team="Cincinnati Reds", away_team="Cleveland Guardians",
+        game_date="2026-07-28", game_datetime="2026-07-28T23:10:00Z",
+    )
+    ev1 = GameOdds(event_id="dh-game1", commence_time="2026-07-28T17:40:00Z",
+                   home_team="Cincinnati Reds", away_team="Cleveland Guardians")
+    ev2 = GameOdds(event_id="dh-game2", commence_time="2026-07-28T23:10:00Z",
+                   home_team="Cincinnati Reds", away_team="Cleveland Guardians")
+
+    # Each scheduled game pairs with its own event, order-independent.
+    assert _match_odds(game1, [ev2, ev1]).event_id == "dh-game1"
+    assert _match_odds(game2, [ev2, ev1]).event_id == "dh-game2"
+    # Only the partner game's event listed -> skip (no odds), never its line.
+    assert _match_odds(game1, [ev2]) is None
+    assert _match_odds(game2, [ev1]) is None
+    # A single game with a known first pitch still matches a slightly-off
+    # commence time (books sometimes drift by minutes).
+    near = GameOdds(event_id="near", commence_time="2026-07-28T17:45:00Z",
+                    home_team="Cincinnati Reds", away_team="Cleveland Guardians")
+    assert _match_odds(game1, [near]).event_id == "near"
+
+
 # --- Projected score (run-environment display, 2026-05-28) -----------------
 def test_projected_score_basic():
     """Ace pitcher reduces opposing team's projected runs."""

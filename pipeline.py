@@ -277,26 +277,46 @@ def _odds_by_team(game: GameOdds) -> dict[str, int]:
 
 
 def _match_odds(scheduled: ScheduledGame, odds: list[GameOdds]) -> GameOdds | None:
-    """Match a scheduled game to its odds by team pair AND date.
+    """Match a scheduled game to its odds by team pair AND start time.
 
     The Odds API returns every upcoming event, so a multi-day series has several
     events sharing the same team pair. Matching on the pair alone (the old bug)
-    grabbed whichever appeared first — often the WRONG day's line. We pick the
-    event whose start is on the game date, and if the only candidates fall on
-    other days we return None (skip) rather than publish a misleading line.
+    grabbed whichever appeared first — often the WRONG day's line.
+
+    When the schedule carries the actual first pitch (`game_datetime`) we anchor
+    on it with a TIGHT window: both games of a doubleheader share the team pair
+    AND the date, so the previous date-level reference (21:00 UTC) matched both
+    scheduled games to whichever single event sat closer to mid-slate — the
+    2026-07-28 CLE@CIN twin bill priced (and graded) game 1 at game 2's +112
+    line when the true line was -166. Split-DH starts are ≥4h apart, so a 2.5h
+    window pairs each game with its own event and, if a game's own event isn't
+    listed, skips it rather than publish the partner game's line. Without a
+    known first pitch we fall back to the date-level reference and 12h window.
     """
     target = frozenset({scheduled.home_team, scheduled.away_team})
     candidates = [g for g in odds if frozenset({g.home_team, g.away_team}) == target]
     if not candidates:
         return None
 
-    # Reference ~mid-slate on the game date (21:00 UTC ≈ 5pm ET). Same-day MLB
-    # first pitches land within ~8h of this; the next day's are ~17h+ away, so a
-    # 12h tolerance cleanly separates "today's game" from the rest of the series.
-    try:
-        ref = datetime.fromisoformat(scheduled.game_date).replace(hour=21, tzinfo=timezone.utc)
-    except ValueError:
-        return candidates[0]
+    ref: datetime | None = None
+    tolerance = 12.0
+    first_pitch = getattr(scheduled, "game_datetime", None)
+    if first_pitch:
+        try:
+            ref = datetime.fromisoformat(str(first_pitch).replace("Z", "+00:00"))
+            if ref.tzinfo is None:
+                ref = ref.replace(tzinfo=timezone.utc)
+            tolerance = 2.5
+        except ValueError:
+            ref = None
+    if ref is None:
+        # Reference ~mid-slate on the game date (21:00 UTC ≈ 5pm ET). Same-day
+        # MLB first pitches land within ~8h of this; the next day's are ~17h+
+        # away, so 12h cleanly separates "today's game" from the series.
+        try:
+            ref = datetime.fromisoformat(scheduled.game_date).replace(hour=21, tzinfo=timezone.utc)
+        except ValueError:
+            return candidates[0]
 
     def _hours_off(g: GameOdds) -> float:
         try:
@@ -308,7 +328,7 @@ def _match_odds(scheduled: ScheduledGame, odds: list[GameOdds]) -> GameOdds | No
         return abs((dt - ref).total_seconds()) / 3600.0
 
     best = min(candidates, key=_hours_off)
-    return best if _hours_off(best) <= 12.0 else None
+    return best if _hours_off(best) <= tolerance else None
 
 
 def evaluate_game(
