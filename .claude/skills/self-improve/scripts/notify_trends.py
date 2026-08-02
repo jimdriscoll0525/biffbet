@@ -87,6 +87,45 @@ def _fmt_candidate(c: dict) -> str:
     )
 
 
+# Display pool name (report["pools"] keys) -> (slug, is_pass_pool).
+_POOL_SLUGS = {
+    "Moneyline — settled bets": ("ml-bets", False),
+    "Moneyline — passed games (counterfactual)": ("ml-passes", True),
+    "Totals (paper) — settled bets": ("totals-bets", False),
+    "Totals (paper) — passed games (counterfactual)": ("totals-passes", True),
+}
+
+
+def _worth_an_eye(report: dict, limit: int = 3) -> list[str]:
+    """Notable cells that did NOT clear the evidence bar — hypotheses only.
+
+    Pass pools: positive-ROI cells with 100+ settled (money left on the
+    table; negative pass cells just mean the engine passed correctly, and
+    the candidates section already covers those). Bet pools: either
+    direction with 25+ settled. Both need |t| >= 1.4.
+    """
+    candidate_cells = {(c["pool"], c["dimension"], c["value"])
+                       for c in report.get("candidates", [])}
+    found = []
+    for pool_name, pool in report.get("pools", {}).items():
+        slug, is_pass = _POOL_SLUGS.get(pool_name, (pool_name, True))
+        min_n = 100 if is_pass else 25
+        for dim, table in pool.get("tables", {}).items():
+            for value, s in table.items():
+                t = s.get("t_stat")
+                if (t is None or abs(t) < 1.4 or s.get("settled", 0) < min_n
+                        or (slug, dim, value) in candidate_cells
+                        or value == "n/a"
+                        or (is_pass and (s.get("flat_roi") or 0) <= 0)):
+                    continue
+                found.append((abs(t), (
+                    f"* {slug} {dim}={value}: {s['wins']}-{s['losses']}, "
+                    f"{s['flat_roi']:+.1%} ROI, t={t} over "
+                    f"{s['settled']} settled")))
+    found.sort(reverse=True)
+    return [line for _, line in found[:limit]]
+
+
 def build_email(report_path: Path, report: dict, ledger: dict) -> tuple[str, str, bool]:
     """Returns (subject, body, actionable)."""
     candidates = report.get("candidates", [])
@@ -136,6 +175,13 @@ def build_email(report_path: Path, report: dict, ledger: dict) -> tuple[str, str
         lines.append("")
     else:
         lines.append("No candidates cleared the evidence bar this run.")
+        lines.append("")
+
+    eye = _worth_an_eye(report)
+    if eye:
+        lines.append("Worth an eye (did NOT clear the bar — hypotheses, "
+                     "not evidence):")
+        lines.extend(eye)
         lines.append("")
 
     if watches:
