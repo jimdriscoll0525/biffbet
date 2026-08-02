@@ -1,0 +1,38 @@
+{
+  "_comment": "Persistent trend/ability memory for the self-improve skill. Managed by .claude/skills/self-improve/SKILL.md — read that before editing. Statuses: watch | proposed | active | rejected | retired | retire-recommended | dropped.",
+  "updated": "2026-08-02",
+  "abilities": [
+    {
+      "key": "ml-passes|odds_bucket=small fav (-101..-149)",
+      "status": "watch",
+      "first_seen": "2026-08-02",
+      "consecutive_hits": 1,
+      "consecutive_misses": 0,
+      "pool": "ml-passes",
+      "dimension": "odds_bucket",
+      "value": "small fav (-101..-149)",
+      "direction": "negative",
+      "notes": "Passed small favorites lose money counterfactually (would-have-bet the final pre-slate snapshot). Pass-pool trend: no CLV, so per SKILL.md it can only ever propose a paper-mode ability. Interpretation if it persists: the engine's pass decisions on small favs are correct — a possible framing is validation of the current threshold rather than a change. Not Bonferroni-significant this run (p=0.0383 raw, 87 cells tested).",
+      "evidence": [
+        {
+          "run_date": "2026-08-02",
+          "report": "storage/retro/retro_report_2026-08-02.json",
+          "rows": 343,
+          "settled": 336,
+          "wins": 167,
+          "losses": 169,
+          "hit_rate": 0.497,
+          "hit_rate_wilson_95": [0.4439, 0.5502],
+          "breakeven_hit_rate": 0.5517,
+          "flat_pl_units": -34.54,
+          "flat_roi": -0.1028,
+          "t_stat": -2.08,
+          "p_value": 0.0383,
+          "bonferroni_significant": false,
+          "clv_agrees": null,
+          "cells_tested": 87
+        }
+      ]
+    }
+  ]
+}
