@@ -30,7 +30,42 @@
           "p_value": 0.0383,
           "bonferroni_significant": false,
           "clv_agrees": null,
-          "cells_tested": 87
+          "cells_tested": 118
+        }
+      ]
+    },
+    {
+      "key": "ml-passes|dispersion_bucket=normal (0.25-0.45pp)",
+      "status": "watch",
+      "first_seen": "2026-08-02",
+      "consecutive_hits": 1,
+      "consecutive_misses": 0,
+      "pool": "ml-passes",
+      "dimension": "dispersion_bucket",
+      "value": "normal (0.25-0.45pp)",
+      "direction": "negative",
+      "notes": "Book-dispersion lens added 2026-08-02. Treated as ONE trend with the corroborating ml-passes|dispersion_bucket=very wide (0.6pp+) cell (26-36, -23.8% ROI, t=-2.06), which also cleared the bar the same run: passes lose counterfactually whenever books disagree by 0.25pp+, and lose harder the wider the disagreement. The flip side is the actual hypothesis of interest: TIGHT-dispersion passes (<0.25pp) were counterfactually +10.3% over 177 settled (t=1.46, did not clear the bar). Mechanism candidate: when books agree tightly, the consensus price is efficient and our best-price EV is honest; when they disagree, the stored EV is inflated by soft-book outliers. Pass pool: no CLV, paper-mode ceiling per SKILL.md. Not Bonferroni-significant (118 cells).",
+      "evidence": [
+        {
+          "run_date": "2026-08-02",
+          "report": "storage/retro/retro_report_2026-08-02.json",
+          "rows": 318,
+          "settled": 314,
+          "wins": 153,
+          "losses": 161,
+          "hit_rate": 0.4873,
+          "hit_rate_wilson_95": [0.4325, 0.5424],
+          "breakeven_hit_rate": 0.5448,
+          "flat_pl_units": -36.249,
+          "flat_roi": -0.1154,
+          "t_stat": -2.2,
+          "p_value": 0.0283,
+          "bonferroni_significant": false,
+          "clv_agrees": null,
+          "cells_tested": 118,
+          "corroborating_cells": [
+            "ml-passes|dispersion_bucket=very wide (0.6pp+): 26-36, flat_roi -0.238, t=-2.06, p=0.044"
+          ]
         }
       ]
     }
