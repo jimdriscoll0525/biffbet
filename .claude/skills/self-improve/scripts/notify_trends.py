@@ -96,6 +96,21 @@ def build_email(report_path: Path, report: dict, ledger: dict) -> tuple[str, str
                if a.get("status") == "watch"]
 
     lines: list[str] = []
+    # The one-line answer first: is anything worth changing the algo, or not?
+    if waiting:
+        lines.append(f"Jim — YES: {len(waiting)} trend(s) have proven out and "
+                     "are waiting on your approval to change the algo. "
+                     "Details below.")
+    elif candidates:
+        lines.append(f"Jim — no winning trend worth changing the algo for "
+                     f"yet. {len(candidates)} pattern(s) cleared this week's "
+                     "screen and are being watched; a trend only earns a "
+                     "proposal after proving out 2+ weeks in a row.")
+    else:
+        lines.append("Jim — no winning trend worth changing the algo for. "
+                     "Nothing cleared the screen this week; the engine runs "
+                     "unchanged.")
+    lines.append("")
     lines.append(f"BiffBet weekly retro — {report.get('run_date')}")
     lines.append(f"Report: {report_path}")
     rc = report.get("row_counts", {})
