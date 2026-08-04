@@ -6,20 +6,35 @@
 #
 # Monday 9am ET: Sunday's slate has settled and graded overnight, so the
 # week's data is complete when this fires.
+#
+# NOTE: this file must stay ASCII-only. The scheduled task runs it under
+# Windows PowerShell 5.1, which reads a BOM-less file as ANSI - a single
+# em dash or curly quote corrupts into a string terminator and the whole
+# script dies at parse time (exit 1, nothing logged). That exact bug ate
+# the 2026-08-03 run.
 
 $repo = "C:\Users\jim\mlb_value_bot"
 Set-Location $repo
 
+# 0. Refresh the local SQLite from Supabase (production source of truth).
+#    The engine runs in GitHub Actions and writes to Supabase; without this
+#    pull the retro mines a stale local copy. `-m mlb_value_bot` resolves the
+#    package only from the repo's PARENT directory (the repo folder IS the
+#    package), hence PYTHONPATH.
+$env:PYTHONPATH = Split-Path $repo
+& "$repo\.venv\Scripts\python.exe" -m mlb_value_bot pull `
+    *> "$repo\storage\retro\last_run.log"
+
 # 1. Deterministic data collection (read-only; caches pass grades).
 & "$repo\.venv\Scripts\python.exe" "$repo\.claude\skills\self-improve\scripts\retro_analysis.py" `
-    *> "$repo\storage\retro\last_run.log"
+    *>> "$repo\storage\retro\last_run.log"
 
 # 2. Interpretation + ledger update via Claude Code (headless).
 #    Comment this block out if you prefer to run /self-improve manually
 #    after reviewing storage\retro\retro_report_<date>.md yourself.
 $claude = Get-Command claude -ErrorAction SilentlyContinue
 if ($claude) {
-    & claude -p "/self-improve — the retro script already ran; start from step 2 (reconcile the newest storage/retro report against docs/abilities/ledger.json). Remember: propose only, never implement." `
+    & claude -p "/self-improve - the retro script already ran; start from step 2 (reconcile the newest storage/retro report against docs/abilities/ledger.json). Remember: propose only, never implement." `
         --permission-mode acceptEdits `
         *>> "$repo\storage\retro\last_run.log"
 } else {

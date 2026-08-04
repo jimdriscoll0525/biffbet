@@ -1,18 +1,18 @@
 {
   "_comment": "Persistent trend/ability memory for the self-improve skill. Managed by .claude/skills/self-improve/SKILL.md — read that before editing. Statuses: watch | proposed | active | rejected | retired | retire-recommended | dropped.",
-  "updated": "2026-08-02",
+  "updated": "2026-08-04",
   "abilities": [
     {
       "key": "ml-passes|odds_bucket=small fav (-101..-149)",
       "status": "watch",
       "first_seen": "2026-08-02",
-      "consecutive_hits": 1,
-      "consecutive_misses": 0,
+      "consecutive_hits": 0,
+      "consecutive_misses": 1,
       "pool": "ml-passes",
       "dimension": "odds_bucket",
       "value": "small fav (-101..-149)",
       "direction": "negative",
-      "notes": "Passed small favorites lose money counterfactually (would-have-bet the final pre-slate snapshot). Pass-pool trend: no CLV, so per SKILL.md it can only ever propose a paper-mode ability. Interpretation if it persists: the engine's pass decisions on small favs are correct — a possible framing is validation of the current threshold rather than a change. Not Bonferroni-significant this run (p=0.0383 raw, 87 cells tested).",
+      "notes": "Passed small favorites lose money counterfactually (would-have-bet the final pre-slate snapshot). Pass-pool trend: no CLV, so per SKILL.md it can only ever propose a paper-mode ability. Interpretation if it persists: the engine's pass decisions on small favs are correct — a possible framing is validation of the current threshold rather than a change. 2026-08-04 (data refreshed through 08-03 via Supabase pull): FELL BELOW the bar on grown N — 180-178 over 358 settled, flat ROI -9.3%, t=-1.94 vs the 2.0 bar. Near-miss, so consecutive_misses=1 per the reconcile rules; drops at 2. The earlier stale-data 08-04 rerun (byte-identical to 08-02) is kept below for the audit trail and never counted toward persistence.",
       "evidence": [
         {
           "run_date": "2026-08-02",
@@ -31,6 +31,12 @@
           "bonferroni_significant": false,
           "clv_agrees": null,
           "cells_tested": 118
+        },
+        {
+          "run_date": "2026-08-04",
+          "report": "storage/retro/retro_report_2026-08-04.json (superseded stale-data run of same date)",
+          "counts_toward_persistence": false,
+          "note": "First 08-04 run mined a stale DB (identical stats to 08-02). After the Supabase pull was fixed the same day, the regenerated report shows this cell BELOW the bar: 180-178 / 358 settled, flat_roi -0.0928, t=-1.94. Recorded as a miss."
         }
       ]
     },
@@ -38,13 +44,13 @@
       "key": "ml-passes|dispersion_bucket=normal (0.25-0.45pp)",
       "status": "watch",
       "first_seen": "2026-08-02",
-      "consecutive_hits": 1,
+      "consecutive_hits": 2,
       "consecutive_misses": 0,
       "pool": "ml-passes",
       "dimension": "dispersion_bucket",
       "value": "normal (0.25-0.45pp)",
       "direction": "negative",
-      "notes": "Book-dispersion lens added 2026-08-02. Treated as ONE trend with the corroborating ml-passes|dispersion_bucket=very wide (0.6pp+) cell (26-36, -23.8% ROI, t=-2.06), which also cleared the bar the same run: passes lose counterfactually whenever books disagree by 0.25pp+, and lose harder the wider the disagreement. The flip side is the actual hypothesis of interest: TIGHT-dispersion passes (<0.25pp) were counterfactually +10.3% over 177 settled (t=1.46, did not clear the bar). Mechanism candidate: when books agree tightly, the consensus price is efficient and our best-price EV is honest; when they disagree, the stored EV is inflated by soft-book outliers. Pass pool: no CLV, paper-mode ceiling per SKILL.md. Not Bonferroni-significant (118 cells).",
+      "notes": "Book-dispersion lens added 2026-08-02. Passes lose counterfactually when books disagree by 0.25pp+; mechanism candidate: best-price EV is inflated by soft-book outliers when books disagree, honest when they agree. Pass pool: no CLV, paper-mode ceiling per SKILL.md. 2026-08-04 (fresh data through 08-03): cleared the bar AGAIN on grown N (314 -> 347 settled, t strengthened -2.2 -> -2.29) — consecutive_hits=2. Promotion still blocked: bonferroni_significant=false in both runs (118/120 cells), and the 08-02->08-04 gap is 2 days, so treat next Monday's scheduled run as the true consecutive-weekly test. Related cells moved AGAINST the story on fresh data, keep honest: very-wide (0.6pp+) softened below the bar (28-35, -19.2%, t=-1.66), and the tight-dispersion flip-side hypothesis weakened (was 105-72 +10.3% t=1.46; now 112-82 +7.0% t=1.04 — the new week went 7-10). Bet-pool tension from the 08-04 stale-run reconcile also stands: very-wide-dispersion BETS were the engine's best segment (10-3, +41.8%, n=13), so the framing stays pass-side EV inflation, never blanket dispersion suppression.",
       "evidence": [
         {
           "run_date": "2026-08-02",
@@ -66,6 +72,57 @@
           "corroborating_cells": [
             "ml-passes|dispersion_bucket=very wide (0.6pp+): 26-36, flat_roi -0.238, t=-2.06, p=0.044"
           ]
+        },
+        {
+          "run_date": "2026-08-04",
+          "report": "storage/retro/retro_report_2026-08-04.json",
+          "rows": 361,
+          "settled": 347,
+          "wins": 169,
+          "losses": 178,
+          "hit_rate": 0.487,
+          "hit_rate_wilson_95": [0.4349, 0.5395],
+          "breakeven_hit_rate": 0.5453,
+          "flat_pl_units": -39.735,
+          "flat_roi": -0.1145,
+          "t_stat": -2.29,
+          "p_value": 0.0225,
+          "bonferroni_significant": false,
+          "clv_agrees": null,
+          "cells_tested": 120,
+          "note": "Data refreshed through 08-03 (Supabase pull). Very-wide corroborating cell softened below the bar this run (t=-1.66)."
+        }
+      ]
+    },
+    {
+      "key": "totals-passes|tilt_bucket=mild over (0.25..0.75)",
+      "status": "watch",
+      "first_seen": "2026-08-04",
+      "consecutive_hits": 1,
+      "consecutive_misses": 0,
+      "pool": "totals-passes",
+      "dimension": "tilt_bucket",
+      "value": "mild over (0.25..0.75)",
+      "direction": "negative",
+      "notes": "Totals tilt lens added 2026-08-02 (tilt provenance only stored since the 2026-07 commit, so the sample is recent-games-only by construction). Passed totals where the model tilted mildly OVER the market mean went 16-30 counterfactually — consistent with the totals model's known historical over-bias (tilt bug fixed 2026-07-02): a mild over-tilt that still fails the EV bar looks like residual over-lean, and the engine is right to pass. Small N (46 settled), pass pool (no CLV, paper-mode ceiling), not Bonferroni-significant. If it persists, likelier a validation/monitoring story than a change.",
+      "evidence": [
+        {
+          "run_date": "2026-08-04",
+          "report": "storage/retro/retro_report_2026-08-04.json",
+          "rows": 56,
+          "settled": 46,
+          "wins": 16,
+          "losses": 30,
+          "hit_rate": 0.3478,
+          "hit_rate_wilson_95": [0.2268, 0.4923],
+          "breakeven_hit_rate": 0.5191,
+          "flat_pl_units": -14.875,
+          "flat_roi": -0.3234,
+          "t_stat": -2.34,
+          "p_value": 0.0238,
+          "bonferroni_significant": false,
+          "clv_agrees": null,
+          "cells_tested": 120
         }
       ]
     }
