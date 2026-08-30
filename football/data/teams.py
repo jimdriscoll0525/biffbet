@@ -67,7 +67,7 @@ CFB_NAME_OVERRIDES: dict[str, str] = {
     "UTSA Roadrunners": "UT San Antonio",
     "UTEP Miners": "UTEP",
     "UNLV Rebels": "UNLV",
-    "UMass Minutemen": "UMass",
+    "UMass Minutemen": "Massachusetts",   # CFBD renamed UMass -> Massachusetts (2026)
     "UConn Huskies": "Connecticut",
     "Appalachian State Mountaineers": "App State",
     "Southern Miss Golden Eagles": "Southern Miss",
@@ -76,6 +76,10 @@ CFB_NAME_OVERRIDES: dict[str, str] = {
     "San Jose State Spartans": "San José State",
     "Army Black Knights": "Army",
     "Navy Midshipmen": "Navy",
+    # 2026-08-30: names the mascot-constrained prefix rule can no longer
+    # resolve (the Odds API display name is not "<CFBD school> <mascot>").
+    "Sam Houston State Bearkats": "Sam Houston",
+    "Southern Mississippi Golden Eagles": "Southern Miss",
 }
 
 
@@ -96,8 +100,10 @@ def build_cfb_matcher(school_mascots: list[tuple[str, str | None]]):
     """
     by_full: dict[str, str] = {}
     by_school: dict[str, str] = {}
+    mascot_of: dict[str, str | None] = {}
     for school, mascot in school_mascots:
         by_school[_clean(school)] = school
+        mascot_of[school] = _clean(mascot) if mascot else None
         if mascot:
             by_full[_clean(f"{school} {mascot}")] = school
 
@@ -114,10 +120,22 @@ def build_cfb_matcher(school_mascots: list[tuple[str, str | None]]):
         if c in by_school:
             return by_school[c]
         # Longest school name that prefixes the display name ("Ohio State
-        # Buckeyes" -> "ohio state"). Longest-first prevents "Ohio" stealing it.
+        # Buckeyes" -> "ohio state"). Longest-first prevents "Ohio" stealing
+        # it. The remainder must be that school's OWN mascot (2026-08-30):
+        # an unconstrained prefix resolved FCS visitors to FBS hosts —
+        # "Tennessee State Tigers" -> Tennessee, "North Carolina A&T Aggies"
+        # -> North Carolina, "Utah Tech Trailblazers" -> Utah — and priced
+        # Georgia vs Tennessee State as Georgia vs Tennessee. When CFBD has
+        # no mascot for the school the old prefix rule still applies.
         for cleaned, school in schools_cleaned:
-            if c.startswith(cleaned + " ") or c == cleaned:
+            if c == cleaned:
                 return school
+            if c.startswith(cleaned + " "):
+                remainder = c[len(cleaned) + 1:]
+                mascot = mascot_of.get(school)
+                if mascot is None or remainder == mascot:
+                    return school
+                return None   # "<school> <something else>" is a different school
         return None
 
     return normalize_cfb

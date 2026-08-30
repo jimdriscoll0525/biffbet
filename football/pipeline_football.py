@@ -282,18 +282,38 @@ def _evaluate_market(ctx: LeagueContext, scored: ScoredGame, view, projection,
     sigma = float(pcfg.get(f"{league}_total_sigma" if is_total else f"{league}_margin_sigma",
                            10.0 if is_total else 13.2))
 
+    # Divergence guards are league-keyed when a `<key>_<league>` override
+    # exists (CFB scoring runs ~25% higher and its margin sigma is 16 vs
+    # 13.2, so the same point gap is a smaller model/market disagreement).
     if is_total:
         p_a_model, p_push, _ = total_probabilities(projection.total, view.line, sigma)
-        model_mu, divergence_guard = projection.total, float(pcfg.get("max_total_divergence_pts", 6.0))
+        model_mu = projection.total
+        divergence_guard = float(pcfg.get(f"max_total_divergence_pts_{league}",
+                                          pcfg.get("max_total_divergence_pts", 6.0)))
     else:
         p_a_model, p_push, _ = cover_probabilities(projection.margin, view.line, sigma)
-        model_mu, divergence_guard = projection.margin, float(pcfg.get("max_spread_divergence_pts", 4.5))
+        model_mu = projection.margin
+        divergence_guard = float(pcfg.get(f"max_spread_divergence_pts_{league}",
+                                          pcfg.get("max_spread_divergence_pts", 4.5)))
 
     hold_reason = None
     divergence = abs(model_mu - view.anchor_mean) if view.anchor_mean is not None else None
     if divergence is not None and divergence > divergence_guard:
         hold_reason = (f"divergence guard: model {model_mu:+.1f} vs market mean "
                        f"{view.anchor_mean:+.1f} ({divergence:.1f} > {divergence_guard})")
+
+    # CFB mismatch cap: past this spread magnitude the game is a P4-vs-
+    # bottom-G5 (or FCS-grade) blowout where the normal margin model and the
+    # percentile edges are least trustworthy (starters sit, garbage time
+    # dominates the cover). Held analysis-only; totals on the same game are
+    # capped too because blowout scripts drive the total as much as the margin.
+    max_abs_spread = config.get("college", {}).get("max_abs_spread")
+    ref_spread = view.sharp_line if (not is_total and view.sharp_line is not None) \
+        else (view.line if not is_total else None)
+    if league == "cfb" and max_abs_spread is not None and ref_spread is not None \
+            and abs(ref_spread) > float(max_abs_spread):
+        hold_reason = hold_reason or (f"cfb mismatch cap: |spread| {abs(ref_spread):.1f} "
+                                      f"> {float(max_abs_spread):.1f}")
 
     outdoor_total = is_total and not weather.indoor
     if is_total and outdoor_total and not weather.available \
@@ -428,11 +448,32 @@ def _clean_units(units: dict) -> dict:
             for k, v in units.items() if k.endswith("_pct")}
 
 
-def _match_game_row(ctx: LeagueContext, home: str, away: str) -> pd.Series | None:
+def _match_game_row(ctx: LeagueContext, home: str, away: str,
+                    commence_time: str | None = None,
+                    max_days: float = 2.0) -> pd.Series | None:
+    """The schedule row for this matchup. When a kickoff time is given, the
+    row must kick off within `max_days` of it and the home/away order may
+    be swapped (neutral-site games: the Odds API and CFBD disagree on who
+    is 'home'). Without a kickoff time, falls back to the last exact-order
+    row (legacy behavior; NFL callers)."""
     g = ctx.games
     if g.empty or "home_team" not in g.columns:
         return None
-    hit = g[(g["home_team"] == home) & (g["away_team"] == away)]
+    exact = (g["home_team"] == home) & (g["away_team"] == away)
+    swapped = (g["home_team"] == away) & (g["away_team"] == home)
+    date_col = next((c for c in ("start_date", "date") if c in g.columns), None)
+    if commence_time and date_col is not None:
+        kick = pd.to_datetime(commence_time, utc=True, errors="coerce")
+        starts = pd.to_datetime(g[date_col], utc=True, errors="coerce")
+        if pd.notna(kick):
+            near = (starts - kick).abs() <= pd.Timedelta(days=max_days)
+            for mask in (exact & near, swapped & near):
+                hit = g[mask]
+                if not hit.empty:
+                    gap = (starts[hit.index] - kick).abs()
+                    return hit.loc[gap.idxmin()]
+            return None
+    hit = g[exact]
     if hit.empty:
         return None
     # Nearest upcoming when a matchup repeats (CFB championship rematches).
@@ -473,8 +514,28 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
     q4_pct = percentile_series(ctx.unit_stats["q4_epa"], True) \
         if "q4_epa" in ctx.unit_stats.columns else None
 
+    # Slate horizon: the Odds API lists every game that has a line — for the
+    # NFL that is the whole season in August (272 games on 2026-08-30), for
+    # CFB the current week plus early next-week openers. Only games kicking
+    # off within `slate.max_days_ahead` are priced; a pick made on a game
+    # weeks out would be frozen on stale unit stats and an opening number.
+    max_ahead = config.get("slate", {}).get("max_days_ahead")
+    horizon = None
+    if max_ahead is not None:
+        from datetime import datetime, timedelta, timezone
+        horizon = datetime.now(timezone.utc) + timedelta(days=float(max_ahead))
+
     out: list[FootballGameAnalysis] = []
+    n_beyond = 0
     for game in odds_games:
+        if horizon is not None and game.commence_time:
+            try:
+                kick = datetime.fromisoformat(game.commence_time.replace("Z", "+00:00"))
+            except ValueError:
+                kick = None
+            if kick is not None and kick > horizon:
+                n_beyond += 1
+                continue
         if league == "nfl":
             home = normalize_nfl(game.home_name_raw)
             away = normalize_nfl(game.away_name_raw)
@@ -486,7 +547,16 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
                      game.away_name_raw, game.home_name_raw)
             continue
 
-        row = _match_game_row(ctx, home, away)
+        row = _match_game_row(ctx, home, away, game.commence_time)
+        if row is None and league == "cfb" \
+                and config.get("college", {}).get("require_schedule_match", True):
+            # No CFBD game within 2 days of this kickoff for these two schools
+            # -> the name matcher resolved the wrong program (or CFBD lacks
+            # the game). Never price it: the row would carry an Odds API
+            # event id that grading can't settle, and the matchup is suspect.
+            log.info("cfb: %s @ %s has no CFBD schedule match near %s; skipped",
+                     away, home, game.commence_time[:16])
+            continue
         week = int(row["week"]) if row is not None and "week" in row and pd.notna(row["week"]) else None
         game_id = str(row["game_id"]) if row is not None and "game_id" in row and pd.notna(row.get("game_id")) \
             else (str(row["id"]) if row is not None and "id" in row and pd.notna(row.get("id"))
@@ -559,9 +629,26 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
                     p.hold_reason = "capped: better markets on this game"
 
         out.append(FootballGameAnalysis(
-            league=league, date=game.commence_time[:10], week=week, game_id=game_id,
-            home=home, away=away, commence_time=game.commence_time, picks=picks))
+            league=league, date=_kickoff_date_et(game.commence_time), week=week,
+            game_id=game_id, home=home, away=away,
+            commence_time=game.commence_time, picks=picks))
+    if n_beyond:
+        log.info("%s: %d game(s) beyond the %s-day slate horizon skipped",
+                 league, n_beyond, max_ahead)
     return out
+
+
+def _kickoff_date_et(commence_iso: str) -> str:
+    """Slate date = kickoff date in US Eastern (the site's `todayET`). The
+    UTC date split every 7:30/8pm ET Saturday college game onto Sunday."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    try:
+        kick = datetime.fromisoformat(commence_iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return commence_iso[:10]
+    return kick.astimezone(ZoneInfo("America/New_York")).date().isoformat()
 
 
 def project_game_for(ctx: LeagueContext, scored: ScoredGame, weather,

@@ -126,6 +126,23 @@ college:
   # (a G5 team's 80th-pct rushing offense is not an SEC one's).
   sp_blend: 0.30
   power_conferences: ["SEC", "Big Ten", "Big 12", "ACC", "FBS Independents"]
+  # Mismatch cap (2026-08-30): CFB spreads past this magnitude (sharp line,
+  # else bet-book line) are held analysis-only on BOTH markets. Beyond ~4
+  # touchdowns the game is a P4-vs-bottom-G5 blowout where the normal margin
+  # model and quartile "strong O vs weak D" edges fire trivially and starters
+  # sit in the 4th — the cover is garbage-time noise. FCS opponents never
+  # reach the pipeline at all (the CFBD name matcher drops them). Set null
+  # to disable; revisit once CFB CLV on |spread| 21-28 is measured.
+  max_abs_spread: 28.0
+
+# Slate horizon (2026-08-30): only price games kicking off within this many
+# days. The Odds API lists every game with a posted line (the whole NFL
+# season in August; CFB's next-week openers on Sunday), and a paper pick on a
+# game weeks out is frozen on stale stats and an opening number — it would
+# pollute the record with picks no bettor would place. 8 days = this week's
+# slate plus the following Thursday/Friday openers once posted.
+slate:
+  max_days_ahead: 8
 
 # --- Projections + EV --------------------------------------------------------
 projections:
@@ -136,7 +153,10 @@ projections:
   # phase-weighted EPA/play (offense vs what the opponent allows) times plays,
   # + a red-zone efficiency kicker, + home-field advantage on the margin.
   base_pts_nfl: 22.5
-  base_pts_cfb: 28.5
+  # 2026-08-30: 28.5 -> 26.2. Measured 2025 FBS-vs-FBS scoring (762 completed
+  # CFBD games) = 26.23 pts/team/game; 28.5 projected every total ~4.5 pts
+  # over the market and drove an all-overs slate. Recheck each August.
+  base_pts_cfb: 26.2
   hfa_pts_nfl: 1.5
   hfa_pts_cfb: 2.5
   rz_coef_pts: 8.0                 # pts per unit of red-zone TD-rate edge vs pool avg
@@ -148,11 +168,17 @@ projections:
   # further than the guard from the market are held to analysis-only.
   max_total_divergence_pts: 6.0
   max_spread_divergence_pts: 4.5
+  # CFB overrides (2026-08-30): totals run ~55-65 vs the NFL's ~45 and the
+  # margin sigma is 16 vs 13.2, so the same point gap is a smaller model/
+  # market disagreement. Scaled ~1.3x; the pipeline falls back to the
+  # league-neutral keys above when a `<key>_<league>` override is absent.
+  max_total_divergence_pts_cfb: 6.0   # NOT loosened: totals over-bias is the known failure mode
+  max_spread_divergence_pts_cfb: 6.0
   # Spread/total margin distribution sigma (pts) for cover/over probabilities.
   nfl_margin_sigma: 13.2
   nfl_total_sigma: 10.0
   cfb_margin_sigma: 16.0
-  cfb_total_sigma: 12.5
+  cfb_total_sigma: 14.0   # 2026-08-30: 12.5 -> 14. 2025 FBS total sd 16.3 raw; ~14 residual around the market number
 
 ev:
   devig_method: "power"

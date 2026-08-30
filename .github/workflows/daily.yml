@@ -47,6 +47,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r mlb_value_bot/requirements.txt
 
+      # Persist the parquet TTL cache across runs (2026-08-30). The runner is
+      # ephemeral, so every 3-hourly tick re-fetched the CFBD season pulls
+      # (teams/stats/PPA/SP+/venues/games x 2 seasons) — ~8 calls x 8 runs/day
+      # against a FREE tier of 1,000 calls/MONTH (313 left on Aug 30 after 10
+      # in-season days). With the cache restored, the client's own TTLs apply
+      # (season pulls weekly, games 3h). `key` is unique per run so the cache
+      # is re-saved every time; `restore-keys` picks up the newest prior one.
+      - name: Restore data cache (CFBD / nflverse parquet)
+        uses: actions/cache@v4
+        with:
+          path: mlb_value_bot/storage/cache
+          key: data-cache-${{ github.run_id }}
+          restore-keys: |
+            data-cache-
+
       - name: Run pipeline (pull -> grade -> slate -> sync)
         if: ${{ inputs.scope != 'football' }}
         env:

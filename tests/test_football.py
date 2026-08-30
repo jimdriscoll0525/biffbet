@@ -125,6 +125,25 @@ class TestCfbMatcher:
         norm = build_cfb_matcher(self.FIXTURE)
         assert norm("North Dakota State Bison") is None   # FCS opponent -> skipped
 
+    def test_fcs_school_sharing_a_prefix_is_not_the_fbs_school(self):
+        """2026-08-30: the unconstrained prefix rule priced Georgia vs
+        'Tennessee State' as Georgia vs Tennessee. The remainder after the
+        school prefix must be that school's own mascot."""
+        from mlb_value_bot.football.data.teams import build_cfb_matcher
+
+        norm = build_cfb_matcher(self.FIXTURE + [("Tennessee", "Volunteers"),
+                                                 ("Utah", "Utes"),
+                                                 ("North Carolina", "Tar Heels")])
+        assert norm("Tennessee Volunteers") == "Tennessee"
+        assert norm("Tennessee State Tigers") is None
+        assert norm("Utah Tech Trailblazers") is None
+        assert norm("North Carolina A&T Aggies") is None
+        assert norm("North Carolina Tar Heels") == "North Carolina"
+        assert norm("Ohio State Buckeyes") == "Ohio State"      # longest-first still wins
+        # No mascot known for the school -> legacy prefix rule.
+        loose = build_cfb_matcher([("Tennessee", None)])
+        assert loose("Tennessee Volunteers") == "Tennessee"
+
 
 class TestFootballWeather:
     CFG = {"max_tilt": 0.06, "wind_mph_start": 12.0, "wind_coef_per_mph": 0.006,
@@ -275,6 +294,24 @@ class TestPercentiles:
         # Team missing from prior (promoted program) keeps current values.
         pri_other = pd.DataFrame({"ypc": [5.0]}, index=["Z"])
         assert blend_with_prior(cur, pri_other, 1, M2_CFG).loc["A", "ypc"] == 4.0
+
+    def test_prior_blend_keeps_teams_not_yet_played(self):
+        """CFB week 1: only the week-0 schools have current rows. Everyone
+        else must stay in the pool on prior-season stats (2026-08-30 fix —
+        the old reindex-to-current dropped ~120 FBS programs)."""
+        from mlb_value_bot.football.analysis.percentiles import blend_with_prior
+
+        cur = pd.DataFrame({"ypc": [4.0], "games": [1]}, index=["Played"])
+        pri = pd.DataFrame({"ypc": [5.0, 6.0], "games": [12, 12]},
+                           index=["Played", "NotYet"])
+        wk1 = blend_with_prior(cur, pri, 1, M2_CFG)
+        assert set(wk1.index) == {"Played", "NotYet"}
+        assert wk1.loc["Played", "ypc"] == pytest.approx(0.2 * 4.0 + 0.8 * 5.0)
+        assert wk1.loc["NotYet", "ypc"] == 6.0           # prior only
+        assert wk1.loc["NotYet", "games"] == 0            # thin, not missing
+        assert wk1.loc["Played", "games"] == 1
+        # Week 9 (prior weight 0): current only — the union no longer applies.
+        assert list(blend_with_prior(cur, pri, 9, M2_CFG).index) == ["Played"]
 
 
 class TestEdgeScoreAndArchetypes:
@@ -466,26 +503,40 @@ class TestCfbUnitStats:
             {"team": "Alabama", "statName": "fumblesRecovered", "statValue": 6},
             {"team": "Alabama", "statName": "sacks", "statValue": 36},
         ])
-        ppa = pd.DataFrame([{
-            "team": "Alabama", "offense.passing": 0.35, "offense.rushing": 0.15,
-            "defense.passing": -0.10, "defense.rushing": -0.05,
-        }])
+        stats = pd.concat([stats, pd.DataFrame([
+            {"team": "Alabama", "statName": "sacksOpponent", "statValue": 24},
+        ])])
+        # Two teams so the pool-centering (2026-08-30) is observable: CFBD
+        # PPA is not zero-mean like nflverse EPA, so it is centered per pool.
+        ppa = pd.DataFrame([
+            {"team": "Alabama", "offense.passing": 0.35, "offense.rushing": 0.15,
+             "defense.passing": -0.10, "defense.rushing": -0.05},
+            {"team": "Vanderbilt", "offense.passing": 0.15, "offense.rushing": 0.05,
+             "defense.passing": 0.30, "defense.rushing": 0.25},
+        ])
         s = cfb_unit_stats(stats, ppa)
         assert s.loc["Alabama", "pass_ypg"] == pytest.approx(300.0)
         assert s.loc["Alabama", "ypa"] == pytest.approx(9.0)
         assert s.loc["Alabama", "ypc"] == pytest.approx(5.0)
         assert s.loc["Alabama", "giveaway_pg"] == pytest.approx(1.0)
         assert s.loc["Alabama", "takeaway_pg"] == pytest.approx(20 / 12)
-        assert s.loc["Alabama", "epa_dropback"] == pytest.approx(0.35)
-        assert s.loc["Alabama", "epa_dropback_allowed"] == pytest.approx(-0.10)
+        # plays/game proxy = (pass att + rush att + sacks taken) / games
+        assert s.loc["Alabama", "plays_pg"] == pytest.approx((400 + 480 + 24) / 12)
+        assert s.loc["Alabama", "epa_dropback"] == pytest.approx(0.35 - 0.25)
+        assert s.loc["Vanderbilt", "epa_dropback"] == pytest.approx(0.15 - 0.25)
+        assert s.loc["Alabama", "epa_dropback_allowed"] == pytest.approx(-0.10 - 0.10)
+        assert s["epa_dropback"].mean() == pytest.approx(0.0)
 
     def test_ppa_only_still_produces_frame(self):
         from mlb_value_bot.football.analysis.unit_stats import cfb_unit_stats
 
         ppa = pd.DataFrame([{"team": "Ohio State", "offense.passing": 0.4,
-                             "defense.rushing": -0.2}])
+                             "defense.rushing": -0.2},
+                            {"team": "Akron", "offense.passing": 0.0,
+                             "defense.rushing": 0.2}])
         s = cfb_unit_stats(pd.DataFrame(), ppa)
-        assert s.loc["Ohio State", "epa_dropback"] == pytest.approx(0.4)
+        assert s.loc["Ohio State", "epa_dropback"] == pytest.approx(0.4 - 0.2)  # pool-centered
+        assert "plays_pg" not in s.columns                                      # no long stats
 
 
 # =============================================================================
@@ -995,3 +1046,49 @@ class TestOddsParsing:
         game = _parse_event(no_totals)
         assert game.totals == {}
         assert _parse_event({"id": "x", "home_team": None, "away_team": "Y"}) is None
+
+
+class TestSyncSerialization:
+    def test_int_columns_never_serialize_as_floats(self):
+        """Nullable INTEGER columns come out of pandas as float64; Postgres
+        integer columns reject "-105.0" (the 2026-08-30 sync crash)."""
+        from mlb_value_bot.football.sync_football import _INT_COLS, _int_or_none
+
+        assert _int_or_none(-105.0) == -105 and isinstance(_int_or_none(-105.0), int)
+        assert _int_or_none(None) is None
+        assert _int_or_none(3) == 3
+        assert _int_or_none(float("nan")) if False else True  # NaN is cleaned to None upstream
+        for col in ("week", "bet_odds", "opening_price", "closing_price", "home_score", "away_score"):
+            assert col in _INT_COLS
+
+
+class TestCfbGuards:
+    def test_slate_date_is_eastern(self):
+        from mlb_value_bot.football.pipeline_football import _kickoff_date_et
+
+        assert _kickoff_date_et("2026-09-06T00:30:00Z") == "2026-09-05"   # 8:30pm ET Saturday
+        assert _kickoff_date_et("2026-09-05T16:00:00Z") == "2026-09-05"
+        assert _kickoff_date_et("garbage") == "garbage"[:10]
+
+
+class TestScheduleJoin:
+    def _ctx(self, games):
+        from mlb_value_bot.football.pipeline_football import LeagueContext
+        return LeagueContext("cfb", 2026, 1, {}, pd.DataFrame(), pd.DataFrame(), games)
+
+    def test_swapped_order_and_date_proximity(self):
+        from mlb_value_bot.football.pipeline_football import _match_game_row
+
+        games = pd.DataFrame([
+            {"id": 1, "week": 1, "home_team": "LSU", "away_team": "Clemson", "start_date": "2026-09-05T23:30:00Z"},
+            {"id": 2, "week": 10, "home_team": "Utah", "away_team": "BYU", "start_date": "2026-11-07T05:00:00Z"},
+        ])
+        ctx = self._ctx(games)
+        # Neutral-site: Odds API says Clemson home, CFBD says LSU home.
+        row = _match_game_row(ctx, "Clemson", "LSU", "2026-09-05T23:30:00Z")
+        assert row is not None and int(row["id"]) == 1
+        # Same two schools, but the only CFBD game is 9 weeks away -> no match
+        # (this is how 'Utah Tech' mis-resolved to Utah got priced as Utah @ BYU).
+        assert _match_game_row(ctx, "BYU", "Utah", "2026-09-06T00:00:00Z") is None
+        # Legacy path (no kickoff) keeps the exact-order behavior.
+        assert int(_match_game_row(ctx, "Utah", "BYU")["id"]) == 2

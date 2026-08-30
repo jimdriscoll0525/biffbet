@@ -37,6 +37,26 @@ _PUSH_COLS = [
 ]
 
 
+# Supabase `integer` columns. Nullable INTEGER columns come out of pandas as
+# float64 (NaN for the analysis rows), so opening_price=-105 serialized as
+# -105.0 and PostgREST rejected the whole batch ("invalid input syntax for
+# type integer: -105.0") — every football row was lost on the ephemeral CI
+# box from the moment the 2026 season window opened (fixed 2026-08-30).
+_INT_COLS = ("week", "bet_odds", "opening_price", "closing_price",
+             "home_score", "away_score")
+
+
+def _int_or_none(value):
+    """Coerce a cleaned scalar to int for Postgres integer columns."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, float):
+        return int(round(value))
+    return int(value)
+
+
 def _rec_rows(since: str | None) -> list[dict]:
     df = football_store.to_dataframe(since=since)
     if df.empty:
@@ -44,6 +64,9 @@ def _rec_rows(since: str | None) -> list[dict]:
     rows = []
     for _, r in df.iterrows():
         row = {c: _clean(r[c]) for c in _PUSH_COLS if c in df.columns}
+        for c in _INT_COLS:
+            if c in row:
+                row[c] = _int_or_none(row[c])
         row["paper"] = bool(r["paper"])
         row["is_value"] = bool(r["is_value"])
         raw = r.get("reasoning_json")

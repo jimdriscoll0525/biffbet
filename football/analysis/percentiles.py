@@ -88,12 +88,27 @@ def blend_with_prior(current: pd.DataFrame, prior: pd.DataFrame,
         return current
     if current is None or current.empty:
         return prior
-    blended = current.copy()
+    # UNION of both pools (2026-08-30 fix). College starts staggered: in week
+    # 1 only the ~16 week-0 schools have current-season rows, and reindexing
+    # to `current` silently dropped the other ~120 FBS programs from the
+    # percentile pool ("outside percentile pool" on Ohio State @ Texas).
+    # Teams with no current rows yet run purely on the prior with games=0
+    # (so evaluability/completeness still sees them as thin); teams absent
+    # from the prior (promoted programs) keep current. NFL is unaffected:
+    # all 32 teams enter the current frame in the same week.
+    index = current.index.union(prior.index)
+    cur_aligned = current.reindex(index)
+    pri_aligned = prior.reindex(index)
+    blended = cur_aligned.copy()
+    if "games" in blended.columns:
+        blended["games"] = cur_aligned["games"].fillna(0)
     shared_cols = [c for c in current.columns
                    if c != "games" and c in prior.columns]
-    aligned_prior = prior.reindex(current.index)
     for col in shared_cols:
-        cur, pri = current[col], aligned_prior[col]
+        cur, pri = cur_aligned[col], pri_aligned[col]
         merged = (1.0 - w) * cur + w * pri
-        blended[col] = merged.where(pri.notna(), cur)
+        merged = merged.where(pri.notna(), cur)        # no prior   -> current
+        blended[col] = merged.where(cur.notna(), pri)  # no current -> prior
+    for col in [c for c in prior.columns if c not in blended.columns]:
+        blended[col] = pri_aligned[col]
     return blended

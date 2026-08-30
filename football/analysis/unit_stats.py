@@ -112,6 +112,7 @@ _CFBD_CANDIDATES = {
     "interceptions_made": ["interceptions"],          # CFBD: defensive INTs
     "fumbles_recovered": ["fumblesRecovered"],
     "sacks_made": ["sacks"],                          # CFBD: defensive sacks
+    "sacks_taken": ["sacksOpponent"],                 # CFBD: sacks by the opponent
     "penalty_yards": ["penaltyYards"],
 }
 
@@ -160,6 +161,14 @@ def cfb_unit_stats(stats_long: pd.DataFrame, ppa: pd.DataFrame) -> pd.DataFrame:
             sk = pick("sacks_made")
             if sk is not None:
                 out["sack_rate_made"] = sk / g       # per-game proxy
+            # Pace proxy (2026-08-30): CFBD has no plays stat, so offensive
+            # plays/game = pass attempts + rush attempts + sacks TAKEN
+            # (`sacksOpponent`). Without this the projection had no EPA x
+            # plays term at all and every CFB game projected to league-base
+            # points (a constant total ~57 -> over on every market under it).
+            sk_taken = pick("sacks_taken")
+            if att is not None and ra is not None:
+                out["plays_pg"] = (att + ra + (sk_taken if sk_taken is not None else 0)) / g
 
     if not ppa.empty and "team" in ppa.columns:
         p = ppa.set_index("team")
@@ -170,7 +179,14 @@ def cfb_unit_stats(stats_long: pd.DataFrame, ppa: pd.DataFrame) -> pd.DataFrame:
         cols = {}
         for src, dst in ppa_map.items():
             if src in p.columns:
-                cols[dst] = pd.to_numeric(p[src], errors="coerce")
+                series = pd.to_numeric(p[src], errors="coerce")
+                # CENTER at the pool mean (2026-08-30). nflverse EPA/play is
+                # ~0 on average by construction, so `base + EPA x plays` is a
+                # deviation from league scoring. CFBD PPA is NOT centered
+                # (2025 FBS offense.passing mean +0.26): adding it raw to the
+                # base would add ~+18 pts per team. Percentile ranks and the
+                # opponent-adjusted edge are unchanged by a constant shift.
+                cols[dst] = series - series.mean()
         if cols:
             ppa_frame = pd.DataFrame(cols)
             out = ppa_frame if out.empty else out.join(ppa_frame, how="outer")
