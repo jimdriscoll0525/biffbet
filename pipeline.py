@@ -682,6 +682,8 @@ def _selection_filters(best_side: str, evals: dict, market_intel, config: dict) 
       the entire net loss. (n=11 -- revisit when the sample grows.)
     - require_sharp_coverage: no bet when no sharp book priced the game.
       The "no sharp data" segment was the only one with negative CLV (-0.69%).
+    - min_model_prob: no bet when the blended pick-side probability is below
+      it (ability approved 2026-08-30; 6-18 / -46% on the removed cell).
     """
     fcfg = config.get("filters", {})
     reasons: list[str] = []
@@ -691,6 +693,16 @@ def _selection_filters(best_side: str, evals: dict, market_intel, config: dict) 
     if heavy is not None and price <= float(heavy):
         reasons.append(
             f"filtered: heavy favorite {price:+d} (at or below {int(heavy):+d})"
+        )
+
+    # min_model_prob (ability, 2026-08-30): the blended pick-side probability
+    # must at least favor our side. See config.yaml `filters.min_model_prob`.
+    min_p = fcfg.get("min_model_prob")
+    p_pick = getattr(evals[best_side], "model_prob", None)
+    if min_p is not None and p_pick is not None and float(p_pick) < float(min_p):
+        reasons.append(
+            f"filtered: blend has pick at {float(p_pick) * 100:.0f}% (below min_model_prob "
+            f"{float(min_p) * 100:.0f}%)"
         )
 
     if bool(fcfg.get("require_sharp_coverage", False)):

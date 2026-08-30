@@ -336,6 +336,17 @@ filters:
   # (5-6, -2.57u) was the ONLY segment with negative CLV (-0.69%): without a
   # sharp anchor both the blend and the fade guard fly blind.
   require_sharp_coverage: true
+  # Ability "min-model-prob" (approved 2026-08-30, docs/abilities/proposals/
+  # 2026-08-30-min-model-prob.md). No bet when the BLENDED probability on the
+  # picked side is below this. The blend is 65% market: when even that has our
+  # side losing, the raw EV is a price artifact (a long dog price), not an
+  # edge. Graded evidence: bets with blended p < 0.50 went 6-18, -46% flat
+  # ROI (t=-2.4, n=24) vs 60-52 / -1.9% for the rest; full-book ROI -10.9% ->
+  # -1.9%, August -17.8% -> -5.6%. Filtered games stay on the slate as
+  # analyses (is_value=false) so the weekly retro grades the removed cell.
+  # KILL CRITERIA: retire if after 40 settled post-activation removed games
+  # (counterfactual) their flat ROI is > 0, OR the kept book's avg CLV < 0.
+  min_model_prob: 0.50
 
 kelly:
   fraction: 0.25          # quarter-Kelly

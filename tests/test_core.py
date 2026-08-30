@@ -901,6 +901,26 @@ def test_selection_filters_heavy_favorite_and_sharp_coverage():
     assert _selection_filters("home", _evals(-300), no_sharp, {}) == []
 
 
+def test_selection_filter_min_model_prob():
+    """Ability min-model-prob (2026-08-30): a pick whose BLENDED probability
+    is below filters.min_model_prob is held to analysis-only. Config-gated;
+    absent key = off; evals without model_prob (older shapes) never fire."""
+    from types import SimpleNamespace
+    from mlb_value_bot.pipeline import _selection_filters
+
+    def _evals(odds, p):
+        return {"away": SimpleNamespace(american_odds=odds, model_prob=p)}
+
+    sharp_ok = SimpleNamespace(available=True, sharp_devig_home=0.55)
+    cfg = {"filters": {"min_model_prob": 0.50}}
+    fired = _selection_filters("away", _evals(135, 0.47), sharp_ok, cfg)
+    assert len(fired) == 1 and "min_model_prob" in fired[0] and "47%" in fired[0]
+    assert _selection_filters("away", _evals(135, 0.50), sharp_ok, cfg) == []   # boundary: allowed
+    assert _selection_filters("away", _evals(-120, 0.56), sharp_ok, cfg) == []
+    assert _selection_filters("away", _evals(135, 0.47), sharp_ok, {}) == []    # key absent = off
+    assert _selection_filters("away", {"away": SimpleNamespace(american_odds=135)}, sharp_ok, cfg) == []
+
+
 # --- Bet sizing tiers + Kelly caps (Step 5, 2026-05-30) --------------------
 def test_bet_tier_bands_on_adjusted_ev():
     """Pass/Small/Standard/Strong bands at 2/5/8% on Adjusted EV."""

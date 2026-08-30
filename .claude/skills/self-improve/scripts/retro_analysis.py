@@ -145,6 +145,8 @@ def _filter_reason(reasoning: dict) -> str:
             reasons.add("heavy favorite")
         elif "no sharp book" in f:
             reasons.add("no sharp coverage")
+        elif "min_model_prob" in f:
+            reasons.add("blend below min_model_prob")   # ability, 2026-08-30
         else:
             reasons.add("other")
     return "+".join(sorted(reasons)) if reasons else "none"
