@@ -264,7 +264,8 @@ def _compute_adjusted_ev(raw_ev: float, sharp_gap_side_pp: float | None,
 
 def _evaluate_market(ctx: LeagueContext, scored: ScoredGame, view, projection,
                      weather, g5_involved: bool, explosive_involved: bool,
-                     games_min: float | None) -> FootballPick | None:
+                     games_min: float | None,
+                     qb_hold: str | None = None) -> FootballPick | None:
     """Price one market (spread or total) into a FootballPick, or None when
     the market can't be evaluated at all."""
     from mlb_value_bot.football.analysis import football_stability as stab
@@ -319,6 +320,12 @@ def _evaluate_market(ctx: LeagueContext, scored: ScoredGame, view, projection,
     if is_total and outdoor_total and not weather.available \
             and config.get("weather", {}).get("require_for_bet", True):
         hold_reason = hold_reason or "outdoor total without weather -> analysis-only"
+
+    # QB guard (2026-08-31): the team's primary passer — whose play the unit
+    # stats were earned by — is listed Out/Doubtful/IR. The market repriced;
+    # our season stats didn't. Never model the backup; just don't commit.
+    if qb_hold is not None:
+        hold_reason = hold_reason or f"qb guard: {qb_hold}"
 
     epa_available = any(v is not None for v in
                         (projection.home_detail.epa_pass, projection.home_detail.epa_rush))
@@ -507,6 +514,13 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
         log.warning("%s: no unit stats for season %d; slate skipped", league, season)
         return []
 
+    # QB availability flags (NFL only; one cached ESPN call for the league).
+    qb_flags_map: dict[str, str] = {}
+    qb_note = None
+    if league == "nfl":
+        from mlb_value_bot.football.data.qb_status import compute_flags
+        qb_flags_map, qb_note = compute_flags(season, config)
+
     pcfg = config.get("projections", {})
     pool_rz = float(ctx.unit_stats["rz_td_rate"].mean()) \
         if "rz_td_rate" in ctx.unit_stats.columns else None
@@ -615,9 +629,13 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
                 else market_view(game, "total", config, sigma_t)
             if view is None:
                 continue
+            qb_hold = qb_flags_map.get(home) or qb_flags_map.get(away)
             pick = _evaluate_market(ctx, scored, view, projection, weather,
-                                    g5_involved, explosive_involved, games_min)
+                                    g5_involved, explosive_involved, games_min,
+                                    qb_hold=qb_hold)
             if pick is not None:
+                if qb_hold or qb_note:
+                    pick.reasoning["qb_guard"] = qb_hold or qb_note
                 picks.append(pick)
 
         max_picks = int(config.get("ev", {}).get("max_picks_per_game", 3))

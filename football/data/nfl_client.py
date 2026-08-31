@@ -29,6 +29,11 @@ _PBP_COLS = [
     "sack", "qb_hit", "interception", "fumble_lost",
     "pass_touchdown", "rush_touchdown", "touchdown",
     "yards_gained", "epa", "success", "qtr", "yardline_100",
+    # QB guard (2026-08-31): identifies each team's primary passer so the
+    # guard can hold picks when the QB the stats were earned by is out.
+    # Cached parquets from before this change lack the column until their
+    # TTL refresh; qb_status degrades gracefully in the meantime.
+    "passer_player_name",
 ]
 
 

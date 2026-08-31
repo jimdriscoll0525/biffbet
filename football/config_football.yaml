@@ -230,6 +230,20 @@ weather:
   cold_coef_per_f: 0.004
   timeout: 8
 
+# QB availability guard (2026-08-31; NFL only — the football twin of MLB's
+# scratched-starter guard). One free ESPN injuries call (cached ttl_hours)
+# identifies teams whose PRIMARY passer — the QB who threw the most passes in
+# the pbp our unit stats came from — carries a hold status. New picks on
+# those games are held analysis-only with the reason on the card; committed
+# bets stay frozen (upsert never downgrades). ESPN outage or missing passer
+# data disables the guard for the run with a note, never blocks the slate.
+# Known v1 gap: offseason QB changes (trade/free agency) are invisible here.
+qb_guard:
+  enabled: true
+  ttl_hours: 3
+  timeout: 15
+  hold_statuses: ["Out", "Doubtful", "Injured Reserve", "Physically Unable to Perform"]
+
 variance:
   # Late-game explosiveness (Q4 garbage/comeback scoring) is a VARIANCE
   # adjustment: explosive offenses widen the outcome distribution, which cuts
