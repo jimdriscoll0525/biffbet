@@ -43,8 +43,11 @@ _SUFFIXES = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv", "v"}
        wait=wait_exponential(multiplier=1, min=1, max=8),
        retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)))
 def _fetch_injuries(timeout: float) -> list | dict:
-    resp = requests.get(ESPN_INJURIES_URL, timeout=timeout,
-                        headers={"User-Agent": "biffbet-qb-guard/1.0"})
+    # NO custom User-Agent (2026-08-31): ESPN's edge 403s custom and
+    # browser-imitating UAs from this context but accepts the plain
+    # python-requests default. Verified empirically; do not "fix" this by
+    # adding a browser UA.
+    resp = requests.get(ESPN_INJURIES_URL, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
