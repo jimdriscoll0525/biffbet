@@ -1129,6 +1129,59 @@ class TestCfbGuards:
         assert _kickoff_date_et("garbage") == "garbage"[:10]
 
 
+class TestMarginAnchor:
+    """CFB margin anchor (2026-08-31): power rating + HFA + clamped EPA tilt."""
+    CFG = {"projections": {"base_pts_cfb": 26.2, "hfa_pts_cfb": 2.5,
+                           "margin_tilt_max_cfb": 6.0}}
+    UNITS_STRONG = {"epa_dropback": 0.10, "rush_epa": 0.05, "plays_pg": 70.0,
+                    "epa_dropback_allowed": -0.05, "rush_epa_allowed": -0.02}
+    UNITS_WEAK = {"epa_dropback": -0.10, "rush_epa": -0.05, "plays_pg": 70.0,
+                  "epa_dropback_allowed": 0.05, "rush_epa_allowed": 0.02}
+
+    def test_anchored_margin_is_power_plus_hfa_plus_clamped_tilt(self):
+        from mlb_value_bot.football.analysis.projections import project_game
+
+        plain = project_game(self.UNITS_STRONG, self.UNITS_WEAK, "cfb", self.CFG, 0.6, 0.4)
+        epa_margin = plain.margin - 2.5                      # tilt before clamping
+        anchored = project_game(self.UNITS_STRONG, self.UNITS_WEAK, "cfb", self.CFG,
+                                0.6, 0.4, power_margin=24.0)
+        expected_tilt = max(-6.0, min(6.0, epa_margin))
+        assert anchored.margin == pytest.approx(24.0 + 2.5 + expected_tilt, abs=0.02)
+        assert abs(epa_margin) > 6.0 or expected_tilt == pytest.approx(epa_margin)
+        # Total untouched; displayed points re-derived coherently.
+        assert anchored.total == plain.total
+        assert anchored.home_pts + anchored.away_pts == pytest.approx(anchored.total_raw, abs=0.02)
+        assert anchored.home_pts - anchored.away_pts == pytest.approx(anchored.margin, abs=0.02)
+        assert any("margin anchored" in n for n in anchored.home_detail.notes)
+
+    def test_tilt_clamps_at_max(self):
+        from mlb_value_bot.football.analysis.projections import project_game
+
+        # Enormous EPA gap -> tilt must clamp at +/-6.
+        big = dict(self.UNITS_STRONG, epa_dropback=0.5, rush_epa=0.3)
+        small = dict(self.UNITS_WEAK, epa_dropback=-0.5, rush_epa=-0.3)
+        anchored = project_game(big, small, "cfb", self.CFG, 0.6, 0.4, power_margin=10.0)
+        assert anchored.margin == pytest.approx(10.0 + 2.5 + 6.0, abs=0.02)
+
+    def test_none_power_margin_is_legacy_behavior(self):
+        from mlb_value_bot.football.analysis.projections import project_game
+
+        plain = project_game(self.UNITS_STRONG, self.UNITS_WEAK, "cfb", self.CFG, 0.6, 0.4)
+        assert not any("anchored" in n for n in plain.home_detail.notes)
+
+    def test_power_margin_source_gated_and_elo_converted(self):
+        from mlb_value_bot.football.pipeline_football import _power_margin_for
+
+        row = {"homePregameElo": 1479.0, "awayPregameElo": 978.0}
+        cfg = {"projections": {"margin_anchor_cfb": "elo", "elo_points_per_margin": 23.0}}
+        assert _power_margin_for("cfb", row, cfg) == pytest.approx((1479 - 978) / 23.0)
+        assert _power_margin_for("nfl", row, cfg) is None            # league not enabled
+        assert _power_margin_for("cfb", None, cfg) is None           # no schedule row
+        assert _power_margin_for("cfb", {"homePregameElo": None,
+                                         "awayPregameElo": 900.0}, cfg) is None
+        assert _power_margin_for("cfb", row, {"projections": {}}) is None  # anchor off
+
+
 class TestScheduleJoin:
     def _ctx(self, games):
         from mlb_value_bot.football.pipeline_football import LeagueContext

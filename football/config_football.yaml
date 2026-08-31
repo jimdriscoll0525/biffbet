@@ -174,6 +174,21 @@ projections:
   # league-neutral keys above when a `<key>_<league>` override is absent.
   max_total_divergence_pts_cfb: 6.0   # NOT loosened: totals over-bias is the known failure mode
   max_spread_divergence_pts_cfb: 6.0
+  # CFB margin anchor (approved 2026-08-31, docs/abilities/proposals/
+  # 2026-08-31-cfb-margin-anchor.md). The margin becomes: pregame-Elo diff /
+  # elo_points_per_margin + HFA + the EPA matchup margin clamped to
+  # +/-margin_tilt_max_cfb — anchor + bounded tilt, the totals-model shape.
+  # Why: per-play stats saturate; the EPA-only margin spans ~+/-12 pts vs
+  # market spreads to 38+, so every big spread manufactured fake dog EV
+  # (93% of 2025-backtest spread picks were dogs, CLV -0.23 line-pts).
+  # Anchored 2025 A/B: CLV +0.02, dog share 30%, monotone in spread size.
+  # NFL stays EPA-only (its margins already match its spread universe:
+  # sd 6.0 vs market sd 6.2; no free NFL rating feed exists).
+  # KILL CRITERIA: set margin_anchor_cfb to null if after 40 graded CFB
+  # spread paper picks avg clv_pp < 0; review at 40 regardless.
+  margin_anchor_cfb: "elo"
+  elo_points_per_margin: 23.0      # fitted on 2025 FBS: 23 Elo pts ~ 1 pt of margin
+  margin_tilt_max_cfb: 6.0
   # Spread/total margin distribution sigma (pts) for cover/over probabilities.
   nfl_margin_sigma: 13.2
   nfl_total_sigma: 10.0

@@ -91,7 +91,23 @@ def expected_team_points(off_units: dict, opp_def_units: dict, league: str,
 def project_game(home_units: dict, away_units: dict, league: str, config: dict,
                  pass_weight: float, rush_weight: float,
                  weather_mult: float = 1.0,
-                 pool_rz_avg: float | None = None) -> GameProjection:
+                 pool_rz_avg: float | None = None,
+                 power_margin: float | None = None) -> GameProjection:
+    """`power_margin` (2026-08-31, CFB margin anchor): a points-scale rating
+    differential (home-positive, EXCLUDING HFA) — pregame Elo diff / 23 from
+    CFBD, supplied by the pipeline. When present, the margin becomes
+
+        margin = power_margin + HFA + clamp(EPA matchup margin, ±tilt_max)
+
+    i.e. the matchup-exploitation signal turns into a BOUNDED TILT on a
+    correctly-scaled anchor — the same anchor+tilt shape as the totals model
+    (market mean + clamped tilt) and MLB's market blend. Why: per-play
+    strength stats saturate (2025 backtest: engine-shape margins sd 5 vs
+    actual 20; on 21+pt spreads it projected |4.3| vs market |28.9|), which
+    made every big-spread "edge" a scale artifact and 93%% of spread picks
+    dogs. Anchored A/B on 2025: CLV -0.23 -> +0.02 line-pts, dog share 30%%,
+    performance monotone in spread size. The TOTAL is deliberately untouched.
+    None -> the old EPA-only margin (NFL, and CFB games missing Elo)."""
     cfg = config.get("projections", {})
     hfa = float(cfg.get(f"hfa_pts_{league}", 1.5))
     home = expected_team_points(home_units, away_units, league, config,
@@ -100,10 +116,22 @@ def project_game(home_units: dict, away_units: dict, league: str, config: dict,
                                 pass_weight, rush_weight, pool_rz_avg)
     margin = home.points - away.points + hfa
     total_raw = home.points + away.points
+    home_pts = home.points + hfa / 2
+    away_pts = away.points - hfa / 2
+    if power_margin is not None:
+        tilt_max = float(cfg.get(f"margin_tilt_max_{league}", 6.0))
+        epa_tilt = max(-tilt_max, min(tilt_max, margin - hfa))
+        margin = power_margin + hfa + epa_tilt
+        # Re-derive the displayed team points so margin+total stay coherent.
+        home_pts = (total_raw + margin) / 2
+        away_pts = (total_raw - margin) / 2
+        home.notes.append(
+            f"margin anchored: power rating {power_margin:+.1f} + HFA {hfa:.1f} "
+            f"+ matchup tilt {epa_tilt:+.1f} (clamped ±{tilt_max:.0f})")
     mult = min(1.0, float(weather_mult))       # suppress-only, belt & suspenders
     return GameProjection(
-        home_pts=round(home.points + hfa / 2, 2),
-        away_pts=round(away.points - hfa / 2, 2),
+        home_pts=round(home_pts, 2),
+        away_pts=round(away_pts, 2),
         margin=round(margin, 2), total_raw=round(total_raw, 2),
         total=round(total_raw * mult, 2), weather_mult=mult,
         home_detail=home, away_detail=away,

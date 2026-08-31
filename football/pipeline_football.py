@@ -593,7 +593,8 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
                                coords[1] if coords else None,
                                game.commence_time, indoor, config)
 
-        projection = project_game_for(ctx, scored, weather, pool_rz, lean)
+        projection = project_game_for(ctx, scored, weather, pool_rz, lean,
+                                      power_margin=_power_margin_for(league, row, config))
 
         g5_involved = ctx.league == "cfb" and bool({home, away} & ctx.g5_teams)
         explosive_involved = False
@@ -652,8 +653,11 @@ def _kickoff_date_et(commence_iso: str) -> str:
 
 
 def project_game_for(ctx: LeagueContext, scored: ScoredGame, weather,
-                     pool_rz: float | None, script_lean: float):
-    """Assemble raw unit rows + phase weights into a GameProjection."""
+                     pool_rz: float | None, script_lean: float,
+                     power_margin: float | None = None):
+    """Assemble raw unit rows + phase weights into a GameProjection.
+    `power_margin`: points-scale rating anchor (see projections.project_game;
+    CFB margin anchor, 2026-08-31)."""
     from mlb_value_bot.football.analysis.matchup import phase_weights
     from mlb_value_bot.football.analysis.projections import project_game
 
@@ -662,7 +666,25 @@ def project_game_for(ctx: LeagueContext, scored: ScoredGame, weather,
     away_raw = ctx.unit_stats.loc[scored.away].to_dict() if scored.away in ctx.unit_stats.index else {}
     return project_game(home_raw, away_raw, ctx.league, ctx.config,
                         w_pass, w_rush, weather_mult=weather.multiplier,
-                        pool_rz_avg=pool_rz)
+                        pool_rz_avg=pool_rz, power_margin=power_margin)
+
+
+def _power_margin_for(league: str, row, config: dict) -> float | None:
+    """CFB margin anchor (2026-08-31): pregame Elo differential from the
+    matched CFBD schedule row, converted to points. Elo is as-of-kickoff
+    (CFBD carries it across seasons), so there is no look-ahead. Returns
+    None — and the projection falls back to the EPA-only margin — when the
+    anchor is disabled, the league has no rating source (NFL), or the row
+    lacks Elo (brand-new FBS programs early on)."""
+    if config.get("projections", {}).get(f"margin_anchor_{league}") != "elo":
+        return None
+    if row is None:
+        return None
+    he, ae = row.get("homePregameElo"), row.get("awayPregameElo")
+    if he is None or ae is None or pd.isna(he) or pd.isna(ae):
+        return None
+    per_pt = float(config.get("projections", {}).get("elo_points_per_margin", 23.0))
+    return (float(he) - float(ae)) / per_pt
 
 
 def build_drive_stats(league: str, season: int, week: int, config: dict) -> pd.DataFrame:

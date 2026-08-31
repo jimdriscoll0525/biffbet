@@ -423,6 +423,44 @@
       "direction": "tbd",
       "notes": "Pre-registered 2026-08-31 (instrumented before any evidence — Jim asked for the learning capability after the Sep 3-5 CFB board produced 0 spread picks with 27 of 35 spread markets divergence-guard-held). Question: are guard-held spread leans covering AND beating the sharp close? Mechanism candidate: the CFB margin projection (base + centered PPA x plays) tops out ~+/-12 pts while CFB markets go to 38+, so on big spreads the model 'disagrees' by 8-33 pts, always on the dog side, and the guard holds everything past 6 pts. If the leans show positive cover ROI AND positive clv_pp on a decent sample, the fix is recalibrating the margin scale (e.g. a variance-matching multiplier on the strength term), NEVER just loosening the guard onto a knowingly compressed projection. Instrumentation shipped same day: engine grades analysis rows counterfactually (grading.grade_analyses), openings frozen at first sighting for hold-lens CLV, retro pools fb-spread-holds/fb-total-holds with dims hold_kind/spread_band/lean_type/league/month. Pass-pool lens: paper-mode ceiling per SKILL.md. Anecdote only: both guard-held big-spread dog leans on the Aug 29 retro slate covered (n=2).",
       "evidence": []
+    },
+    {
+      "key": "fb-model|cfb-margin-anchor",
+      "status": "active",
+      "first_seen": "2026-08-31",
+      "proposed": "2026-08-31",
+      "activated": "2026-08-31",
+      "consecutive_hits": 1,
+      "consecutive_misses": 0,
+      "pool": "fb-bets",
+      "dimension": "model",
+      "value": "cfb margin = elo anchor + clamped EPA tilt",
+      "direction": "structural",
+      "proposal_doc": "docs/abilities/proposals/2026-08-31-cfb-margin-anchor.md",
+      "config_keys": [
+        "projections.margin_anchor_cfb",
+        "projections.elo_points_per_margin",
+        "projections.margin_tilt_max_cfb"
+      ],
+      "kill_criteria": "set margin_anchor_cfb to null if after 40 graded CFB spread paper picks avg clv_pp < 0; review at 40 regardless",
+      "notes": "Structural fix, not a segment trend: the EPA-only CFB margin saturates (~+/-12 pts vs spreads to 38+), making every big-spread 'edge' a scale artifact (93% dog picks, CLV -0.23 in the 2025 backtest). Elo-anchored A/B on 2025: CLV +0.02, dog share 30%, monotone band behavior, totals identical. Approved by Jim 2026-08-31 after the $0 historical-odds backtest (35 snapshots, ~1750 credits). Related watch fb-spread-holds|hold_kind=divergence guard stays open: it now measures whether the guard on the ANCHORED model still suppresses anything real.",
+      "evidence": [
+        {
+          "run_date": "2026-08-31",
+          "report": "session scratchpad backtest_2025.py -> bt2025_cfb.parquet; artifact 07ced051 §8",
+          "picks_current": 74,
+          "record_current": "41-32-1",
+          "roi_current": 0.074,
+          "clv_current_pts": -0.23,
+          "dog_share_current": 0.93,
+          "picks_anchored": 86,
+          "record_anchored": "47-38-1",
+          "roi_anchored": 0.054,
+          "clv_anchored_pts": 0.02,
+          "dog_share_anchored": 0.3,
+          "note": "ROI look-ahead-inflated; CLV honest. Elo fit: 23 Elo pts per margin pt, corr 0.61 w/ actual margins, MAE 4.8 vs close."
+        }
+      ]
     }
   ]
 }
