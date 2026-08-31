@@ -226,6 +226,13 @@ grading:
   # A committed bet whose game still has no final this many days later is
   # voided (canceled game; stake returned).
   void_after_days: 10
+  # Hold-lens instrumentation (2026-08-31): also grade ANALYSIS rows
+  # (guard-held / below-threshold markets) counterfactually. They never touch
+  # the record (flat_stake 0; performance filters is_value=1) — they exist so
+  # the weekly retro can ask "are the divergence-guard-held spread leans
+  # actually covering, and beating the sharp close?" before anyone considers
+  # recalibrating the margin scale. Set false to stop.
+  grade_analyses: true
 
 live:
   # Engine-side inputs for the site's live in-game over/under tool

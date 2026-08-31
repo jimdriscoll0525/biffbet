@@ -68,6 +68,7 @@ except ImportError:  # pragma: no cover - scipy is in requirements.txt
 # .claude/skills/self-improve/scripts/retro_analysis.py -> repo root
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_DB = REPO_ROOT / "storage" / "mlb_value_bot.db"
+DEFAULT_FOOTBALL_DB = REPO_ROOT / "storage" / "football.db"
 DEFAULT_OUT = REPO_ROOT / "storage" / "retro"
 
 MLB_SCHEDULE_URL = (
@@ -267,6 +268,50 @@ def _prepare_totals(df: pd.DataFrame) -> pd.DataFrame:
     ).astype("string")
     df["month"] = df["date"].astype(str).str.slice(0, 7)
     return df
+
+
+def _prepare_football(df: pd.DataFrame) -> pd.DataFrame:
+    """Football lens columns (2026-08-31). Football rows arrive ALREADY
+    graded — the engine counterfactually settles analysis rows too
+    (config_football.yaml grading.grade_analyses) — and carry hold-lens CLV:
+    an opening frozen at first sighting (re-frozen on a best-side flip) vs
+    the de-vigged sharp close, in probability points. The headline question
+    this lens exists for: are the divergence-guard-held CFB spread leans
+    covering AND beating the sharp close (i.e. is the guard suppressing a
+    real edge because the margin projection's scale is compressed), or is
+    the guard right?"""
+    df = df.copy()
+    parsed = df["reasoning_json"].apply(_reasoning)
+    def _hold_kind(r: dict) -> str:
+        reason = (r.get("hold_reason") or "pick")
+        # "adjusted EV +2.1% below threshold" embeds the value — collapse to
+        # one bucket, else every row is its own cell.
+        if "below threshold" in reason:
+            return "below EV threshold"
+        return reason.split(":")[0].strip()
+
+    df["hold_kind"] = parsed.apply(_hold_kind)
+    df["spread_band"] = pd.cut(
+        pd.to_numeric(df["line"], errors="coerce").abs(),
+        bins=[-np.inf, 3.5, 7.5, 14.0, 28.0, np.inf],
+        labels=["|line| 0-3.5", "3.5-7.5", "7.5-14", "14-28", "28+"],
+    ).astype("string").fillna("n/a")
+    # For spreads: which side of the number the model leaned (dog lays +pts).
+    df["lean_type"] = np.where(
+        df["market"] != "spread", df["pick_side"].fillna("n/a"),
+        np.where(pd.to_numeric(df["line"], errors="coerce") > 0, "dog", "favorite"))
+    df["league_market"] = df["league"].astype(str) + " " + df["market"].astype(str)
+    df["month"] = df["date"].astype(str).str.slice(0, 7)
+    # Reuse _cell_stats verbatim: it reads `clv_pct` — football's CLV is
+    # clv_pp (PROBABILITY POINTS vs the sharp close, not %). Labeled in the
+    # report caveats.
+    df["clv_pct"] = df["clv_pp"]
+    return df
+
+
+FB_BET_DIMS = ["league_market", "pick_side", "spread_band", "stability",
+               "tier", "month"]
+FB_HOLD_DIMS = ["hold_kind", "spread_band", "lean_type", "league", "month"]
 
 
 # --------------------------------------------------------------------------
@@ -549,6 +594,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--skip-pass-grading", action="store_true",
                     help="Offline mode: use only already-cached pass grades.")
     ap.add_argument("--skip-totals", action="store_true")
+    ap.add_argument("--skip-football", action="store_true")
+    ap.add_argument("--football-db", type=Path, default=DEFAULT_FOOTBALL_DB)
     args = ap.parse_args(argv)
 
     if not args.db.exists():
@@ -625,6 +672,38 @@ def main(argv: list[str] | None = None) -> int:
             candidates += cand
             cells_total += seg["cells_tested"]
 
+    # ---- Football (paper) — engine-graded, incl. hold lens --------------
+    if not args.skip_football and args.football_db.exists():
+        try:
+            fb = _load_table(args.football_db, "football_recommendations")
+        except (pd.errors.DatabaseError, sqlite3.DatabaseError):
+            fb = pd.DataFrame()
+        if len(fb):
+            if args.since:
+                fb = fb[fb["date"].astype(str) >= args.since]
+            fb = _prepare_football(fb)
+            fb_bets = fb[fb["is_value"].astype(int) == 1]
+            fb_holds = fb[(fb["is_value"].astype(int) == 0)
+                          & (fb["market"] == "spread")]
+            fb_holds_t = fb[(fb["is_value"].astype(int) == 0)
+                            & (fb["market"] == "total")]
+            row_counts["football_bets"] = len(fb_bets)
+            row_counts["football_spread_holds"] = len(fb_holds)
+            row_counts["football_total_holds"] = len(fb_holds_t)
+
+            for name, pool_df, dims, pool_key in (
+                ("Football (paper) — committed picks", fb_bets, FB_BET_DIMS, "fb-bets"),
+                ("Football — HELD spread markets (counterfactual)", fb_holds, FB_HOLD_DIMS, "fb-spread-holds"),
+                ("Football — HELD total markets (counterfactual)", fb_holds_t, FB_HOLD_DIMS, "fb-total-holds"),
+            ):
+                if pool_df.empty:
+                    continue
+                seg, cand = _segment_report(pool_df, dims, "result",
+                                            args.min_n, args.t_threshold, pool_key)
+                pools[name] = {"overall": _cell_stats(pool_df, "result"), **seg}
+                candidates += cand
+                cells_total += seg["cells_tested"]
+
     # Multiple-comparisons context: with `cells_total` cells inspected, flag
     # how many false positives the bar would let through by chance alone.
     for c in candidates:
@@ -654,6 +733,15 @@ def main(argv: list[str] | None = None) -> int:
             "persistence across consecutive weekly runs regardless.",
             "Bet-pool cells overlap (the same bets appear in every dimension); "
             "candidates are correlated, not independent findings.",
+            "Football pools: results come pre-graded by the engine (analysis "
+            "rows counterfactually, at the last-refresh best-side price); the "
+            "avg CLV column is clv_pp — PROBABILITY POINTS vs the sharp "
+            "close, not the moneyline %% metric. Hold-lens openings are only "
+            "frozen from 2026-08-31; earlier rows have last-snapshot CLV "
+            "(~0 by construction). fb-spread-holds is the divergence-guard "
+            "question: per SKILL.md it is a pass-pool lens (paper-mode "
+            "ceiling), and its remedy if proven is recalibrating the margin "
+            "scale, never simply loosening the guard.",
         ],
     }
 

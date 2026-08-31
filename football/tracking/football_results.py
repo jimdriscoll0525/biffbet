@@ -41,6 +41,11 @@ class GradingSummary:
     pending: int = 0
     profit_loss: float = 0.0
     dates: list[str] = field(default_factory=list)
+    # Counterfactual grading of ANALYSIS rows (guard-held / below-threshold
+    # markets), 2026-08-31. Kept OUT of the headline W-L/P&L above — these
+    # were never bets; they feed the weekly retro's hold-lens only.
+    analyses_graded: int = 0
+    analyses_pending: int = 0
 
 
 def grade_pick(side: str, line: float | None, home_score: int, away_score: int) -> str:
@@ -118,7 +123,8 @@ def grade_open(config: dict, before: str | None = None) -> list[GradingSummary]:
     from mlb_value_bot.football import season_for_date
 
     before = before or _date.today().isoformat()
-    rows = store.get_open_bets(before=before)
+    grade_analyses = bool(config.get("grading", {}).get("grade_analyses", False))
+    rows = store.get_open_bets(before=before, include_analyses=grade_analyses)
     if not rows:
         return []
 
@@ -144,14 +150,20 @@ def grade_open(config: dict, before: str | None = None) -> list[GradingSummary]:
                 s.voids += 1
                 log.info("Voided %s %s %s (%d days without a final)",
                          league, row["game_id"], row["market"], age)
-            else:
+            elif bool(row["is_value"]):
                 s.pending += 1
+            else:
+                s.analyses_pending += 1
             continue
 
         hs, as_ = score
         result = grade_pick(row["pick_side"], row["line"], hs, as_)
         pl = profit_for(result, float(row["flat_stake"] or 0.0), float(row["decimal_odds"]))
         store.update_result(row["id"], result, pl, hs, as_)
+        if not bool(row["is_value"]):
+            # Counterfactual analysis grade: never part of the record.
+            s.analyses_graded += 1
+            continue
         s.graded += 1
         s.profit_loss += pl
         if result == "win":

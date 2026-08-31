@@ -985,13 +985,71 @@ class TestStoreUpsert:
         store.save_slate([self._analysis([self._pick(is_value=False)])], cfg)
         df = store.to_dataframe()
         assert df.iloc[0]["is_value"] == 0
-        assert pd.isna(df.iloc[0]["opening_line"])    # analyses set no opening
+        # Hold-lens instrumentation (2026-08-31): analyses freeze an opening
+        # reference at first sighting too, so held leans get CLV vs the close.
+        assert df.iloc[0]["opening_line"] == -3.0
 
-        # Promotion: THIS run's price becomes the opening reference.
+        # Promotion: THIS run's price becomes the opening reference (the
+        # commit-time freeze beats the first-sighting freeze).
         store.save_slate([self._analysis([self._pick(line=-2.5, is_value=True)])], cfg)
         row = store.to_dataframe().iloc[0]
         assert row["is_value"] == 1
         assert row["opening_line"] == -2.5
+
+    def test_hold_lens_opening_kept_and_refrozen_on_side_flip(self, tmp_path, monkeypatch):
+        """Analysis rows: opening stays frozen across refreshes on the SAME
+        side (so hold-lens CLV accrues), but re-freezes when the best side
+        flips — open-vs-close across different sides would be meaningless."""
+        from mlb_value_bot.football.tracking import football_store as store
+
+        monkeypatch.setattr(store, "FOOTBALL_DB_PATH", tmp_path / "fb.db")
+        cfg = {"model_tag": "matchup_v1", "betting": {"paper_only": True}}
+
+        store.save_slate([self._analysis([self._pick(is_value=False, sharp_p=0.52)])], cfg)
+        # Same side, line/sharps moved: opening kept, CLV computed vs opening.
+        store.save_slate([self._analysis([self._pick(is_value=False, line=-3.5,
+                                                     odds=-115, sharp_p=0.55)])], cfg)
+        row = store.to_dataframe().iloc[0]
+        assert row["is_value"] == 0
+        assert row["opening_line"] == -3.0            # kept
+        assert row["closing_line"] == -3.5
+        assert row["clv_pp"] == pytest.approx(5.0)    # 55% sharp close vs 50% open devig
+
+        # Best side flips home -> away: opening re-freezes to the new side.
+        store.save_slate([self._analysis([self._pick(side="away", line=-3.5,
+                                                     is_value=False, sharp_p=0.55)])], cfg)
+        row = store.to_dataframe().iloc[0]
+        assert row["pick_side"] == "away"
+        assert row["opening_line"] == 3.5             # picked-side (away) number, re-frozen
+
+    def test_grade_analyses_counterfactually_config_gated(self, tmp_path, monkeypatch):
+        """grading.grade_analyses settles held/analysis rows from finals but
+        keeps them OUT of the headline record (separate counters)."""
+        from mlb_value_bot.football.tracking import football_results as results
+        from mlb_value_bot.football.tracking import football_store as store
+
+        monkeypatch.setattr(store, "FOOTBALL_DB_PATH", tmp_path / "fb.db")
+        cfg = {"model_tag": "matchup_v1", "betting": {"paper_only": True},
+               "grading": {"void_after_days": 10, "grade_analyses": True}}
+        bet = self._pick(is_value=True)               # home -3
+        held = self._pick(market="total", side="over", line=44.0, is_value=False)
+        store.save_slate([self._analysis([bet, held])], cfg)
+
+        monkeypatch.setattr(results, "_nfl_finals",
+                            lambda season, config: {"2026_01_A_H": (27, 20)})
+        (s,) = results.grade_open(cfg, before="2026-09-20")
+        assert (s.wins, s.losses, s.graded) == (1, 0, 1)      # bet: -3 covers by 7
+        assert s.analyses_graded == 1                          # total 47 > 44 -> over wins
+        df = store.to_dataframe().set_index("market")
+        assert df.loc["total", "result"] == "win"
+        assert df.loc["total", "profit_loss"] == 0.0           # never staked
+        assert df.loc["spread", "result"] == "win"
+
+        # Gate off: analyses stay pending.
+        monkeypatch.setattr(store, "FOOTBALL_DB_PATH", tmp_path / "fb2.db")
+        cfg2 = dict(cfg, grading={"void_after_days": 10, "grade_analyses": False})
+        store.save_slate([self._analysis([held])], cfg2)
+        assert results.grade_open(cfg2, before="2026-09-20") == [] or             store.to_dataframe().iloc[0]["result"] == "pending"
 
     def test_away_and_under_lines_stored_from_picked_side(self, tmp_path, monkeypatch):
         from mlb_value_bot.football.tracking import football_store as store

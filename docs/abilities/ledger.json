@@ -1,6 +1,6 @@
 {
   "_comment": "Persistent trend/ability memory for the self-improve skill. Managed by .claude/skills/self-improve/SKILL.md — read that before editing. Statuses: watch | proposed | active | rejected | retired | retire-recommended | dropped.",
-  "updated": "2026-08-30",
+  "updated": "2026-08-31",
   "abilities": [
     {
       "key": "ml-passes|odds_bucket=small fav (-101..-149)",
@@ -47,20 +47,27 @@
           "report": "storage/retro/retro_report_2026-08-10.json",
           "counts_toward_persistence": false,
           "note": "Miss #2 → dropped. Cell below the bar on grown N: 193-189 / 382 settled, flat_roi -0.0877, t=-1.89, p=0.0593. Trend continuity lives on in ml-passes|side_type=favorite (new watch this run)."
+        },
+        {
+          "run_date": "2026-08-31",
+          "report": "storage/retro/retro_report_2026-08-31.json",
+          "counts_toward_persistence": false,
+          "note": "REAPPEARED while dropped: 221-230 / 451 settled, flat_roi -0.1153, t=-2.70, p=0.0071 — its strongest showing yet, but still not Bonferroni-significant (bar ~0.0004 with 133 cells), so per the reconcile rules no re-proposal; evidence appended only. Continuity remains tracked under ml-passes|side_type=favorite, which also cleared this run (hit #2)."
         }
       ]
     },
     {
       "key": "ml-passes|dispersion_bucket=normal (0.25-0.45pp)",
-      "status": "watch",
+      "status": "dropped",
       "first_seen": "2026-08-02",
+      "dropped": "2026-08-31",
       "consecutive_hits": 0,
-      "consecutive_misses": 1,
+      "consecutive_misses": 2,
       "pool": "ml-passes",
       "dimension": "dispersion_bucket",
       "value": "normal (0.25-0.45pp)",
       "direction": "negative",
-      "notes": "Book-dispersion lens added 2026-08-02. Passes lose counterfactually when books disagree by 0.25pp+; mechanism candidate: best-price EV is inflated by soft-book outliers when books disagree, honest when they agree. Pass pool: no CLV, paper-mode ceiling per SKILL.md. 2026-08-04 (fresh data through 08-03): cleared the bar AGAIN on grown N (314 -> 347 settled, t strengthened -2.2 -> -2.29) — consecutive_hits=2. Promotion was blocked: bonferroni_significant=false in both runs. 2026-08-10: NEAR-MISS — 188-194 / 382 settled, flat_roi -9.5%, t=-1.97, p=0.0495, a hair below the t=2.0 bar. Rules are rules: consecutive_misses=1, hits reset (had reached 2). The economic signal is essentially unchanged (~-9.5% ROI all three runs); what moved is that the new week's games diluted t slightly. Bet-pool tension still stands and strengthened: very-wide-dispersion BETS are now 10-4, +31.7% (n=14) — framing stays pass-side EV inflation, never blanket dispersion suppression. Flip-side tight-dispersion passes: +5.1% ROI (t=0.78), directionally consistent with the mechanism but weak. Drops at 2 consecutive misses.",
+      "notes": "Book-dispersion lens added 2026-08-02. Passes lose counterfactually when books disagree by 0.25pp+; mechanism candidate: best-price EV is inflated by soft-book outliers when books disagree, honest when they agree. Pass pool: no CLV, paper-mode ceiling per SKILL.md. 2026-08-04 (fresh data through 08-03): cleared the bar AGAIN on grown N (314 -> 347 settled, t strengthened -2.2 -> -2.29) — consecutive_hits=2. Promotion was blocked: bonferroni_significant=false in both runs. 2026-08-10: NEAR-MISS — 188-194 / 382 settled, flat_roi -9.5%, t=-1.97, p=0.0495, a hair below the t=2.0 bar. Rules are rules: consecutive_misses=1, hits reset (had reached 2). The economic signal is essentially unchanged (~-9.5% ROI all three runs); what moved is that the new week's games diluted t slightly. Bet-pool tension still stands and strengthened: very-wide-dispersion BETS are now 10-4, +31.7% (n=14) — framing stays pass-side EV inflation, never blanket dispersion suppression. Flip-side tight-dispersion passes: +5.1% ROI (t=0.78), directionally consistent with the mechanism but weak. Drops at 2 consecutive misses. 2026-08-31: missed again (235-233 / 468 settled, flat_roi -7.6%, t=-1.74) — DROPPED at 2 consecutive misses. Twist the same run: the BET-pool cell ml-bets|dispersion_bucket=normal cleared hard (25-50, -36% ROI, t=-3.38) but with CLV DISAGREEING — see that new watch entry. The dispersion lens is now non-monotonic on the bet side (tight and wide/very-wide positive, normal deeply negative), which undercuts the original soft-book-outlier mechanism; treat any dispersion revival skeptically.",
       "evidence": [
         {
           "run_date": "2026-08-02",
@@ -113,6 +120,12 @@
           "report": "storage/retro/retro_report_2026-08-10.json",
           "counts_toward_persistence": false,
           "note": "Miss #1 (near-miss): 188-194 / 382 settled, flat_roi -0.0951, t=-1.97, p=0.0495 — just under the t=2.0 bar on grown N. ROI stable at ~-9.5% across all three runs."
+        },
+        {
+          "run_date": "2026-08-31",
+          "report": "storage/retro/retro_report_2026-08-31.json",
+          "counts_toward_persistence": false,
+          "note": "Miss #2 → dropped. 235-233 / 468 settled, flat_roi -0.0757, t=-1.74, p=0.0833. Economic signal has decayed monotonically (-11.5% → -11.5% → -9.5% → -7.6%) as N grew — looks like regression to the mean, a clean drop."
         }
       ]
     },
@@ -120,13 +133,13 @@
       "key": "totals-passes|tilt_bucket=mild over (0.25..0.75)",
       "status": "watch",
       "first_seen": "2026-08-04",
-      "consecutive_hits": 2,
-      "consecutive_misses": 0,
+      "consecutive_hits": 0,
+      "consecutive_misses": 1,
       "pool": "totals-passes",
       "dimension": "tilt_bucket",
       "value": "mild over (0.25..0.75)",
       "direction": "negative",
-      "notes": "Totals tilt lens added 2026-08-02 (tilt provenance only stored since the 2026-07 commit, so the sample is recent-games-only by construction). Passed totals where the model tilted mildly OVER the market mean lose counterfactually — consistent with the totals model's known historical over-bias (tilt bug fixed 2026-07-02): a mild over-tilt that still fails the EV bar looks like residual over-lean, and the engine is right to pass. 2026-08-10: cleared the bar AGAIN on grown N (46 -> 58 settled, 22-36, flat_roi -26.4%, t=-2.12) — consecutive_hits=2, persistence bar met. Promotion BLOCKED on significance: bonferroni_significant=false in both runs (120 and 127 cells tested; p=0.0238 / 0.0384 vs a ~0.0004 Bonferroni bar). Pass pool: no CLV, paper-mode ceiling regardless. Even if it eventually promotes, likelier a validation/monitoring story (the pass logic is correctly absorbing residual over-bias) than a config change. Still small N.",
+      "notes": "Totals tilt lens added 2026-08-02 (tilt provenance only stored since the 2026-07 commit, so the sample is recent-games-only by construction). Passed totals where the model tilted mildly OVER the market mean lose counterfactually — consistent with the totals model's known historical over-bias (tilt bug fixed 2026-07-02): a mild over-tilt that still fails the EV bar looks like residual over-lean, and the engine is right to pass. 2026-08-10: cleared the bar AGAIN on grown N (46 -> 58 settled, 22-36, flat_roi -26.4%, t=-2.12) — consecutive_hits=2, persistence bar met. Promotion BLOCKED on significance: bonferroni_significant=false in both runs (120 and 127 cells tested; p=0.0238 / 0.0384 vs a ~0.0004 Bonferroni bar). Pass pool: no CLV, paper-mode ceiling regardless. Even if it eventually promotes, likelier a validation/monitoring story (the pass logic is correctly absorbing residual over-bias) than a config change. Still small N. 2026-08-31: MISSED — N nearly doubled (58 → 112 settled, tilt provenance backfilling as more games carry it) and the ROI diluted to -13.5% (50-62, t=-1.48). consecutive_hits reset from 2, misses=1; drops at 2. Same run the broader cell totals-passes|pick_side=over cleared for the first time (256-285 / 541, -9.0%, t=-2.18, new watch) — likely the same residual-over-bias story at wider aperture; if this tilt cell drops, continuity lives there.",
       "evidence": [
         {
           "run_date": "2026-08-04",
@@ -169,6 +182,12 @@
           "bonferroni_significant": false,
           "clv_agrees": null,
           "cells_tested": 127
+        },
+        {
+          "run_date": "2026-08-31",
+          "report": "storage/retro/retro_report_2026-08-31.json",
+          "counts_toward_persistence": false,
+          "note": "Miss #1: 50-62 / 112 settled, flat_roi -0.1354, t=-1.48, p=0.1417. N grew 58 → 112 and the signal diluted. Related broader cell totals-passes|pick_side=over cleared this run (own watch entry)."
         }
       ]
     },
@@ -176,13 +195,13 @@
       "key": "ml-passes|side_type=favorite",
       "status": "watch",
       "first_seen": "2026-08-10",
-      "consecutive_hits": 1,
+      "consecutive_hits": 2,
       "consecutive_misses": 0,
       "pool": "ml-passes",
       "dimension": "side_type",
       "value": "favorite",
       "direction": "negative",
-      "notes": "Passed favorites (all sizes) lose money counterfactually: 300-257 / 557 settled, flat_roi -7.4%, t=-2.02, p=0.0442 — the largest-N cell ever to clear the bar. This is the broader reframing of the small-fav trend dropped this same run (small favs are 382 of these 557; big favs contribute -4.4% ROI on 175 in the same direction, so the whole favorite side of the pass pool leans negative). Per the overlap rule, treat as ONE trend under this sharper framing. Mechanism candidate: same as before — the engine's EV bar correctly screens out favorites whose best-price EV looks close but isn't; passed underdogs counterfactually break even (+0.5%), so the asymmetry is favorite-specific (juice concentration on the favorite side of square books?). Pass pool: no CLV, paper-mode ceiling per SKILL.md; if anything this validates the threshold rather than suggesting loosening. Not Bonferroni-significant (p=0.0442 vs ~0.0004 with 127 cells). Watch for persistence next Monday.",
+      "notes": "Passed favorites (all sizes) lose money counterfactually: 300-257 / 557 settled, flat_roi -7.4%, t=-2.02, p=0.0442 — the largest-N cell ever to clear the bar. This is the broader reframing of the small-fav trend dropped this same run (small favs are 382 of these 557; big favs contribute -4.4% ROI on 175 in the same direction, so the whole favorite side of the pass pool leans negative). Per the overlap rule, treat as ONE trend under this sharper framing. Mechanism candidate: same as before — the engine's EV bar correctly screens out favorites whose best-price EV looks close but isn't; passed underdogs counterfactually break even (+0.5%), so the asymmetry is favorite-specific (juice concentration on the favorite side of square books?). Pass pool: no CLV, paper-mode ceiling per SKILL.md; if anything this validates the threshold rather than suggesting loosening. Not Bonferroni-significant (p=0.0442 vs ~0.0004 with 127 cells). Watch for persistence next Monday. 2026-08-31: cleared AGAIN on grown N (557 → 672 settled, 361-311, flat_roi -8.0%, t=-2.39, p=0.0169) — consecutive_hits=2, persistence bar met. Promotion BLOCKED on significance: bonferroni_significant=false in both runs (bar ~0.0004 with 133 cells). Corroboration this run: the small-fav sub-cell hit t=-2.70 (its strongest ever, evidence appended to its dropped entry), and ml-passes|filter_reason=none (-7.3%, t=-2.17) cleared too — per the overlap rule that cell is FOLDED into this one rather than watched separately: at 835/971 settled it is essentially the whole unfiltered pass pool, favorites are the part that loses (passed dogs -0.3%), so favorite stays the sharper framing. Even on promotion this is pass-pool (paper-mode ceiling) and reads as threshold validation, not a config change.",
       "evidence": [
         {
           "run_date": "2026-08-10",
@@ -205,6 +224,32 @@
           "clv_agrees": null,
           "cells_tested": 127,
           "related_dropped_key": "ml-passes|odds_bucket=small fav (-101..-149)"
+        },
+        {
+          "run_date": "2026-08-31",
+          "report": "storage/retro/retro_report_2026-08-31.json",
+          "rows": 690,
+          "settled": 672,
+          "wins": 361,
+          "losses": 311,
+          "hit_rate": 0.5372,
+          "hit_rate_wilson_95": [
+            0.4994,
+            0.5746
+          ],
+          "breakeven_hit_rate": 0.5799,
+          "flat_pl_units": -53.46,
+          "flat_roi": -0.0796,
+          "t_stat": -2.39,
+          "p_value": 0.0169,
+          "bonferroni_significant": false,
+          "clv_agrees": null,
+          "cells_tested": 133,
+          "corroborating_cells": [
+            "ml-passes|odds_bucket=small fav (-101..-149): 221-230 / 451, flat_roi -0.1153, t=-2.70, p=0.0071",
+            "ml-passes|filter_reason=none (folded per overlap rule): 404-431 / 835, flat_roi -0.0733, t=-2.17, p=0.0306"
+          ],
+          "note": "Hit #2 on grown N — persistence met, promotion blocked on Bonferroni."
         }
       ]
     },
@@ -225,7 +270,7 @@
         "filters.min_model_prob"
       ],
       "kill_criteria": "retire if after 40 settled post-activation removed games their counterfactual flat ROI > 0, or the kept book's avg CLV since activation < 0",
-      "notes": "Found in the 2026-08-30 full-history retro (ad hoc Supabase pull through 08-30, not the weekly script): bets where the 65%-market blend still had our side under 50% went 6-18, -46% flat, t=-2.36, n=24, avg CLV +2.03%. Removing them takes the book from -10.9% to -1.9% (60-52) and August from -17.8% to -5.6%. Promoted straight to active on Jim's explicit approval ('approve proposal D') - bypasses the 2-consecutive-runs bar; NOT Bonferroni-significant (p~0.02 with 127 cells); CLV on the removed cell is positive, so this is results-based. Dog EV thresholds and favorites-only were backtested and rejected. Weekly retro: track the removed cell under filter_reason='blend below min_model_prob' toward the kill criteria.",
+      "notes": "Found in the 2026-08-30 full-history retro (ad hoc Supabase pull through 08-30, not the weekly script): bets where the 65%-market blend still had our side under 50% went 6-18, -46% flat, t=-2.36, n=24, avg CLV +2.03%. Removing them takes the book from -10.9% to -1.9% (60-52) and August from -17.8% to -5.6%. Promoted straight to active on Jim's explicit approval ('approve proposal D') - bypasses the 2-consecutive-runs bar; NOT Bonferroni-significant (p~0.02 with 127 cells); CLV on the removed cell is positive, so this is results-based. Dog EV thresholds and favorites-only were backtested and rejected. Weekly retro: track the removed cell under filter_reason='blend below min_model_prob' toward the kill criteria. 2026-08-31 (day 1 post-activation): filter_reason='blend below min_model_prob' shows 4 removed games, 1 settled — it WON counterfactually (+1.4u). 1/40 toward the kill sample; no signal either way, keep counting.",
       "evidence": [
         {
           "run_date": "2026-08-30",
@@ -250,8 +295,134 @@
             "avg_clv_pct": 0.2,
             "aug_flat_roi": -0.056
           }
+        },
+        {
+          "run_date": "2026-08-31",
+          "report": "storage/retro/retro_report_2026-08-31.json",
+          "post_activation_check": true,
+          "note": "filter_reason='blend below min_model_prob': 4 rows, 1 settled, 1-0, +1.40u counterfactual. 1/40 settled toward the kill criteria — far too early to evaluate."
         }
       ]
+    },
+    {
+      "key": "ml-bets|dispersion_bucket=normal (0.25-0.45pp)",
+      "status": "watch",
+      "first_seen": "2026-08-31",
+      "consecutive_hits": 1,
+      "consecutive_misses": 0,
+      "pool": "ml-bets",
+      "dimension": "dispersion_bucket",
+      "value": "normal (0.25-0.45pp)",
+      "direction": "negative",
+      "notes": "BETS placed when book dispersion is normal go 25-50 (-36.0% flat, t=-3.38, p=0.0011) — the strongest t ever seen in the bet pool, on 75 of 173 settled bets. But treat with heavy suspicion: (1) CLV DISAGREES — avg CLV on these losing bets is +2.07%, i.e. the market moved TOWARD our side and the bets still lost, which for a bet-pool trend permanently blocks promotion until clv_agrees flips; results-vs-CLV divergence is the signature of variance, not edge. (2) The dispersion pattern is non-monotonic (tight +8.8%, normal -36.0%, wide +15.9%, very wide +31.7%) with no articulable mechanism for why MIDDLE dispersion specifically would be toxic — a U-shape like this is what overfitting looks like. (3) It inverts the dropped pass-pool dispersion story. Not Bonferroni-significant (p=0.0011 vs ~0.0004 bar, 133 cells). Watch it because the t demands it; expect it to be noise.",
+      "evidence": [
+        {
+          "run_date": "2026-08-31",
+          "report": "storage/retro/retro_report_2026-08-31.json",
+          "rows": 75,
+          "settled": 75,
+          "wins": 25,
+          "losses": 50,
+          "hit_rate": 0.3333,
+          "hit_rate_wilson_95": [
+            0.2371,
+            0.4458
+          ],
+          "breakeven_hit_rate": 0.4941,
+          "flat_pl_units": -26.981,
+          "flat_roi": -0.3598,
+          "t_stat": -3.38,
+          "p_value": 0.0011,
+          "bonferroni_significant": false,
+          "clv_agrees": false,
+          "avg_clv_pct": 2.067,
+          "clv_tracked": 72,
+          "cells_tested": 133
+        }
+      ]
+    },
+    {
+      "key": "totals-passes|roof=fixed_closed",
+      "status": "watch",
+      "first_seen": "2026-08-31",
+      "consecutive_hits": 1,
+      "consecutive_misses": 0,
+      "pool": "totals-passes",
+      "dimension": "roof",
+      "value": "fixed_closed",
+      "direction": "negative",
+      "notes": "Passed totals in closed-roof parks lose counterfactually: 10-20 / 30 settled, -36.5% flat, t=-2.19, p=0.037. Barely clears min_n=25 — smallest cell ever watched, so hold it loosely. Mechanism candidate: with the roof closed there is no weather variance for the market to misprice, so the model's non-weather total edge is thinner than its EV estimate implies — the engine is right to pass in domes. Pass pool: no CLV, paper-mode ceiling per SKILL.md; like the other pass-pool trends, promotion would read as validation of the pass logic, not a bet-more change. Not Bonferroni-significant.",
+      "evidence": [
+        {
+          "run_date": "2026-08-31",
+          "report": "storage/retro/retro_report_2026-08-31.json",
+          "rows": 31,
+          "settled": 30,
+          "wins": 10,
+          "losses": 20,
+          "hit_rate": 0.3333,
+          "hit_rate_wilson_95": [
+            0.1923,
+            0.5122
+          ],
+          "breakeven_hit_rate": 0.5208,
+          "flat_pl_units": -10.947,
+          "flat_roi": -0.3649,
+          "t_stat": -2.19,
+          "p_value": 0.037,
+          "bonferroni_significant": false,
+          "clv_agrees": null,
+          "cells_tested": 133
+        }
+      ]
+    },
+    {
+      "key": "totals-passes|pick_side=over",
+      "status": "watch",
+      "first_seen": "2026-08-31",
+      "consecutive_hits": 1,
+      "consecutive_misses": 0,
+      "pool": "totals-passes",
+      "dimension": "pick_side",
+      "value": "over",
+      "direction": "negative",
+      "notes": "Passed totals whose counterfactual pick was the OVER lose: 256-285 / 541 settled, -9.0% flat, t=-2.18, p=0.0294 — while passed unders roughly break even. This is the wide-aperture version of the residual-over-bias story tracked in totals-passes|tilt_bucket=mild over (which missed this run as its N doubled): the totals model still leans over relative to outcomes, and the EV bar is correctly absorbing it. If the tilt cell drops, this becomes the canonical framing per the overlap rule (same mechanism, 5x the N, no tilt-provenance truncation). Pass pool: no CLV, paper-mode ceiling. Not Bonferroni-significant.",
+      "evidence": [
+        {
+          "run_date": "2026-08-31",
+          "report": "storage/retro/retro_report_2026-08-31.json",
+          "rows": 574,
+          "settled": 541,
+          "wins": 256,
+          "losses": 285,
+          "hit_rate": 0.4732,
+          "hit_rate_wilson_95": [
+            0.4315,
+            0.5153
+          ],
+          "breakeven_hit_rate": 0.5211,
+          "flat_pl_units": -48.847,
+          "flat_roi": -0.0903,
+          "t_stat": -2.18,
+          "p_value": 0.0294,
+          "bonferroni_significant": false,
+          "clv_agrees": null,
+          "cells_tested": 133
+        }
+      ]
+    },
+    {
+      "key": "fb-spread-holds|hold_kind=divergence guard",
+      "status": "watch",
+      "first_seen": "2026-08-31",
+      "consecutive_hits": 0,
+      "consecutive_misses": 0,
+      "pool": "fb-spread-holds",
+      "dimension": "hold_kind",
+      "value": "divergence guard",
+      "direction": "tbd",
+      "notes": "Pre-registered 2026-08-31 (instrumented before any evidence — Jim asked for the learning capability after the Sep 3-5 CFB board produced 0 spread picks with 27 of 35 spread markets divergence-guard-held). Question: are guard-held spread leans covering AND beating the sharp close? Mechanism candidate: the CFB margin projection (base + centered PPA x plays) tops out ~+/-12 pts while CFB markets go to 38+, so on big spreads the model 'disagrees' by 8-33 pts, always on the dog side, and the guard holds everything past 6 pts. If the leans show positive cover ROI AND positive clv_pp on a decent sample, the fix is recalibrating the margin scale (e.g. a variance-matching multiplier on the strength term), NEVER just loosening the guard onto a knowingly compressed projection. Instrumentation shipped same day: engine grades analysis rows counterfactually (grading.grade_analyses), openings frozen at first sighting for hold-lens CLV, retro pools fb-spread-holds/fb-total-holds with dims hold_kind/spread_band/lean_type/league/month. Pass-pool lens: paper-mode ceiling per SKILL.md. Anecdote only: both guard-held big-spread dog leans on the Aug 29 retro slate covered (n=2).",
+      "evidence": []
     }
   ]
 }

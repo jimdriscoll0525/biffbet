@@ -138,7 +138,7 @@ def upsert_pick(analysis, pick, config: dict) -> int:
 
     with connect() as conn:
         existing = conn.execute(
-            "SELECT id, is_value, opening_line, opening_price, opening_devig_p_side "
+            "SELECT id, is_value, pick_side, opening_line, opening_price, opening_devig_p_side "
             "FROM football_recommendations WHERE league=? AND date=? AND game_id=? AND market=?",
             (analysis.league, analysis.date, analysis.game_id, pick.market),
         ).fetchone()
@@ -167,11 +167,23 @@ def upsert_pick(analysis, pick, config: dict) -> int:
 
         if existing:
             # Analysis row: full refresh; promotion sets the opening reference.
+            #
+            # Hold-lens CLV (ability instrumentation, 2026-08-31): analysis
+            # rows ALSO keep a frozen opening reference so the weekly retro
+            # can measure CLV on guard-held leans (e.g. divergence-guard
+            # spreads) against the sharp close — the question being whether
+            # the guard is suppressing a real edge. The opening is frozen at
+            # FIRST sighting and RE-frozen only if the best side flips
+            # between runs (a flipped side would make open-vs-close a
+            # comparison across different bets). Promotion to a paper bet
+            # still stamps the commit-time opening, exactly as before.
             now_bet = 1 if pick.is_value else 0
-            open_line = f["line"] if pick.is_value else existing["opening_line"]
-            open_price = pick.american_odds if pick.is_value else existing["opening_price"]
-            open_devig = f["devig_side"] if pick.is_value else existing["opening_devig_p_side"]
-            clv = _clv_pp(open_devig, f["sharp_devig_side"]) if pick.is_value else None
+            side_flipped = existing["pick_side"] != pick.side
+            refreeze = pick.is_value or side_flipped or existing["opening_devig_p_side"] is None
+            open_line = f["line"] if refreeze else existing["opening_line"]
+            open_price = pick.american_odds if refreeze else existing["opening_price"]
+            open_devig = f["devig_side"] if refreeze else existing["opening_devig_p_side"]
+            clv = _clv_pp(open_devig, f["sharp_devig_side"])
             conn.execute(
                 """
                 UPDATE football_recommendations SET
@@ -194,7 +206,7 @@ def upsert_pick(analysis, pick, config: dict) -> int:
                          analysis.game_id, pick.market, pick.side, f["line"])
             return int(existing["id"])
 
-        clv = _clv_pp(f["devig_side"], f["sharp_devig_side"]) if pick.is_value else None
+        clv = _clv_pp(f["devig_side"], f["sharp_devig_side"])
         cur = conn.execute(
             """
             INSERT INTO football_recommendations (
@@ -215,9 +227,9 @@ def upsert_pick(analysis, pick, config: dict) -> int:
                m.get("home_edge"), m.get("archetype"),
                proj.get("margin"), proj.get("total"), paper, model_tag,
                json.dumps(pick.reasoning),
-               f["line"] if pick.is_value else None,
-               pick.american_odds if pick.is_value else None,
-               f["devig_side"] if pick.is_value else None,
+               # Opening reference frozen for ALL rows at first insert
+               # (hold-lens CLV instrumentation, 2026-08-31).
+               f["line"], pick.american_odds, f["devig_side"],
                f["line"], pick.american_odds, f["sharp_line"], f["sharp_devig_side"],
                clv, "pending", 1 if pick.is_value else 0, now, now),
         )
@@ -247,10 +259,16 @@ def update_result(rec_id: int, result: str, profit_loss: float | None,
         )
 
 
-def get_open_bets(league: str | None = None, before: str | None = None) -> list[sqlite3.Row]:
-    """Pending committed bets — the grading worklist."""
+def get_open_bets(league: str | None = None, before: str | None = None,
+                  include_analyses: bool = False) -> list[sqlite3.Row]:
+    """Pending committed bets — the grading worklist. With include_analyses,
+    pending is_value=0 rows are returned too (counterfactual hold-lens
+    grading, 2026-08-31); callers must keep their stats separate from the
+    real record (flat_stake is 0 on those rows, so P/L math is unaffected)."""
     init_db()
-    q = "SELECT * FROM football_recommendations WHERE result='pending' AND is_value=1"
+    q = "SELECT * FROM football_recommendations WHERE result='pending'"
+    if not include_analyses:
+        q += " AND is_value=1"
     params: list = []
     if league:
         q += " AND league=?"

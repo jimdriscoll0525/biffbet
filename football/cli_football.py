@@ -159,10 +159,12 @@ def results(before: str | None) -> None:
         click.echo("No past dates with open football bets.")
         return
     for s in summaries:
+        extra = (f" (+{s.analyses_graded} held/analysis markets graded "
+                 f"counterfactually)" if s.analyses_graded else "")
         click.echo(f"{s.league.upper()}: {s.graded} settled "
                    f"({s.wins}W-{s.losses}L-{s.pushes}P), {s.voids} void, "
                    f"{s.pending} pending, P/L {s.profit_loss:+.4f}u "
-                   f"across {len(s.dates)} date(s)")
+                   f"across {len(s.dates)} date(s){extra}")
 
 
 @cli.command(name="pull")
