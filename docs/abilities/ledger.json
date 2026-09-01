@@ -1,6 +1,6 @@
 {
   "_comment": "Persistent trend/ability memory for the self-improve skill. Managed by .claude/skills/self-improve/SKILL.md — read that before editing. Statuses: watch | proposed | active | rejected | retired | retire-recommended | dropped.",
-  "updated": "2026-08-31",
+  "updated": "2026-09-01",
   "abilities": [
     {
       "key": "ml-passes|odds_bucket=small fav (-101..-149)",
@@ -459,6 +459,41 @@
           "clv_anchored_pts": 0.02,
           "dog_share_anchored": 0.3,
           "note": "ROI look-ahead-inflated; CLV honest. Elo fit: 23 Elo pts per margin pt, corr 0.61 w/ actual margins, MAE 4.8 vs close."
+        }
+      ]
+    },
+    {
+      "key": "fb-model|nfl-ats-epa-anchor",
+      "status": "rejected",
+      "first_seen": "2026-09-01",
+      "proposed": "2026-09-01",
+      "rejected": "2026-09-01",
+      "consecutive_hits": 0,
+      "consecutive_misses": 0,
+      "pool": "fb-bets",
+      "dimension": "model",
+      "value": "nfl margin = EPA+SR rating anchor + conditional tilt",
+      "direction": "structural",
+      "proposal_doc": "docs/abilities/proposals/2026-09-01-nfl-ats-core.md",
+      "config_keys": [
+        "projections.margin_anchor_nfl"
+      ],
+      "notes": "Built (M1-M4) and gate-tested same day. 2025 holdout: 50.5% ATS at |edge|>=2 degrading to 46.2% at >=4 (bigger disagreement = more wrong = noise), pipeline CLV+ 29% on 24 picks. Anchor stays null; module retained for diagnostics (ratings CLI, luck flags, QB pressure sens). Re-propose only on live-season fb-spread-holds/clv_pp evidence, never by re-tuning the same seasons.",
+      "evidence": [
+        {
+          "run_date": "2026-09-01",
+          "report": "session scratchpad tune_ats.py -> ats_grid_stage1.parquet / ats_holdout_2025.parquet / ats_pipeline_2025.parquet",
+          "holdout_games": 272,
+          "ats_edge2": 0.505,
+          "ats_edge3": 0.491,
+          "ats_edge4": 0.462,
+          "pipeline_picks": 24,
+          "pipeline_record": "14-8-2",
+          "pipeline_clv_pts": 0.12,
+          "pipeline_clv_pos": 0.29,
+          "insample_ats2": 0.522,
+          "corr_close": 0.815,
+          "note": "gate: holdout CLV>=0 AND top-tier ATS>=~52% — failed on the 196-game margin sample"
         }
       ]
     }

@@ -187,11 +187,14 @@ projections:
   # KILL CRITERIA: set margin_anchor_cfb to null if after 40 graded CFB
   # spread paper picks avg clv_pp < 0; review at 40 regardless.
   margin_anchor_cfb: "elo"
-  # NFL ATS core anchor (M2, plan approved 2026-09-01): "epa_rating" points
-  # the NFL margin at the EPA+success-rate power rating (nfl_rating below)
-  # with the matchup layer as the clamped tilt. DELIBERATELY null until the
-  # M6 walk-forward backtest (2023-24 tune, 2025 holdout) passes its gate:
-  # CLV >= 0 and top-tier ATS >= ~52% on the holdout.
+  # NFL ATS core anchor (M2). GATE FAILED 2026-09-01 — stays null. The M6
+  # walk-forward holdout (2025, untouched by tuning) showed the anchored
+  # margin is market-CONSISTENT, not market-beating: 50.5% ATS at |edge|>=2
+  # (n=196) degrading monotonically with edge size (46.2% at >=4) — bigger
+  # model/market disagreement = more wrong = noise. corr 0.815 / MAE 5.2 vs
+  # the close: an excellent model OF the market. Full verdict:
+  # docs/abilities/proposals/2026-09-01-nfl-ats-core.md. Re-propose only on
+  # live-season evidence (the fb-spread-holds lens watches for it).
   margin_anchor_nfl: null
   margin_tilt_max_nfl: 4.0
   elo_points_per_margin: 23.0      # fitted on 2025 FBS: 23 Elo pts ~ 1 pt of margin
@@ -242,7 +245,11 @@ weather:
 # garbage-time re-weighted, recency-decayed, prior-blended. Every value here
 # is provisional until the M6 backtest fits it — see the module docstring.
 nfl_rating:
-  decay: 0.90                 # per-week exponential recency decay
+  # Values below are the M6-tuned set (2023-24 walk-forward grid, 48+4
+  # combos). Notable: recency decay showed NO in-sample ATS value (decay 1.0
+  # beat 0.85-0.95 families) — kept at 1.0 with the knob retained; the
+  # EPA/SR 70/30 mix and mild garbage-time discount led their families.
+  decay: 1.00                 # per-week exponential recency decay (1.0 = off)
   gt_weight: 0.2              # weight on plays at wp <0.05 or >0.95
   epa_share: 0.7              # EPA vs success-rate mix in the composite
   sr_share: 0.3
