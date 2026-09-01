@@ -218,6 +218,31 @@ def drive_stats_cmd(season: int | None, do_sync: bool) -> None:
         click.echo(f"Synced {n} drive-stat row(s) to Supabase.")
 
 
+@cli.command(name="ratings")
+@click.option("--season", type=int, default=None, help="Season year (default: inferred).")
+@click.option("--week", type=int, default=None, help="As-of week (default: inferred).")
+def ratings_cmd(season: int | None, week: int | None) -> None:
+    """Debug board: the NFL ATS core power ratings (M2) — points scale,
+    walk-forward as of --week. Pure model output for hand-checking."""
+    from mlb_value_bot.football.analysis.nfl_rating import prior_weight, team_ratings
+    from mlb_value_bot.football.data import nfl_client
+    from mlb_value_bot.football.pipeline_football import _infer_week
+
+    config = load_football_config()
+    today = date.today().isoformat()
+    yr = season or season_for_date(today)
+    wk = week or _infer_week(config, "nfl", yr, today)
+    r = team_ratings(nfl_client.week_stats(yr, config),
+                     nfl_client.week_stats(yr - 1, config), wk, config)
+    if r.empty:
+        click.echo(f"No rating inputs for season {yr} week {wk}.")
+        return
+    click.echo(f"NFL ATS core ratings — season {yr}, as of week {wk} "
+               f"(prior weight {prior_weight(wk, config):.2f}):")
+    cols = ["rating_pts", "net_epa", "net_sr", "off_epa", "def_epa", "plays_pg", "games"]
+    click.echo(r[cols].round(3).to_string())
+
+
 @cli.command(name="grade-live")
 @click.option("--before", default=None, help="Grade recs dated before this (default: today).")
 def grade_live_cmd(before: str | None) -> None:

@@ -1254,3 +1254,118 @@ class TestQbGuard:
         sig = inspect.signature(pf._evaluate_market)
         assert "qb_hold" in sig.parameters
         assert sig.parameters["qb_hold"].default is None
+
+
+class TestNflWeekStats:
+    def _pbp(self):
+        # 2 teams, 2 weeks. KC offense vs BUF defense and mirror.
+        rows = []
+        for week, wp, epa, succ in [(1, 0.5, 0.2, 1), (1, 0.5, -0.1, 0), (1, 0.99, 0.8, 1),
+                                    (2, 0.5, 0.3, 1)]:
+            rows.append(dict(game_id=f"g{week}", week=week, posteam="KC", defteam="BUF",
+                             **{"pass": 1}, rush=0, qb_dropback=1, epa=epa, success=succ,
+                             wp=wp, sack=0, qb_hit=0, yards_gained=8, rush_attempt=0,
+                             interception=0, fumble=0, fumble_lost=0, yardline_100=50,
+                             touchdown=0, passer_player_name="P.Mahomes"))
+        rows.append(dict(game_id="g1", week=1, posteam="BUF", defteam="KC",
+                         **{"pass": 0}, rush=1, qb_dropback=0, epa=-0.2, success=0,
+                         wp=0.5, sack=0, qb_hit=0, yards_gained=0, rush_attempt=1,
+                         interception=0, fumble=1, fumble_lost=1, yardline_100=15,
+                         touchdown=0, passer_player_name=None))
+        return pd.DataFrame(rows)
+
+    def test_aggregates_split_gt_and_sides(self):
+        from mlb_value_bot.football.analysis.nfl_week_stats import week_team_stats
+
+        ws = week_team_stats(self._pbp())
+        kc1 = ws[(ws.team == "KC") & (ws.week == 1)].iloc[0]
+        assert kc1["off_all_ngt_plays"] == 2          # wp .99 play split out
+        assert kc1["off_all_gt_plays"] == 1
+        assert kc1["off_all_ngt_epa"] == pytest.approx(0.1)
+        assert kc1["off_all_gt_epa"] == pytest.approx(0.8)
+        assert kc1["def_all_ngt_plays"] == 1          # BUF's rush against KC D
+        assert kc1["def_stuffs"] == 1                 # 0-yard rush
+        assert kc1["def_fumbles_lost"] == 1           # takeaway shows on D side
+        buf1 = ws[(ws.team == "BUF") & (ws.week == 1)].iloc[0]
+        assert buf1["off_fumbles_lost"] == 1
+        assert buf1["off_rz_plays"] == 1              # snapped from the 15
+        assert week_team_stats(pd.DataFrame()).empty  # degrade
+
+    def test_qb_week_stats_hit_split(self):
+        from mlb_value_bot.football.analysis.nfl_week_stats import week_qb_stats
+
+        pbp = self._pbp()
+        pbp.loc[0, "qb_hit"] = 1
+        q = week_qb_stats(pbp)
+        row = q[(q.passer == "P.Mahomes") & (q.week == 1)].iloc[0]
+        assert row["dropbacks"] == 3
+        assert row["hit_dropbacks"] == 1
+        assert row["hit_epa_sum"] == pytest.approx(0.2)
+
+
+class TestNflRating:
+    CFG = {"nfl_rating": {"decay": 0.5, "gt_weight": 0.0, "epa_share": 1.0,
+                          "sr_share": 0.0, "prior_weight_week1": 0.8,
+                          "prior_out_week": 8}}
+
+    def _ws(self, team, weeks_epa):
+        rows = []
+        for week, epa in weeks_epa:
+            r = {"team": team, "week": week, "off_games": 1, "def_games": 1}
+            for side in ("off", "def"):
+                for phase in ("all", "pass", "rush"):
+                    for b in ("ngt", "gt"):
+                        r[f"{side}_{phase}_{b}_plays"] = 0.0
+                        r[f"{side}_{phase}_{b}_epa"] = 0.0
+                        r[f"{side}_{phase}_{b}_succ"] = 0.0
+            r["off_all_ngt_plays"] = 10.0
+            r["off_all_ngt_epa"] = epa * 10
+            r["off_all_ngt_succ"] = 5.0
+            r["def_all_ngt_plays"] = 10.0
+            r["def_all_ngt_epa"] = 0.0
+            r["def_all_ngt_succ"] = 5.0
+            rows.append(r)
+        return pd.DataFrame(rows)
+
+    def test_recency_decay_and_walk_forward(self):
+        from mlb_value_bot.football.analysis.nfl_rating import team_ratings
+
+        # Week 1 EPA 0.0, week 2 EPA 0.4; as of week 3 with decay .5 the
+        # weighted off EPA = (.5*0 + 1*.4*10)/(.5*10 + 1*10) plays.
+        ws = self._ws("KC", [(1, 0.0), (2, 0.4), (3, 9.9)])   # week 3 must be IGNORED
+        r = team_ratings(ws, pd.DataFrame(), 3, dict(self.CFG, nfl_rating={**self.CFG["nfl_rating"], "prior_weight_week1": 0.0}))
+        assert r.loc["KC", "off_epa"] == pytest.approx((0.5 * 0 + 1.0 * 4.0) / 15.0)
+        assert r.loc["KC", "rating_pts"] == pytest.approx(r.loc["KC", "plays_pg"] * r.loc["KC", "net_epa"])
+
+    def test_prior_blend_schedule(self):
+        from mlb_value_bot.football.analysis.nfl_rating import prior_weight, team_ratings
+
+        assert prior_weight(1, self.CFG) == pytest.approx(0.8)
+        assert prior_weight(8, self.CFG) == 0.0
+        cur = self._ws("KC", [(1, 0.0)])
+        pri = self._ws("KC", [(1, 0.4)] * 1)
+        r = team_ratings(cur, pri, 2, self.CFG)
+        pw = prior_weight(2, self.CFG)
+        assert r.loc["KC", "off_epa"] == pytest.approx((1 - pw) * 0.0 + pw * 0.4)
+        # No current data at all -> pure prior.
+        r2 = team_ratings(pd.DataFrame(), pri, 1, self.CFG)
+        assert r2.loc["KC", "off_epa"] == pytest.approx(0.4)
+
+    def test_gt_weight_downweights_blowout_plays(self):
+        from mlb_value_bot.football.analysis.nfl_rating import team_ratings
+
+        ws = self._ws("KC", [(1, 0.0)])
+        ws["off_all_gt_plays"] = 10.0
+        ws["off_all_gt_epa"] = 8.0            # huge garbage-time EPA
+        cfg0 = {"nfl_rating": {**self.CFG["nfl_rating"], "gt_weight": 0.0, "prior_weight_week1": 0.0}}
+        cfg1 = {"nfl_rating": {**self.CFG["nfl_rating"], "gt_weight": 1.0, "prior_weight_week1": 0.0}}
+        r0 = team_ratings(ws, pd.DataFrame(), 2, cfg0)
+        r1 = team_ratings(ws, pd.DataFrame(), 2, cfg1)
+        assert r0.loc["KC", "off_epa"] == pytest.approx(0.0)
+        assert r1.loc["KC", "off_epa"] > 0.3   # full weight lets blowout stats in
+
+    def test_nfl_anchor_gated_off_by_default(self):
+        from mlb_value_bot.football.pipeline_football import _nfl_ratings_map
+
+        assert _nfl_ratings_map(2026, 1, {"projections": {}}) is None
+        assert _nfl_ratings_map(2026, 1, {"projections": {"margin_anchor_nfl": None}}) is None

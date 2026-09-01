@@ -187,6 +187,13 @@ projections:
   # KILL CRITERIA: set margin_anchor_cfb to null if after 40 graded CFB
   # spread paper picks avg clv_pp < 0; review at 40 regardless.
   margin_anchor_cfb: "elo"
+  # NFL ATS core anchor (M2, plan approved 2026-09-01): "epa_rating" points
+  # the NFL margin at the EPA+success-rate power rating (nfl_rating below)
+  # with the matchup layer as the clamped tilt. DELIBERATELY null until the
+  # M6 walk-forward backtest (2023-24 tune, 2025 holdout) passes its gate:
+  # CLV >= 0 and top-tier ATS >= ~52% on the holdout.
+  margin_anchor_nfl: null
+  margin_tilt_max_nfl: 4.0
   elo_points_per_margin: 23.0      # fitted on 2025 FBS: 23 Elo pts ~ 1 pt of margin
   margin_tilt_max_cfb: 6.0
   # Spread/total margin distribution sigma (pts) for cover/over probabilities.
@@ -229,6 +236,19 @@ weather:
   cold_f_start: 25.0               # suppression begins below this temp
   cold_coef_per_f: 0.004
   timeout: 8
+
+# NFL ATS core rating (M1+M2, 2026-09-01). rating_pts = plays_pg x
+# (epa_share x net EPA/play + sr_share x sr_epa_equiv x net success rate),
+# garbage-time re-weighted, recency-decayed, prior-blended. Every value here
+# is provisional until the M6 backtest fits it — see the module docstring.
+nfl_rating:
+  decay: 0.90                 # per-week exponential recency decay
+  gt_weight: 0.2              # weight on plays at wp <0.05 or >0.95
+  epa_share: 0.7              # EPA vs success-rate mix in the composite
+  sr_share: 0.3
+  sr_epa_equiv: 1.6           # EPA-per-play per unit of success rate (league slope)
+  prior_weight_week1: 0.8     # prior-season blend, linear to 0 by prior_out_week
+  prior_out_week: 8
 
 # QB availability guard (2026-08-31; NFL only — the football twin of MLB's
 # scratched-starter guard). One free ESPN injuries call (cached ttl_hours)

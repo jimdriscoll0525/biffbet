@@ -34,6 +34,9 @@ _PBP_COLS = [
     # Cached parquets from before this change lack the column until their
     # TTL refresh; qb_status degrades gracefully in the meantime.
     "passer_player_name",
+    # ATS core rating, M1 (2026-09-01): win probability for the garbage-time
+    # filter, down/distance for context, fumble fields for the luck lens.
+    "wp", "down", "ydstogo", "fumble", "fumble_forced",
 ]
 
 
@@ -99,6 +102,32 @@ def schedules(season: int, config: dict, force_refresh: bool = False) -> pd.Data
         f"nfl_schedules_{season}",
         lambda: _load("load_schedules", season),
         ttl_seconds=_ttl_hours(config, "schedules_ttl_hours", 3),
+        force_refresh=force_refresh,
+    )
+
+
+def week_stats(season: int, config: dict, force_refresh: bool = False) -> pd.DataFrame:
+    """Per-(team, week) aggregates for the ATS core rating (M1, 2026-09-01).
+    Cached so raw pbp is never re-aggregated on every run; the producer reads
+    the (already cached) trimmed pbp."""
+    from mlb_value_bot.football.analysis.nfl_week_stats import week_team_stats
+
+    return cached_dataframe(
+        f"nfl_weekstats_{season}",
+        lambda: week_team_stats(pbp(season, config)),
+        ttl_seconds=_ttl_hours(config, "pbp_ttl_hours", 12),
+        force_refresh=force_refresh,
+    )
+
+
+def qb_week_stats(season: int, config: dict, force_refresh: bool = False) -> pd.DataFrame:
+    """Per-(passer, week) EPA splits incl. under-hit — the M3 pressure lens."""
+    from mlb_value_bot.football.analysis.nfl_week_stats import week_qb_stats
+
+    return cached_dataframe(
+        f"nfl_qbweek_{season}",
+        lambda: week_qb_stats(pbp(season, config)),
+        ttl_seconds=_ttl_hours(config, "pbp_ttl_hours", 12),
         force_refresh=force_refresh,
     )
 

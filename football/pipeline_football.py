@@ -517,9 +517,11 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
     # QB availability flags (NFL only; one cached ESPN call for the league).
     qb_flags_map: dict[str, str] = {}
     qb_note = None
+    nfl_ratings: dict[str, float] | None = None
     if league == "nfl":
         from mlb_value_bot.football.data.qb_status import compute_flags
         qb_flags_map, qb_note = compute_flags(season, config)
+        nfl_ratings = _nfl_ratings_map(season, ctx.week, config)
 
     pcfg = config.get("projections", {})
     pool_rz = float(ctx.unit_stats["rz_td_rate"].mean()) \
@@ -607,8 +609,13 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
                                coords[1] if coords else None,
                                game.commence_time, indoor, config)
 
+        if league == "nfl" and nfl_ratings is not None:
+            rh, ra = nfl_ratings.get(home), nfl_ratings.get(away)
+            power = (rh - ra) if rh is not None and ra is not None else None
+        else:
+            power = _power_margin_for(league, row, config)
         projection = project_game_for(ctx, scored, weather, pool_rz, lean,
-                                      power_margin=_power_margin_for(league, row, config))
+                                      power_margin=power)
 
         g5_involved = ctx.league == "cfb" and bool({home, away} & ctx.g5_teams)
         explosive_involved = False
@@ -703,6 +710,28 @@ def _power_margin_for(league: str, row, config: dict) -> float | None:
         return None
     per_pt = float(config.get("projections", {}).get("elo_points_per_margin", 23.0))
     return (float(he) - float(ae)) / per_pt
+
+
+def _nfl_ratings_map(season: int, week: int, config: dict) -> dict[str, float] | None:
+    """team -> rating_pts for the NFL ATS core anchor (M2, 2026-09-01).
+    None while `projections.margin_anchor_nfl` != "epa_rating" — the anchor
+    is OFF until the M6 walk-forward backtest passes its gate. Degrades to
+    None (EPA-only margins, current behavior) on any data failure."""
+    if config.get("projections", {}).get("margin_anchor_nfl") != "epa_rating":
+        return None
+    try:
+        from mlb_value_bot.football.analysis.nfl_rating import team_ratings
+        from mlb_value_bot.football.data import nfl_client
+
+        cur = nfl_client.week_stats(season, config)
+        pri = nfl_client.week_stats(season - 1, config)
+        ratings = team_ratings(cur, pri, week, config)
+        if ratings.empty:
+            return None
+        return ratings["rating_pts"].to_dict()
+    except Exception as exc:  # noqa: BLE001 — never kill the slate on a rating
+        log.warning("nfl rating anchor unavailable: %s", exc)
+        return None
 
 
 def build_drive_stats(league: str, season: int, week: int, config: dict) -> pd.DataFrame:
