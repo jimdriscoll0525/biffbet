@@ -25,6 +25,12 @@ $env:PYTHONPATH = Split-Path $repo
 & "$repo\.venv\Scripts\python.exe" -m mlb_value_bot pull `
     *> "$repo\storage\retro\last_run.log"
 
+# 0b. Football tables too (2026-09-01): the retro now mines fb-bets and
+#     the guard-held hold-lens pools; without this pull those cells sit
+#     stale (step 0 pulls only the MLB tables).
+& "$repo\.venv\Scripts\python.exe" -m mlb_value_bot.football pull `
+    *>> "$repo\storage\retro\last_run.log"
+
 # 1. Deterministic data collection (read-only; caches pass grades).
 & "$repo\.venv\Scripts\python.exe" "$repo\.claude\skills\self-improve\scripts\retro_analysis.py" `
     *>> "$repo\storage\retro\last_run.log"
