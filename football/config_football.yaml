@@ -250,6 +250,29 @@ nfl_rating:
   prior_weight_week1: 0.8     # prior-season blend, linear to 0 by prior_out_week
   prior_out_week: 8
 
+# M3 conditional matchup adjustments (fire ONLY on top-N vs bottom-N unit
+# mismatches; neutral matchups contribute zero to avoid double-counting the
+# core rating). Point sizes provisional until M6 fits them; the summed tilt
+# is clamped by projections.margin_tilt_max_nfl.
+nfl_matchup:
+  edge_n: 10                    # "top-10 vs bottom-10" of 32
+  rush_adj_pts: 1.0
+  pass_adj_pts: 1.5
+  qb_pressure_adj_pts: 1.0
+  ol_pass_adj_pts: 1.0
+  ol_run_adj_pts: 0.5
+  qb_pressure_sens_quantile: 0.25   # bottom-quartile EPA drop when hit
+
+# M4 luck / regression flags: season-to-date randomness indicators (fumble
+# recovery %, RZ TD rate vs expected, TO margin vs expected, wins vs
+# EPA-implied). fade = wins outrun EPA, buy = EPA outruns record; nudges the
+# margin by luck_adjust_pts (0 disables — M6 decides if it earns its keep).
+nfl_regression:
+  min_games: 4
+  flag_threshold: 0.18
+  luck_adjust_pts: 1.0
+  weights: {win_luck: 1.0, to_luck: 0.5, fumble_luck: 0.5, rz_luck: 0.5}
+
 # QB availability guard (2026-08-31; NFL only — the football twin of MLB's
 # scratched-starter guard). One free ESPN injuries call (cached ttl_hours)
 # identifies teams whose PRIMARY passer — the QB who threw the most passes in

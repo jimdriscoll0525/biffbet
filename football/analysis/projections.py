@@ -92,7 +92,8 @@ def project_game(home_units: dict, away_units: dict, league: str, config: dict,
                  pass_weight: float, rush_weight: float,
                  weather_mult: float = 1.0,
                  pool_rz_avg: float | None = None,
-                 power_margin: float | None = None) -> GameProjection:
+                 power_margin: float | None = None,
+                 tilt_pts: float | None = None) -> GameProjection:
     """`power_margin` (2026-08-31, CFB margin anchor): a points-scale rating
     differential (home-positive, EXCLUDING HFA) — pregame Elo diff / 23 from
     CFBD, supplied by the pipeline. When present, the margin becomes
@@ -120,7 +121,11 @@ def project_game(home_units: dict, away_units: dict, league: str, config: dict,
     away_pts = away.points - hfa / 2
     if power_margin is not None:
         tilt_max = float(cfg.get(f"margin_tilt_max_{league}", 6.0))
-        epa_tilt = max(-tilt_max, min(tilt_max, margin - hfa))
+        # NFL ATS (M3): the tilt is the CONDITIONAL matchup+luck adjustment,
+        # not the EPA margin (whose information already lives in the core
+        # rating). CFB keeps the EPA-margin tilt on its Elo anchor.
+        raw_tilt = tilt_pts if tilt_pts is not None else (margin - hfa)
+        epa_tilt = max(-tilt_max, min(tilt_max, raw_tilt))
         margin = power_margin + hfa + epa_tilt
         # Re-derive the displayed team points so margin+total stay coherent.
         home_pts = (total_raw + margin) / 2

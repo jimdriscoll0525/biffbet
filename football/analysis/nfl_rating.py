@@ -32,16 +32,53 @@ def _weighted_stats(ws: pd.DataFrame, as_of_week: int, decay: float,
         d[f"{side}_plays_w"] = w * (d[f"{side}_all_ngt_plays"] + gt_weight * d[f"{side}_all_gt_plays"])
         d[f"{side}_epa_w"] = w * (d[f"{side}_all_ngt_epa"] + gt_weight * d[f"{side}_all_gt_epa"])
         d[f"{side}_succ_w"] = w * (d[f"{side}_all_ngt_succ"] + gt_weight * d[f"{side}_all_gt_succ"])
+    # Phase splits + proxy rates for the M3 conditional matchup layer.
+    # Tolerate frames without the proxy columns (fixtures, or a weekstats
+    # parquet cached before M3 shipped): absent counts contribute zero.
+    for side in ("off", "def"):
+        for col in ("dropbacks", "sacks", "qb_hits", "stuffs", "rush_att"):
+            if f"{side}_{col}" not in d.columns:
+                d[f"{side}_{col}"] = 0.0
+        for phase in ("pass", "rush"):
+            d[f"{side}_{phase}_plays_w"] = w * (d[f"{side}_{phase}_ngt_plays"]
+                                                + gt_weight * d[f"{side}_{phase}_gt_plays"])
+            d[f"{side}_{phase}_epa_w"] = w * (d[f"{side}_{phase}_ngt_epa"]
+                                              + gt_weight * d[f"{side}_{phase}_gt_epa"])
+            d[f"{side}_{phase}_succ_w"] = w * (d[f"{side}_{phase}_ngt_succ"]
+                                               + gt_weight * d[f"{side}_{phase}_gt_succ"])
+        for col in ("dropbacks", "sacks", "qb_hits", "stuffs", "rush_att"):
+            d[f"{side}_{col}_w"] = w * d[f"{side}_{col}"]
     d["games_w"] = (w if recency else 1.0) * d["off_games"].clip(lower=1)
     d["plays_raw"] = d["off_all_ngt_plays"] + d["off_all_gt_plays"]
     g = d.groupby("team")
+
+    def _rate(num, den):
+        den_s = g[den].sum()
+        return g[num].sum() / den_s.where(den_s > 0)
+
     out = pd.DataFrame({
-        "off_epa": g["off_epa_w"].sum() / g["off_plays_w"].sum(),
-        "off_sr": g["off_succ_w"].sum() / g["off_plays_w"].sum(),
-        "def_epa": g["def_epa_w"].sum() / g["def_plays_w"].sum(),
-        "def_sr": g["def_succ_w"].sum() / g["def_plays_w"].sum(),
+        "off_epa": _rate("off_epa_w", "off_plays_w"),
+        "off_sr": _rate("off_succ_w", "off_plays_w"),
+        "def_epa": _rate("def_epa_w", "def_plays_w"),
+        "def_sr": _rate("def_succ_w", "def_plays_w"),
         "plays_pg": g["plays_raw"].sum() / g["off_games"].sum().clip(lower=1),
         "games": g["off_games"].sum(),
+        # Phase rates (M3): epa/play + success rate per phase, both sides.
+        "off_pass_epa": _rate("off_pass_epa_w", "off_pass_plays_w"),
+        "off_pass_sr": _rate("off_pass_succ_w", "off_pass_plays_w"),
+        "off_rush_epa": _rate("off_rush_epa_w", "off_rush_plays_w"),
+        "off_rush_sr": _rate("off_rush_succ_w", "off_rush_plays_w"),
+        "def_pass_epa": _rate("def_pass_epa_w", "def_pass_plays_w"),
+        "def_pass_sr": _rate("def_pass_succ_w", "def_pass_plays_w"),
+        "def_rush_epa": _rate("def_rush_epa_w", "def_rush_plays_w"),
+        "def_rush_sr": _rate("def_rush_succ_w", "def_rush_plays_w"),
+        # OL/DL + pressure proxies (M3): taken on offense, generated on D.
+        "sack_rate_taken": _rate("off_sacks_w", "off_dropbacks_w"),
+        "sack_rate_made": _rate("def_sacks_w", "def_dropbacks_w"),
+        "pressure_rate_made": (g["def_sacks_w"].sum() + g["def_qb_hits_w"].sum())
+                              / g["def_dropbacks_w"].sum().where(g["def_dropbacks_w"].sum() > 0),
+        "stuff_rate_taken": _rate("off_stuffs_w", "off_rush_att_w"),
+        "stuff_rate_made": _rate("def_stuffs_w", "def_rush_att_w"),
     })
     return out
 

@@ -1369,3 +1369,101 @@ class TestNflRating:
 
         assert _nfl_ratings_map(2026, 1, {"projections": {}}) is None
         assert _nfl_ratings_map(2026, 1, {"projections": {"margin_anchor_nfl": None}}) is None
+
+
+class TestNflMatchupAdj:
+    def _table(self):
+        # DETERMINISTIC graded values: T0..T29 in a strict order so every
+        # rank is known (a random fixture can legitimately put a mid team
+        # in the top 10 of 32 and fire a channel we didn't intend to test).
+        teams = [f"T{i}" for i in range(30)] + ["GOOD", "BAD"]
+        t = pd.DataFrame(index=teams)
+        grade = [0.001 * i for i in range(30)] + [0.015, 0.015]  # focal teams mid
+        for col in ("off_rush_epa", "off_rush_sr", "def_rush_epa", "def_rush_sr",
+                    "off_pass_epa", "def_pass_epa", "sack_rate_taken",
+                    "sack_rate_made", "pressure_rate_made",
+                    "stuff_rate_taken", "stuff_rate_made"):
+            t[col] = grade
+        t.loc["GOOD", "off_pass_epa"] = 0.5             # clear top-10 offense
+        t.loc["BAD", "def_pass_epa"] = 0.5              # allows the most (worst D)
+        return t
+
+    def test_fires_only_on_real_mismatch_and_is_signed(self):
+        from mlb_value_bot.football.analysis.nfl_matchup_adj import matchup_adjustments
+
+        cfg = {"nfl_matchup": {"edge_n": 10, "pass_adj_pts": 1.5, "rush_adj_pts": 0.0,
+                               "ol_pass_adj_pts": 0.0, "ol_run_adj_pts": 0.0,
+                               "qb_pressure_adj_pts": 0.0}}
+        t = self._table()
+        pts, notes = matchup_adjustments("GOOD", "BAD", t, pd.Series(dtype=float), cfg)
+        assert pts == pytest.approx(1.5)                # pass channel, home side
+        assert any("pass" in n for n in notes)
+        pts2, _ = matchup_adjustments("BAD", "GOOD", t, pd.Series(dtype=float), cfg)
+        assert pts2 == pytest.approx(-1.5)              # same edge, away side
+        # Two genuinely mid-table teams: nothing fires. (T5/T6 would be a
+        # bad choice: in the graded fixture the low-index teams are both
+        # bottom-10 offenses AND top-10 defenses, so a channel legitimately
+        # fires for them — which is itself the intended behavior.)
+        pts3, notes3 = matchup_adjustments("T14", "T16", t, pd.Series(dtype=float), cfg)
+        assert pts3 == 0.0 and notes3 == []
+
+    def test_qb_pressure_sensitivity_and_channel(self):
+        from mlb_value_bot.football.analysis.nfl_matchup_adj import (
+            matchup_adjustments, qb_pressure_sensitivity)
+
+        qb_ws = pd.DataFrame([
+            {"passer": "F.Fragile", "team": "GOOD", "week": 1,
+             "dropbacks": 100, "epa_sum": 10.0, "hit_dropbacks": 25, "hit_epa_sum": -12.5},
+            {"passer": "S.Stoic", "team": "BAD", "week": 1,
+             "dropbacks": 100, "epa_sum": 10.0, "hit_dropbacks": 25, "hit_epa_sum": 2.5},
+        ] + [{"passer": f"Q{i}", "team": f"T{i}", "week": 1, "dropbacks": 100,
+              "epa_sum": 5.0, "hit_dropbacks": 25, "hit_epa_sum": 1.0} for i in range(8)])
+        primary = {"GOOD": "F.Fragile", "BAD": "S.Stoic",
+                   **{f"T{i}": f"Q{i}" for i in range(8)}}
+        sens = qb_pressure_sensitivity(qb_ws, primary)
+        assert sens["GOOD"] < sens["BAD"]               # fragile QB degrades when hit
+        t = self._table()
+        t.loc["BAD", "pressure_rate_made"] = 0.9        # elite pressure defense
+        cfg = {"nfl_matchup": {"edge_n": 10, "pass_adj_pts": 0.0, "rush_adj_pts": 0.0,
+                               "ol_pass_adj_pts": 0.0, "ol_run_adj_pts": 0.0,
+                               "qb_pressure_adj_pts": 1.0}}
+        pts, notes = matchup_adjustments("GOOD", "BAD", t, sens, cfg)
+        assert pts == pytest.approx(-1.0)               # home QB flagged vs pressure D
+        assert any("pressure" in n for n in notes)
+        # Below the sample floor -> no sensitivity, no adjustment.
+        assert qb_pressure_sensitivity(qb_ws.assign(hit_dropbacks=5), primary).empty
+
+
+class TestNflRegression:
+    def _ws(self, team, fum, fum_lost, epa_pg):
+        base = {c: 0.0 for c in [
+            "off_all_ngt_plays", "off_all_ngt_epa", "off_all_ngt_succ",
+            "off_all_gt_plays", "off_all_gt_epa", "off_all_gt_succ",
+            "def_all_ngt_plays", "def_all_ngt_epa", "def_all_ngt_succ",
+            "def_all_gt_plays", "def_all_gt_epa", "def_all_gt_succ"]}
+        rows = []
+        for wk in range(1, 6):
+            rows.append({"team": team, "week": wk, "off_games": 1, **base,
+                         "off_all_ngt_epa": epa_pg, "off_fumbles": fum, "off_fumbles_lost": fum_lost,
+                         "def_fumbles": 0, "def_fumbles_lost": 0, "off_int": 0, "def_int": 0,
+                         "off_rz_td": 1, "off_rz_plays": 4, "def_rz_td": 1, "def_rz_plays": 4})
+        return pd.DataFrame(rows)
+
+    def test_fade_flag_when_wins_outrun_epa(self):
+        from mlb_value_bot.football.analysis.nfl_regression import luck_adjustment, team_luck
+
+        ws = pd.concat([self._ws("LUCKY", 2, 0, 0.0),      # keeps every fumble, zero EPA
+                        self._ws("NORMAL", 2, 1, 0.0)], ignore_index=True)
+        sched = pd.DataFrame([{"week": wk, "home_team": "LUCKY", "away_team": "NORMAL",
+                               "home_score": 21, "away_score": 20} for wk in range(1, 6)])
+        cfg = {"nfl_regression": {"min_games": 4, "flag_threshold": 0.18,
+                                  "luck_adjust_pts": 1.0},
+               "projections": {"nfl_margin_sigma": 13.2}}
+        luck = team_luck(ws, sched, 6, cfg)
+        assert luck.loc["LUCKY", "flag"] == "fade"         # 5-0 with 0 net EPA
+        assert luck.loc["LUCKY", "fumble_luck"] == pytest.approx(0.5)
+        adj, notes = luck_adjustment("LUCKY", "NORMAL", luck, cfg)
+        assert adj <= -1.0 and any("fade" in n for n in notes)
+        # Sample floor: week 3 -> only 2 games -> no flags.
+        early = team_luck(ws, sched, 3, cfg)
+        assert (early["flag"] == "none").all()

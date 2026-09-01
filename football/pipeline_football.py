@@ -12,6 +12,7 @@ for math. It owns no formulas itself.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -411,7 +412,8 @@ def _evaluate_market(ctx: LeagueContext, scored: ScoredGame, view, projection,
             "home_pts": projection.home_pts, "away_pts": projection.away_pts,
             "margin": projection.margin, "total_raw": projection.total_raw,
             "total": projection.total, "weather_mult": projection.weather_mult,
-            "notes": projection.home_detail.notes + projection.away_detail.notes,
+            "notes": [n for n in projection.home_detail.notes
+                      if not n.startswith("__ats__")] + projection.away_detail.notes,
         },
         "market": {
             "book": view.book, "line": view.line,
@@ -433,6 +435,8 @@ def _evaluate_market(ctx: LeagueContext, scored: ScoredGame, view, projection,
         "stability": {"label": stability.label, "flags": stability.flags,
                       "rlm_note": stability.rlm_note,
                       "sharp_gap_pp": stability.sharp_gap_pp},
+        "ats_core": next((json.loads(n[len("__ats__"):]) for n in
+                          projection.home_detail.notes if n.startswith("__ats__")), None),
         "weather": {"multiplier": weather.multiplier, "available": weather.available,
                     "indoor": weather.indoor, "temp_f": weather.temp_f,
                     "wind_mph": weather.wind_mph, "note": weather.note},
@@ -517,11 +521,11 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
     # QB availability flags (NFL only; one cached ESPN call for the league).
     qb_flags_map: dict[str, str] = {}
     qb_note = None
-    nfl_ratings: dict[str, float] | None = None
+    ats = None
     if league == "nfl":
         from mlb_value_bot.football.data.qb_status import compute_flags
         qb_flags_map, qb_note = compute_flags(season, config)
-        nfl_ratings = _nfl_ratings_map(season, ctx.week, config)
+        ats = _nfl_ats_context(season, ctx.week, config)
 
     pcfg = config.get("projections", {})
     pool_rz = float(ctx.unit_stats["rz_td_rate"].mean()) \
@@ -609,13 +613,33 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
                                coords[1] if coords else None,
                                game.commence_time, indoor, config)
 
-        if league == "nfl" and nfl_ratings is not None:
-            rh, ra = nfl_ratings.get(home), nfl_ratings.get(away)
+        tilt_pts = None
+        ats_block = None
+        if league == "nfl" and ats is not None:
+            from mlb_value_bot.football.analysis.nfl_matchup_adj import matchup_adjustments
+            from mlb_value_bot.football.analysis.nfl_regression import luck_adjustment
+
+            rh, ra = ats.ratings.get(home), ats.ratings.get(away)
             power = (rh - ra) if rh is not None and ra is not None else None
+            if power is not None:
+                m_adj, m_notes = matchup_adjustments(home, away, ats.table, ats.qb_sens, config)
+                l_adj, l_notes = luck_adjustment(home, away, ats.luck, config)
+                tilt_pts = m_adj + l_adj
+                # Explainability: core + every fired factor, biggest first.
+                factors = ([f"core rating: {home} {rh:+.1f} vs {away} {ra:+.1f} ({power:+.1f})"]
+                           + m_notes + l_notes)
+                ats_block = {"model": "epa_ats", "rating_home": round(rh, 2),
+                             "rating_away": round(ra, 2), "core_margin": round(power, 2),
+                             "matchup_adj_pts": m_adj, "luck_adj_pts": l_adj,
+                             "factors": factors[:4]}
         else:
             power = _power_margin_for(league, row, config)
         projection = project_game_for(ctx, scored, weather, pool_rz, lean,
-                                      power_margin=power)
+                                      power_margin=power, tilt_pts=tilt_pts)
+        if ats_block is not None:
+            projection.home_detail.notes.append(
+                "ATS core: " + "; ".join(ats_block["factors"]))
+            projection.home_detail.notes.append(f"__ats__{json.dumps(ats_block)}")
 
         g5_involved = ctx.league == "cfb" and bool({home, away} & ctx.g5_teams)
         explosive_involved = False
@@ -679,7 +703,8 @@ def _kickoff_date_et(commence_iso: str) -> str:
 
 def project_game_for(ctx: LeagueContext, scored: ScoredGame, weather,
                      pool_rz: float | None, script_lean: float,
-                     power_margin: float | None = None):
+                     power_margin: float | None = None,
+                     tilt_pts: float | None = None):
     """Assemble raw unit rows + phase weights into a GameProjection.
     `power_margin`: points-scale rating anchor (see projections.project_game;
     CFB margin anchor, 2026-08-31)."""
@@ -691,7 +716,8 @@ def project_game_for(ctx: LeagueContext, scored: ScoredGame, weather,
     away_raw = ctx.unit_stats.loc[scored.away].to_dict() if scored.away in ctx.unit_stats.index else {}
     return project_game(home_raw, away_raw, ctx.league, ctx.config,
                         w_pass, w_rush, weather_mult=weather.multiplier,
-                        pool_rz_avg=pool_rz, power_margin=power_margin)
+                        pool_rz_avg=pool_rz, power_margin=power_margin,
+                        tilt_pts=tilt_pts)
 
 
 def _power_margin_for(league: str, row, config: dict) -> float | None:
@@ -710,6 +736,56 @@ def _power_margin_for(league: str, row, config: dict) -> float | None:
         return None
     per_pt = float(config.get("projections", {}).get("elo_points_per_margin", 23.0))
     return (float(he) - float(ae)) / per_pt
+
+
+class _NflAtsContext:
+    """Per-slate ATS context (M2-M4): ratings + the league table the
+    conditional matchup layer ranks against + QB pressure sensitivity +
+    luck flags. Built once per NFL slate when the anchor is on."""
+
+    def __init__(self, ratings, table, qb_sens, luck):
+        self.ratings = ratings          # dict team -> rating_pts
+        self.table = table              # weighted stats frame (ranks)
+        self.qb_sens = qb_sens          # Series team -> EPA drop when hit
+        self.luck = luck                # luck frame (flags)
+
+
+def _nfl_ats_context(season: int, week: int, config: dict) -> "_NflAtsContext | None":
+    """None while projections.margin_anchor_nfl != "epa_rating" (the M6
+    gate), or on any data failure — the slate then prices exactly as today."""
+    if config.get("projections", {}).get("margin_anchor_nfl") != "epa_rating":
+        return None
+    try:
+        from mlb_value_bot.football.analysis.nfl_matchup_adj import qb_pressure_sensitivity
+        from mlb_value_bot.football.analysis.nfl_rating import _weighted_stats, team_ratings
+        from mlb_value_bot.football.analysis.nfl_regression import team_luck
+        from mlb_value_bot.football.data import nfl_client
+        from mlb_value_bot.football.data.qb_status import primary_passers
+
+        cur = nfl_client.week_stats(season, config)
+        pri = nfl_client.week_stats(season - 1, config)
+        ratings = team_ratings(cur, pri, week, config)
+        if ratings.empty:
+            return None
+        rcfg = config.get("nfl_rating", {})
+        table_src, table_week = (cur, week) if (not cur.empty and (cur["week"] < week).any())             else (pri, 99)
+        table = _weighted_stats(table_src, table_week,
+                                float(rcfg.get("decay", 0.90)),
+                                float(rcfg.get("gt_weight", 0.2)), recency=True)
+        qb_src = nfl_client.qb_week_stats(season, config)
+        if qb_src.empty:
+            qb_src = nfl_client.qb_week_stats(season - 1, config)
+        primary = primary_passers(nfl_client.pbp(season, config))
+        if not primary:
+            primary = primary_passers(nfl_client.pbp(season - 1, config))
+        qb_sens = qb_pressure_sensitivity(qb_src, primary)
+        luck = team_luck(cur if not cur.empty else pri,
+                         nfl_client.schedules(season if not cur.empty else season - 1, config),
+                         table_week, config)
+        return _NflAtsContext(ratings["rating_pts"].to_dict(), table, qb_sens, luck)
+    except Exception as exc:  # noqa: BLE001 — degrade, never kill the slate
+        log.warning("nfl ATS context unavailable: %s", exc)
+        return None
 
 
 def _nfl_ratings_map(season: int, week: int, config: dict) -> dict[str, float] | None:
