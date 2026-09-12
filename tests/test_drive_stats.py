@@ -100,3 +100,19 @@ def test_empty_and_min_games():
     df = pd.DataFrame([_play("g1", "KC", "DEN", 1, pas=1, yards=30,
                              pos_score_post=7)])
     assert nfl_drive_stats(df, cfg_strict).empty
+
+
+def test_quick_td_rates(fixture_pbp):
+    out = nfl_drive_stats(fixture_pbp, CFG)
+    # KC's TD drive took 3:00 (not quick) -> 0 of 1 kept drives.
+    assert out.loc["KC", "quick_td_rate"] == pytest.approx(0.0)
+    assert out.loc["DEN", "quick_td_allowed_rate"] == pytest.approx(0.0)
+    # Shorten it to 1:45 -> quick strike for KC, allowed by DEN.
+    fast = fixture_pbp.copy()
+    fast.loc[fast["fixed_drive"] == 1, "drive_time_of_possession"] = "1:45"
+    out = nfl_drive_stats(fast, CFG)
+    assert out.loc["KC", "quick_td_rate"] == pytest.approx(1.0)
+    assert out.loc["DEN", "quick_td_allowed_rate"] == pytest.approx(1.0)
+    # DEN's FG drive is not a TD -> not quick even at 2:00.
+    assert out.loc["DEN", "quick_td_rate"] == pytest.approx(0.0)
+    assert out.loc["KC", "quick_td_allowed_rate"] == pytest.approx(0.0)

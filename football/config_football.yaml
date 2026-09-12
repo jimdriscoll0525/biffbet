@@ -325,6 +325,7 @@ live:
     explosive_pass_yards: 20
     explosive_rush_yards: 10
     min_games: 1
+    quick_td_seconds: 120            # TD drive <= this TOP counts as a quick strike
   grading:
     # Pending live recommendations with no final after this many days -> void.
     void_after_days: 10

@@ -23,8 +23,12 @@ log = get_logger("football.analysis.drive_stats")
 _STAT_COLS = [
     "games", "ppd_off", "ppd_def_allowed", "drives_pg", "plays_per_drive",
     "sec_per_play", "drive_sec_avg", "explosive_play_rate",
-    "pts_per_min_trailing",
+    "pts_per_min_trailing", "quick_td_rate", "quick_td_allowed_rate",
 ]
+
+# Columns added 2026-09-10 for the site's data-derived X-factor. Supabase rows
+# synced before the schema gained them are simply null on the site side.
+OPTIONAL_STAT_COLS = ("quick_td_rate", "quick_td_allowed_rate")
 
 
 def _top_seconds(value) -> float:
@@ -47,6 +51,7 @@ def nfl_drive_stats(pbp: pd.DataFrame, config: dict) -> pd.DataFrame:
     exp_pass = float(cfg.get("explosive_pass_yards", 20))
     exp_rush = float(cfg.get("explosive_rush_yards", 10))
     min_games = int(cfg.get("min_games", 1))
+    quick_td_sec = float(cfg.get("quick_td_seconds", 120))
 
     df = pbp[pbp["posteam"].notna() & (pbp["posteam"] != "")].copy()
     if df.empty or "fixed_drive" not in df.columns:
@@ -115,6 +120,16 @@ def nfl_drive_stats(pbp: pd.DataFrame, config: dict) -> pd.DataFrame:
     out["explosive_play_rate"] = (plays[explosive].groupby("posteam").size()
                                   .reindex(out.index, fill_value=0)
                                   / per_team.reindex(out.index))
+
+    # --- quick-strike: TD drives that took <= quick_td_sec of game clock --------
+    # (points >= 6 = a touchdown drive; TOP from the drive frame). Offense rate
+    # per kept drive, and the mirror image allowed by each defense.
+    quick_td = (kept["points"] >= 6) & (kept["top_sec"] <= quick_td_sec)
+    out["quick_td_rate"] = (kept[quick_td].groupby("posteam").size()
+                            .reindex(out.index, fill_value=0) / n_drives)
+    out["quick_td_allowed_rate"] = (kept[quick_td].groupby("defteam").size()
+                                    .reindex(out.index, fill_value=0)
+                                    / def_.size().astype(float).reindex(out.index))
 
     # --- comeback scoring rate: points per trailing possession minute ----------
     trailing = kept[kept["start_trailing"]].groupby("posteam")

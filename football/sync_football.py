@@ -118,8 +118,23 @@ def push_drive_stats(url: str, key: str, config: dict) -> int:
                         "games": int(r["games"]), "updated_at": now})
             rows.append(row)
         for start in range(0, len(rows), _BATCH):
-            _post(url, key, "football_team_drive_stats", rows[start:start + _BATCH],
-                  on_conflict="league,season,team")
+            batch = rows[start:start + _BATCH]
+            try:
+                _post(url, key, "football_team_drive_stats", batch,
+                      on_conflict="league,season,team")
+            except Exception as exc:  # noqa: BLE001
+                # Supabase schema without the 2026-09 quick-TD columns yet:
+                # keep the daily priors sync alive, drop just those fields.
+                from mlb_value_bot.football.analysis.drive_stats import OPTIONAL_STAT_COLS
+                if not any(c in str(exc) for c in OPTIONAL_STAT_COLS):
+                    raise
+                log.warning("drive-stats push: schema lacks %s (%s) — retrying "
+                            "without them; apply supabase/schema.sql",
+                            OPTIONAL_STAT_COLS, exc)
+                slim = [{k: v for k, v in r.items() if k not in OPTIONAL_STAT_COLS}
+                        for r in batch]
+                _post(url, key, "football_team_drive_stats", slim,
+                      on_conflict="league,season,team")
         total += len(rows)
     log.info("Pushed %d drive-stat row(s)", total)
     return total

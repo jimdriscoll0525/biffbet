@@ -387,9 +387,16 @@ create table if not exists public.football_team_drive_stats (
     drive_sec_avg        double precision,
     explosive_play_rate  double precision,        -- (pass>=20yd + rush>=10yd) / plays
     pts_per_min_trailing double precision,        -- scoring rate while trailing
+    quick_td_rate        double precision,        -- TD drives <= 2:00 TOP / drives (2026-09)
+    quick_td_allowed_rate double precision,       -- same, allowed by the defense
     updated_at           timestamptz not null default now(),
     primary key (league, season, team)
 );
+-- 2026-09-10: quick-strike columns for the site's data-derived X-factor
+-- (idempotent for tables created before they existed).
+alter table public.football_team_drive_stats
+    add column if not exists quick_td_rate double precision,
+    add column if not exists quick_td_allowed_rate double precision;
 
 -- (2) One row per "Update Over/Under" press on the site.
 create table if not exists public.football_live_snapshots (
