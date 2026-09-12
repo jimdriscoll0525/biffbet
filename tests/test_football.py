@@ -767,6 +767,38 @@ class TestEvaluateMarket:
         assert pick.is_value is False
         assert "divergence guard" in pick.hold_reason
 
+    def test_cfb_mismatch_cap_holds_the_total_too(self):
+        """2026-09-12: the cap used to see ref_spread=None for every total and
+        never fired on one (week 1: 0-9 committed unders, five on 35+ spreads).
+        The game's spread reference now reaches the total evaluation."""
+        from mlb_value_bot.football.pipeline_football import LeagueContext, _evaluate_market
+
+        cfg = {**M3_CFG, "college": {**M3_CFG["college"], "max_abs_spread": 28.0}}
+        # Line next to the projection so the divergence guard stays quiet.
+        _, scored, view, projection, weather = self._fixture(indoor=True, total_line=56.5)
+        assert abs(projection.total - 56.5) < 6.0
+        ctx = LeagueContext("cfb", 2026, 2, cfg, pd.DataFrame(), pd.DataFrame(),
+                            pd.DataFrame())
+        blowout = _evaluate_market(ctx, scored, view, projection, weather, False, False,
+                                   10.0, ref_spread=-41.5)
+        assert blowout.market == "total"
+        assert blowout.is_value is False
+        assert "cfb mismatch cap" in blowout.hold_reason
+        assert "total" in blowout.hold_reason
+        # Inside the cap (or no spread known) the total is priced normally.
+        normal = _evaluate_market(ctx, scored, view, projection, weather, False, False,
+                                  10.0, ref_spread=-10.5)
+        assert normal.hold_reason is None or "mismatch" not in normal.hold_reason
+        unknown = _evaluate_market(ctx, scored, view, projection, weather, False, False,
+                                   10.0, ref_spread=None)
+        assert unknown.hold_reason is None or "mismatch" not in unknown.hold_reason
+        # NFL never caps.
+        nfl_ctx = LeagueContext("nfl", 2026, 2, cfg, pd.DataFrame(), pd.DataFrame(),
+                                pd.DataFrame())
+        nfl = _evaluate_market(nfl_ctx, scored, view, projection, weather, False, False,
+                               10.0, ref_spread=-41.5)
+        assert nfl.hold_reason is None or "mismatch" not in nfl.hold_reason
+
     def test_outdoor_total_without_weather_is_held(self):
         from mlb_value_bot.football.pipeline_football import _evaluate_market
 
@@ -1467,3 +1499,24 @@ class TestNflRegression:
         # Sample floor: week 3 -> only 2 games -> no flags.
         early = team_luck(ws, sched, 3, cfg)
         assert (early["flag"] == "none").all()
+
+
+class TestSlateSkipsStartedGames:
+    """2026-09-12: in-game lines were reaching the pick table (30-minute
+    Saturday cadence + the Odds API serving live numbers). A game that has
+    kicked off is never priced again; the horizon rule is unchanged."""
+
+    def test_started_beyond_and_ok(self):
+        from datetime import datetime, timedelta, timezone
+
+        from mlb_value_bot.football.pipeline_football import _slate_skip_reason
+
+        now = datetime(2026, 9, 12, 17, 0, tzinfo=timezone.utc)   # 1pm ET Saturday
+        horizon = now + timedelta(days=8)
+        assert _slate_skip_reason("2026-09-12T16:00:00Z", now, horizon) == "started"
+        assert _slate_skip_reason("2026-09-12T17:00:00Z", now, horizon) == "started"  # at kickoff
+        assert _slate_skip_reason("2026-09-12T19:30:00Z", now, horizon) is None
+        assert _slate_skip_reason("2026-09-21T00:15:00Z", now, horizon) == "beyond"
+        assert _slate_skip_reason("2026-09-19T23:30:00Z", now, None) is None      # no horizon
+        assert _slate_skip_reason("", now, horizon) is None                         # legacy
+        assert _slate_skip_reason("not-a-time", now, horizon) is None

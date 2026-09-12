@@ -16,6 +16,7 @@ import json
 from dataclasses import dataclass, field
 
 import pandas as pd
+from datetime import datetime, timedelta, timezone
 
 from mlb_value_bot.football import football_in_season, season_for_date  # noqa: F401  (used by CLI callers)
 from mlb_value_bot.football.analysis import percentiles as pctl
@@ -266,9 +267,12 @@ def _compute_adjusted_ev(raw_ev: float, sharp_gap_side_pp: float | None,
 def _evaluate_market(ctx: LeagueContext, scored: ScoredGame, view, projection,
                      weather, g5_involved: bool, explosive_involved: bool,
                      games_min: float | None,
-                     qb_hold: str | None = None) -> FootballPick | None:
+                     qb_hold: str | None = None,
+                     ref_spread: float | None = None) -> FootballPick | None:
     """Price one market (spread or total) into a FootballPick, or None when
-    the market can't be evaluated at all."""
+    the market can't be evaluated at all. `ref_spread` is the game's spread
+    reference (sharp line, else bet-book line) so the CFB mismatch cap can
+    hold the TOTAL on a blowout game too."""
     from mlb_value_bot.football.analysis import football_stability as stab
     from mlb_value_bot.football.analysis.football_confidence import confidence_for_pick
     from mlb_value_bot.football.analysis.football_ev import blend_probability, ev_with_push
@@ -309,13 +313,19 @@ def _evaluate_market(ctx: LeagueContext, scored: ScoredGame, view, projection,
     # percentile edges are least trustworthy (starters sit, garbage time
     # dominates the cover). Held analysis-only; totals on the same game are
     # capped too because blowout scripts drive the total as much as the margin.
+    #
+    # 2026-09-12: the total's reference spread now arrives via `ref_spread`.
+    # It used to be None for every total, so the cap silently never fired on
+    # a total: week 1 committed 0-9 unders, five of them on 35+ pt spreads
+    # where the EPA-per-play total saturates well below the market.
     max_abs_spread = config.get("college", {}).get("max_abs_spread")
-    ref_spread = view.sharp_line if (not is_total and view.sharp_line is not None) \
-        else (view.line if not is_total else None)
+    if not is_total:
+        ref_spread = view.sharp_line if view.sharp_line is not None else view.line
     if league == "cfb" and max_abs_spread is not None and ref_spread is not None \
             and abs(ref_spread) > float(max_abs_spread):
         hold_reason = hold_reason or (f"cfb mismatch cap: |spread| {abs(ref_spread):.1f} "
-                                      f"> {float(max_abs_spread):.1f}")
+                                      f"> {float(max_abs_spread):.1f}"
+                                      + (" (total on a blowout script)" if is_total else ""))
 
     outdoor_total = is_total and not weather.indoor
     if is_total and outdoor_total and not weather.available \
@@ -540,22 +550,20 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
     # off within `slate.max_days_ahead` are priced; a pick made on a game
     # weeks out would be frozen on stale unit stats and an opening number.
     max_ahead = config.get("slate", {}).get("max_days_ahead")
-    horizon = None
-    if max_ahead is not None:
-        from datetime import datetime, timedelta, timezone
-        horizon = datetime.now(timezone.utc) + timedelta(days=float(max_ahead))
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=float(max_ahead)) if max_ahead is not None else None
 
     out: list[FootballGameAnalysis] = []
     n_beyond = 0
+    n_started = 0
     for game in odds_games:
-        if horizon is not None and game.commence_time:
-            try:
-                kick = datetime.fromisoformat(game.commence_time.replace("Z", "+00:00"))
-            except ValueError:
-                kick = None
-            if kick is not None and kick > horizon:
-                n_beyond += 1
-                continue
+        skip = _slate_skip_reason(game.commence_time, now, horizon)
+        if skip == "beyond":
+            n_beyond += 1
+            continue
+        if skip == "started":
+            n_started += 1
+            continue
         if league == "nfl":
             home = normalize_nfl(game.home_name_raw)
             away = normalize_nfl(game.away_name_raw)
@@ -586,9 +594,10 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
         sigma_m = float(pcfg.get(f"{league}_margin_sigma", 13.2))
         spread_view = market_view(game, "spread", config, sigma_m)
         lean = 0.0
+        ref_spread: float | None = None
         if spread_view is not None:
-            ref_line = spread_view.sharp_line if spread_view.sharp_line is not None else spread_view.line
-            lean = min(1.0, abs(ref_line) / float(pcfg.get("script_lean_full_spread", 21.0)))
+            ref_spread = spread_view.sharp_line if spread_view.sharp_line is not None else spread_view.line
+            lean = min(1.0, abs(ref_spread) / float(pcfg.get("script_lean_full_spread", 21.0)))
 
         scored = score_game(ctx, home, away, script_lean=lean)
         if scored is None:
@@ -663,7 +672,7 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
             qb_hold = qb_flags_map.get(home) or qb_flags_map.get(away)
             pick = _evaluate_market(ctx, scored, view, projection, weather,
                                     g5_involved, explosive_involved, games_min,
-                                    qb_hold=qb_hold)
+                                    qb_hold=qb_hold, ref_spread=ref_spread)
             if pick is not None:
                 if qb_hold or qb_note:
                     pick.reasoning["qb_guard"] = qb_hold or qb_note
@@ -685,7 +694,36 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
     if n_beyond:
         log.info("%s: %d game(s) beyond the %s-day slate horizon skipped",
                  league, n_beyond, max_ahead)
+    if n_started:
+        log.info("%s: %d game(s) already kicked off skipped (in-game lines never "
+                 "reach the pick table)", league, n_started)
     return out
+
+
+def _slate_skip_reason(commence_iso: str | None, now: datetime,
+                       horizon: datetime | None) -> str | None:
+    """Why a listed game must NOT be priced: "started" when kickoff is at or
+    before `now`, "beyond" when it is past the slate horizon, else None.
+
+    2026-09-12: the Odds API keeps serving LIVE lines for in-progress games
+    and the Saturday cadence runs every 30 minutes, so analysis rows were
+    being refreshed onto in-game numbers (a Clemson +47.5 "line" that opened
+    at 10.5) and every row's closing line / CLV was an in-game read. A game
+    that has kicked off is never re-priced; its last pre-kickoff refresh IS
+    the close. Missing / unparseable kickoff times are priced (legacy)."""
+    if not commence_iso:
+        return None
+    try:
+        kick = datetime.fromisoformat(commence_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if kick.tzinfo is None:
+        kick = kick.replace(tzinfo=timezone.utc)
+    if kick <= now:
+        return "started"
+    if horizon is not None and kick > horizon:
+        return "beyond"
+    return None
 
 
 def _kickoff_date_et(commence_iso: str) -> str:
