@@ -21,6 +21,13 @@ log = get_logger("football.tracking.performance")
 
 _SETTLED = ("win", "loss", "push", "void")
 
+# Adjusted-EV bands for the site's "at what edge does this pay?" tables.
+# (upper bound exclusive, label). Finer near the 3% threshold, where most
+# football picks sit, than the MLB performance buckets.
+EV_BUCKETS: tuple[tuple[float, str], ...] = (
+    (0.04, "<4%"), (0.05, "4-5%"), (0.08, "5-8%"), (float("inf"), "8%+"),
+)
+
 
 def _bets(df: pd.DataFrame, model_tag: str, league: str | None,
           market: str | None) -> pd.DataFrame:
@@ -57,6 +64,33 @@ def record(df: pd.DataFrame, model_tag: str, league: str | None = None,
         "clv_tracked": int(len(clv)),
         "clv_positive": int((clv > 0).sum()),
     }
+
+
+def ev_buckets(df: pd.DataFrame, model_tag: str, league: str,
+               market: str) -> dict:
+    """W-L-P record per adjusted-EV band for one league x market cell — the
+    same _bets filter as record(), sliced by the number the threshold and
+    tiers actually read (adjusted_ev_pct; raw ev_pct only for rows synced
+    before the adjusted column existed). Every band is always present so
+    the site's table is stable; empty bands carry bets=0."""
+    bets = _bets(df, model_tag, league, market)
+    if "ev_pct" in bets.columns:
+        ev = bets["ev_pct"].astype(float)
+        if "adjusted_ev_pct" in bets.columns:
+            ev = bets["adjusted_ev_pct"].astype(float).fillna(ev)
+    else:
+        ev = pd.Series(float("nan"), index=bets.index, dtype=float)
+    rows = []
+    lo = float("-inf")
+    for hi, label in EV_BUCKETS:
+        cell = record(bets[(ev >= lo) & (ev < hi)], model_tag, league, market)
+        cell["bucket"] = label
+        cell["ev_lo"] = None if lo == float("-inf") else lo
+        cell["ev_hi"] = None if hi == float("inf") else hi
+        rows.append(cell)
+        lo = hi
+    return {"league": league, "market": market, "model_tag": model_tag,
+            "basis": "adjusted_ev_pct", "buckets": rows}
 
 
 def pick_distribution(df: pd.DataFrame, model_tag: str, config: dict,
@@ -105,7 +139,7 @@ def calibration(df: pd.DataFrame, model_tag: str, config: dict) -> dict:
 
 def compute_snapshot(config: dict) -> dict[str, dict]:
     """All football_snapshot scopes, keyed like referee/performance snapshots:
-    record:<league>:<market>, clv:<league>, distribution:<league>:total,
+    record:<league>:<market>, ev:<league>:<market>, distribution:<league>:total,
     calibration:<model_tag>."""
     model_tag = config.get("model_tag", "matchup_v1")
     df = store.to_dataframe()
@@ -117,6 +151,8 @@ def compute_snapshot(config: dict) -> dict[str, dict]:
         for market in ("spread", "total", None):
             r = record(df, model_tag, league, market)
             scopes[f"record:{league}:{market or 'all'}"] = r
+            if market is not None:
+                scopes[f"ev:{league}:{market}"] = ev_buckets(df, model_tag, league, market)
         scopes[f"distribution:{league}:total"] = pick_distribution(df, model_tag, config, league)
     scopes["record:all:all"] = record(df, model_tag)
     scopes["distribution:all:total"] = pick_distribution(df, model_tag, config)

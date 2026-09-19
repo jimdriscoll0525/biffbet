@@ -860,16 +860,17 @@ def _perf_df():
     rows = []
 
     def add(league, market, result, *, tag="matchup_v1", is_value=1, side="home",
-            clv=None, stake=0.01, pl=None):
+            clv=None, stake=0.01, pl=None, ev=0.045, adj_ev=None):
         if pl is None:
             pl = {"win": stake * 0.909, "loss": -stake}.get(result, 0.0)
         rows.append(dict(league=league, market=market, result=result,
                          model_tag=tag, is_value=is_value, pick_side=side,
                          clv_pp=clv, flat_stake=stake, profit_loss=pl,
+                         ev_pct=ev, adjusted_ev_pct=adj_ev,
                          model_prob=0.55, created_at=f"2026-09-{len(rows)+1:02d}"))
-    add("nfl", "spread", "win", clv=1.5)
-    add("nfl", "spread", "loss", clv=-0.5)
-    add("nfl", "spread", "push")
+    add("nfl", "spread", "win", clv=1.5, ev=0.06, adj_ev=0.055)   # 5-8% band
+    add("nfl", "spread", "loss", clv=-0.5, ev=0.045, adj_ev=0.035)  # <4% (adjusted wins)
+    add("nfl", "spread", "push", ev=0.045)                           # 4-5% (raw fallback)
     add("nfl", "total", "win", side="over", clv=2.0)
     add("cfb", "spread", "win", clv=0.5)
     add("cfb", "total", "loss", side="under")
@@ -881,6 +882,27 @@ def _perf_df():
 
 
 class TestRecordFiltering:
+    def test_ev_buckets_slice_on_adjusted_ev_with_raw_fallback(self):
+        """The site's EV table: same is_value x tag x league x market filter
+        as record(), sliced by adjusted_ev_pct (raw ev_pct only when the
+        adjusted value is missing). Every band present; analyses and other
+        tags never leak in."""
+        from mlb_value_bot.football.tracking.football_performance import ev_buckets
+
+        out = ev_buckets(_perf_df(), "matchup_v1", "nfl", "spread")
+        assert out["basis"] == "adjusted_ev_pct"
+        by = {b["bucket"]: b for b in out["buckets"]}
+        assert list(by) == ["<4%", "4-5%", "5-8%", "8%+"]
+        assert (by["<4%"]["wins"], by["<4%"]["losses"]) == (0, 1)
+        assert by["4-5%"]["pushes"] == 1 and by["4-5%"]["graded"] == 1
+        assert (by["5-8%"]["wins"], by["5-8%"]["losses"]) == (1, 0)
+        assert by["8%+"]["bets"] == 0
+        # void + pending rows (ev=0.045 default) sit in 4-5% but never in graded.
+        assert by["4-5%"]["voids"] == 1 and by["4-5%"]["pending"] == 1
+        # The bands partition the cell exactly.
+        total = sum(b["bets"] for b in out["buckets"])
+        assert total == 5  # win, loss, push, void, pending — not the analysis/other-tag rows
+
     def test_record_filtering_by_tag_league_market(self):
         """THE GriffBet-record-bug regression: aggregates count ONLY is_value
         rows of the requested model_tag x league x market — analyses, other
