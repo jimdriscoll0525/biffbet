@@ -22,10 +22,10 @@ log = get_logger("football.tracking.performance")
 _SETTLED = ("win", "loss", "push", "void")
 
 # Adjusted-EV bands for the site's "at what edge does this pay?" tables.
-# (upper bound exclusive, label). Finer near the 3% threshold, where most
-# football picks sit, than the MLB performance buckets.
+# (upper bound exclusive, label). The threshold is 3%, so "<4%" is the
+# 3-4% band in practice; the top bands are the ones the site asked for.
 EV_BUCKETS: tuple[tuple[float, str], ...] = (
-    (0.04, "<4%"), (0.05, "4-5%"), (0.08, "5-8%"), (float("inf"), "8%+"),
+    (0.04, "<4%"), (0.05, "4-5%"), (0.10, "5-10%"), (float("inf"), "10%+"),
 )
 
 
@@ -93,6 +93,27 @@ def ev_buckets(df: pd.DataFrame, model_tag: str, league: str,
             "basis": "adjusted_ev_pct", "buckets": rows}
 
 
+def weekly_records(df: pd.DataFrame, model_tag: str, league: str) -> dict:
+    """W-L-P per NFL/CFB week for one league — overall plus the spread and
+    total splits — using the same _bets filter as record(). Rows whose week
+    is unknown (legacy) are grouped under week 0. Ordered by week."""
+    bets = _bets(df, model_tag, league, None)
+    weeks = pd.to_numeric(bets["week"], errors="coerce").fillna(0).astype(int) if "week" in bets.columns         else pd.Series(0, index=bets.index, dtype=int)
+    rows = []
+    for wk in sorted(weeks.unique()):
+        sub = bets[weeks == wk]
+        dates = sub["date"].astype(str) if "date" in sub.columns else pd.Series([], dtype=str)
+        rows.append({
+            "week": int(wk),
+            "date_from": dates.min() if len(dates) else None,
+            "date_to": dates.max() if len(dates) else None,
+            "all": record(sub, model_tag, league, None),
+            "spread": record(sub, model_tag, league, "spread"),
+            "total": record(sub, model_tag, league, "total"),
+        })
+    return {"league": league, "model_tag": model_tag, "weeks": rows}
+
+
 def pick_distribution(df: pd.DataFrame, model_tag: str, config: dict,
                       league: str | None = None) -> dict:
     """Rolling over/under share across the last `window` committed totals
@@ -139,8 +160,8 @@ def calibration(df: pd.DataFrame, model_tag: str, config: dict) -> dict:
 
 def compute_snapshot(config: dict) -> dict[str, dict]:
     """All football_snapshot scopes, keyed like referee/performance snapshots:
-    record:<league>:<market>, ev:<league>:<market>, distribution:<league>:total,
-    calibration:<model_tag>."""
+    record:<league>:<market>, ev:<league>:<market>, weeks:<league>,
+    distribution:<league>:total, calibration:<model_tag>."""
     model_tag = config.get("model_tag", "matchup_v1")
     df = store.to_dataframe()
     if df.empty:
@@ -153,6 +174,7 @@ def compute_snapshot(config: dict) -> dict[str, dict]:
             scopes[f"record:{league}:{market or 'all'}"] = r
             if market is not None:
                 scopes[f"ev:{league}:{market}"] = ev_buckets(df, model_tag, league, market)
+        scopes[f"weeks:{league}"] = weekly_records(df, model_tag, league)
         scopes[f"distribution:{league}:total"] = pick_distribution(df, model_tag, config, league)
     scopes["record:all:all"] = record(df, model_tag)
     scopes["distribution:all:total"] = pick_distribution(df, model_tag, config)

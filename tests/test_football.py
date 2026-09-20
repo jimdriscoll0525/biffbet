@@ -860,18 +860,19 @@ def _perf_df():
     rows = []
 
     def add(league, market, result, *, tag="matchup_v1", is_value=1, side="home",
-            clv=None, stake=0.01, pl=None, ev=0.045, adj_ev=None):
+            clv=None, stake=0.01, pl=None, ev=0.045, adj_ev=None, week=1):
         if pl is None:
             pl = {"win": stake * 0.909, "loss": -stake}.get(result, 0.0)
         rows.append(dict(league=league, market=market, result=result,
                          model_tag=tag, is_value=is_value, pick_side=side,
                          clv_pp=clv, flat_stake=stake, profit_loss=pl,
-                         ev_pct=ev, adjusted_ev_pct=adj_ev,
+                         ev_pct=ev, adjusted_ev_pct=adj_ev, week=week,
+                         date=f"2026-09-{len(rows)+1:02d}",
                          model_prob=0.55, created_at=f"2026-09-{len(rows)+1:02d}"))
-    add("nfl", "spread", "win", clv=1.5, ev=0.06, adj_ev=0.055)   # 5-8% band
+    add("nfl", "spread", "win", clv=1.5, ev=0.06, adj_ev=0.055)   # 5-10% band
     add("nfl", "spread", "loss", clv=-0.5, ev=0.045, adj_ev=0.035)  # <4% (adjusted wins)
     add("nfl", "spread", "push", ev=0.045)                           # 4-5% (raw fallback)
-    add("nfl", "total", "win", side="over", clv=2.0)
+    add("nfl", "total", "win", side="over", clv=2.0, week=2)
     add("cfb", "spread", "win", clv=0.5)
     add("cfb", "total", "loss", side="under")
     add("nfl", "spread", "win", is_value=0)              # analysis: never counted
@@ -892,16 +893,35 @@ class TestRecordFiltering:
         out = ev_buckets(_perf_df(), "matchup_v1", "nfl", "spread")
         assert out["basis"] == "adjusted_ev_pct"
         by = {b["bucket"]: b for b in out["buckets"]}
-        assert list(by) == ["<4%", "4-5%", "5-8%", "8%+"]
+        assert list(by) == ["<4%", "4-5%", "5-10%", "10%+"]
         assert (by["<4%"]["wins"], by["<4%"]["losses"]) == (0, 1)
         assert by["4-5%"]["pushes"] == 1 and by["4-5%"]["graded"] == 1
-        assert (by["5-8%"]["wins"], by["5-8%"]["losses"]) == (1, 0)
-        assert by["8%+"]["bets"] == 0
+        assert (by["5-10%"]["wins"], by["5-10%"]["losses"]) == (1, 0)
+        assert by["10%+"]["bets"] == 0
         # void + pending rows (ev=0.045 default) sit in 4-5% but never in graded.
         assert by["4-5%"]["voids"] == 1 and by["4-5%"]["pending"] == 1
         # The bands partition the cell exactly.
         total = sum(b["bets"] for b in out["buckets"])
         assert total == 5  # win, loss, push, void, pending — not the analysis/other-tag rows
+
+    def test_weekly_records_split_by_week_and_market(self):
+        """Week rows carry the overall + spread + total records for that
+        league, on the same leak-proof filter (analyses / other tags never
+        count)."""
+        from mlb_value_bot.football.tracking.football_performance import weekly_records
+
+        out = weekly_records(_perf_df(), "matchup_v1", "nfl")
+        by = {w["week"]: w for w in out["weeks"]}
+        assert list(by) == [1, 2]
+        wk1 = by[1]
+        assert (wk1["all"]["wins"], wk1["all"]["losses"], wk1["all"]["pushes"]) == (1, 1, 1)
+        assert wk1["spread"]["graded"] == 3 and wk1["total"]["bets"] == 0
+        assert wk1["date_from"] == "2026-09-01" and wk1["date_to"] >= "2026-09-03"
+        wk2 = by[2]
+        assert wk2["total"]["wins"] == 1 and wk2["spread"]["bets"] == 0
+        # CFB weeks never include NFL rows.
+        cfb = weekly_records(_perf_df(), "matchup_v1", "cfb")
+        assert sum(w["all"]["bets"] for w in cfb["weeks"]) == 2
 
     def test_record_filtering_by_tag_league_market(self):
         """THE GriffBet-record-bug regression: aggregates count ONLY is_value
