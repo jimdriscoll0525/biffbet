@@ -203,7 +203,9 @@ def review_sport(sport: str, df: pd.DataFrame, existing: list[dict], cfg: dict,
 def _write_changes(sr: SportReview) -> None:
     from mlb_value_bot.rsi import supa
 
-    rows = [ch.row for ch in sr.changes]
+    # One shape for every row (new or existing) -- see reconcile.PROPOSAL_COLUMNS.
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = [{**_reconcile.normalize_row(ch.row), "updated_at": stamp} for ch in sr.changes]
     if not rows:
         return
     supa.upsert_rows("rsi_proposals", rows, on_conflict="engine,finding_key")

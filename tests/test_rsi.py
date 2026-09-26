@@ -1254,3 +1254,66 @@ def test_cli_rsi_grade_and_state_commands(monkeypatch, tmp_path):
     out = runner.invoke(cli, ["grade", "--engine", "football"])
     assert out.exit_code == 0, out.output
     assert "0 pending row(s)" in out.output
+
+
+# --- proposal upsert shape (PGRST102 regression, 2026-09-26 run 1) --------------
+def test_proposal_rows_share_one_shape_new_vs_existing():
+    """A brand-new proposal row and an existing-row update must carry exactly
+    the same key set (PROPOSAL_COLUMNS), with never-set columns null on the
+    new row, so a bulk upsert never mixes shapes."""
+    from mlb_value_bot.rsi import reconcile as rc
+
+    cfg = {"consecutive_runs_for_pending": 2, "clv_min_tracked": 10}
+    stats = {"settled": 50, "wins": 30, "losses": 20, "flat_roi": 0.1, "avg_clv": 1.0,
+             "clv_metric": "clv_pp", "clv_tracked": 50, "t_stat": 2.5, "p_value": 0.01,
+             "date_from": "2026-09-01", "date_to": "2026-09-20", "rows": 50}
+    new_finding = {"engine": "football", "sport": "cfb", "key": "fb-bets|rest_bucket=short (<6)",
+                   "pool": "fb-bets", "dimension": "rest_bucket", "value": "short (<6)",
+                   "direction": "negative", "settled": 50, "stats": stats,
+                   "bonferroni_significant": False, "clv_agrees": True, "cells_tested": 100,
+                   "suggestion": {"kind": "insight", "title": "t", "description": "d"}}
+    existing = {"id": 7, "engine": "football", "sport": "nfl",
+                "finding_key": "fb-spread-holds|lean_type=dog", "kind": "overlay",
+                "title": "x", "description": "y", "suggested_change": None, "overlay": {"a": 1},
+                "status": "watch", "confidence": "low", "direction": "positive",
+                "latest_stats": stats, "evidence": [{"run_date": "2026-09-15", "settled": 40}],
+                "consecutive_hits": 1, "consecutive_misses": 0, "first_seen": "2026-09-15",
+                "last_seen": "2026-09-15", "snoozed_until": None, "decided_at": None,
+                "decision_reason": None, "challenger_tag": None, "shadow_started_at": None,
+                "shadow_ends_at": None, "shadow_stats": None, "version_id": None,
+                "created_at": "2026-09-15T00:00:00", "updated_at": "2026-09-15T00:00:00"}
+    present_again = dict(new_finding, key="fb-spread-holds|lean_type=dog", sport="nfl",
+                         dimension="lean_type", value="dog", direction="positive")
+    changes = rc.reconcile([new_finding, present_again], [existing], "2026-09-22", cfg)
+    rows = [rc.normalize_row(ch.row) for ch in changes]
+    assert len(rows) == 2
+    assert all(tuple(r.keys()) == rc.PROPOSAL_COLUMNS for r in rows)
+    assert "id" not in rows[0] and "created_at" not in rows[0] and "updated_at" not in rows[0]
+    new_row = next(r for r in rows if r["finding_key"].startswith("fb-bets|rest"))
+    old_row = next(r for r in rows if r["finding_key"].startswith("fb-spread"))
+    assert new_row["challenger_tag"] is None and new_row["status"] == "watch"
+    # The existing row keeps its fetched values (nothing padded to null).
+    assert old_row["overlay"] == {"a": 1} and old_row["first_seen"] == "2026-09-15"
+
+
+def test_upsert_rows_groups_mixed_shapes(monkeypatch):
+    """Safety net below the template: rows with different key sets are posted
+    in separate uniform bodies, never padded with nulls."""
+    from mlb_value_bot.rsi import supa
+
+    bodies: list[list[dict]] = []
+    monkeypatch.setattr(supa, "_credentials", lambda: ("http://x", "k"))
+    monkeypatch.setattr(supa, "_post", lambda url, key, table, rows, on_conflict=None: bodies.append(rows))
+    rows = [
+        {"engine": "football", "finding_key": "a", "status": "watch", "overlay": None},
+        {"engine": "football", "finding_key": "b", "status": "pending"},
+        {"engine": "football", "finding_key": "c", "status": "watch", "overlay": {"k": 1}},
+    ]
+    assert supa.upsert_rows("rsi_proposals", rows, on_conflict="engine,finding_key") == 3
+    assert len(bodies) == 2
+    for body in bodies:
+        keysets = {tuple(sorted(r.keys())) for r in body}
+        assert len(keysets) == 1
+    assert sum(len(b) for b in bodies) == 3
+    partial = next(r for b in bodies for r in b if r["finding_key"] == "b")
+    assert "overlay" not in partial

@@ -31,7 +31,27 @@ from mlb_value_bot.rsi.stats import Candidate
 
 ENGINE_STATUSES = {"watch", "pending", "snoozed"}          # the engine may move these
 DECIDED_STATUSES = {"approved", "promoted", "rejected", "dropped"}
-_ROW_SKIP = {"id", "created_at"}
+# Columns a proposal upsert may carry. Every row sent to rsi_proposals -- new
+# or existing -- is normalised to exactly this set so a bulk body never mixes
+# shapes (PostgREST PGRST102 "All object keys must match", run 1 on
+# 2026-09-26: an 18-key new row next to 26-key existing rows). For a NEW row
+# the never-set columns are null, which is correct; existing rows carry their
+# fetched values, so nothing is overwritten with null. `id` / `created_at`
+# are never sent (identity + default); `updated_at` is stamped at write time.
+PROPOSAL_COLUMNS: tuple[str, ...] = (
+    "engine", "sport", "finding_key", "kind", "title", "description",
+    "suggested_change", "overlay", "status", "confidence", "direction",
+    "latest_stats", "evidence", "consecutive_hits", "consecutive_misses",
+    "first_seen", "last_seen", "snoozed_until", "decided_at", "decision_reason",
+    "challenger_tag", "shadow_started_at", "shadow_ends_at", "shadow_stats",
+    "version_id",
+)
+_ROW_SKIP = {"id", "created_at", "updated_at"}
+
+
+def normalize_row(row: dict) -> dict:
+    """Exactly PROPOSAL_COLUMNS, missing ones null, unknown keys dropped."""
+    return {c: row.get(c) for c in PROPOSAL_COLUMNS}
 
 
 @dataclass
