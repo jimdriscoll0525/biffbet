@@ -98,9 +98,12 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
         log.exception("analyze_slate failed")
         raise SystemExit(1)
 
-    evaluable = [a for a in analyses if a.best_eval is not None]
+    # Post-price sanity skips keep their evaluation (RSI phase 2) so they are
+    # persisted as passes, but they render with the skipped games.
+    persistable = [a for a in analyses if a.best_eval is not None]
+    evaluable = [a for a in persistable if not a.skipped_reason]
     value_bets = [a for a in evaluable if a.is_value(threshold)]
-    skipped = [a for a in analyses if a.best_eval is None]
+    skipped = [a for a in analyses if a.best_eval is None or a.skipped_reason]
 
     _render_slate_table(evaluable if show_all else value_bets, threshold, bankroll, game_date)
     _render_value_breakdowns(value_bets)
@@ -120,8 +123,8 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
             "and bullpen/park sit out. Run `data-status` for how to add it.[/]"
         )
 
-    if save and evaluable:
-        total, n_value = save_slate(evaluable, threshold, game_date)
+    if save and persistable:
+        total, n_value = save_slate(persistable, threshold, game_date)
         console.print(
             f"[green]Saved/updated {total} slate row(s) "
             f"({n_value} flagged +EV) to the tracking DB.[/]"
@@ -363,9 +366,10 @@ def _render_totals(analyses: list[GameAnalysis], config: dict, bankroll: float,
         f"(graded on CLV vs the totals close)."
     )
 
-    if save and evaluable:
+    persistable = [t for t in totals if t.best_eval is not None and t.rd is not None and t.intel is not None]
+    if save and persistable:
         from mlb_value_bot.pipeline_totals import refresh_skipped_totals_closing, save_totals_slate
-        total, n_value = save_totals_slate(evaluable, threshold, game_date)
+        total, n_value = save_totals_slate(persistable, threshold, game_date)
         console.print(f"[green]Saved/updated {total} totals row(s) ({n_value} flagged value) to the tracking DB.[/]")
         n_ref = refresh_skipped_totals_closing(totals, game_date)
         if n_ref:
@@ -407,7 +411,8 @@ def results(date_: str | None) -> None:
         roi_txt = _fmt_pct(summary.roi) if summary.staked > 0 else "-"
         console.print(Panel(
             f"Settled: [bold]{summary.graded}[/]  ({summary.wins}W-{summary.losses}L)   "
-            f"Void: {summary.voids}   Pending: {summary.pending}\n"
+            f"Void: {summary.voids}   Pending: {summary.pending}   "
+            f"[dim]Passes graded: {summary.analyses_graded}[/]\n"
             f"Staked: {summary.staked:.4f} units   "
             f"P/L: [bold]{summary.profit_loss:+.4f}[/] units   ROI: [bold]{roi_txt}[/]",
             title=f"Daily P/L — {summary.date}", border_style="cyan", expand=False,
@@ -419,10 +424,11 @@ def results(date_: str | None) -> None:
         losses = sum(s.losses for s in summaries)
         pl = sum(s.profit_loss for s in summaries)
         pending = sum(s.pending for s in summaries)
+        passes = sum(s.analyses_graded for s in summaries)
         console.print(Panel(
             f"Dates swept: [bold]{len(summaries)}[/]   Settled: [bold]{graded}[/]  "
             f"({wins}W-{losses}L)   Still pending: {pending}   "
-            f"P/L: [bold]{pl:+.4f}[/] units",
+            f"P/L: [bold]{pl:+.4f}[/] units   [dim]Passes graded: {passes}[/]",
             title="Backfill total", border_style="magenta", expand=False,
         ))
 
@@ -433,14 +439,15 @@ def results(date_: str | None) -> None:
         else:
             t_summaries = results_mod.grade_all_open_totals(before=date.today().isoformat())
         t_graded = sum(s.graded for s in t_summaries)
-        if t_graded or any(s.bets for s in t_summaries):
+        t_passes = sum(s.analyses_graded for s in t_summaries)
+        if t_graded or t_passes or any(s.bets for s in t_summaries):
             t_wins = sum(s.wins for s in t_summaries)
             t_losses = sum(s.losses for s in t_summaries)
             t_pushes = sum(s.pushes for s in t_summaries)
             t_pl = sum(s.profit_loss for s in t_summaries)
             console.print(Panel(
                 f"Totals settled (PAPER): [bold]{t_graded}[/]  ({t_wins}W-{t_losses}L-{t_pushes}P)   "
-                f"Paper P/L: [bold]{t_pl:+.4f}[/] units\n"
+                f"Paper P/L: [bold]{t_pl:+.4f}[/] units   [dim]Passes graded: {t_passes}[/]\n"
                 f"[dim]Totals are graded on CLV vs the totals close, not record — see `performance`.[/]",
                 title="Totals — PAPER results", border_style="magenta", expand=False,
             ))

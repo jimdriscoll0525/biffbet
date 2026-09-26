@@ -27,6 +27,133 @@ from mlb_value_bot.utils import get_logger
 
 log = get_logger("football.pipeline")
 
+# NFL conference membership by nflverse abbreviation (the canonical NFL team
+# key, see football/data/teams.py). Used for the reasoning["context"] block
+# (RSI phase 2, 2026-09-26): conference_game = both teams in the same one.
+_NFL_AFC = frozenset({
+    "BAL", "BUF", "CIN", "CLE", "DEN", "HOU", "IND", "JAX",
+    "KC", "LAC", "LV", "MIA", "NE", "NYJ", "PIT", "TEN",
+})
+_NFL_NFC = frozenset({
+    "ARI", "ATL", "CAR", "CHI", "DAL", "DET", "GB", "LA",
+    "MIN", "NO", "NYG", "PHI", "SEA", "SF", "TB", "WAS",
+})
+_NFL_CONFERENCE: dict[str, str] = {**{t: "AFC" for t in _NFL_AFC}, **{t: "NFC" for t in _NFL_NFC}}
+
+# reasoning["context"] shape -- every pick carries all seven keys (None when
+# the schedule row could not answer).
+_CONTEXT_KEYS = ("conference_game", "home_conference", "away_conference",
+                 "division_game", "home_rest_days", "away_rest_days", "neutral_site")
+
+
+def _empty_context() -> dict:
+    return {k: None for k in _CONTEXT_KEYS}
+
+
+def _as_bool(v) -> bool | None:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, str):
+        low = v.strip().lower()
+        if low in ("true", "t", "1", "yes"):
+            return True
+        if low in ("false", "f", "0", "no"):
+            return False
+        return None
+    return bool(v)
+
+
+def _as_int(v) -> int | None:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_str(v) -> str | None:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    txt = str(v).strip()
+    return txt or None
+
+
+def _rest_days(games_df: pd.DataFrame | None, team: str, kickoff: str | None) -> int | None:
+    """PURE: days between `team`'s previous game in `games_df` and `kickoff`
+    (calendar days, UTC dates), or None when there is no earlier game / no
+    usable date column / no kickoff. Reads whichever of start_date / date /
+    gameday the frame carries (CFBD ISO datetimes, nflverse dates)."""
+    if games_df is None or games_df.empty or not team or not kickoff:
+        return None
+    if "home_team" not in games_df.columns or "away_team" not in games_df.columns:
+        return None
+    date_col = next((c for c in ("start_date", "date", "gameday") if c in games_df.columns), None)
+    if date_col is None:
+        return None
+    kick = pd.to_datetime(kickoff, utc=True, errors="coerce")
+    if pd.isna(kick):
+        return None
+    mask = (games_df["home_team"] == team) | (games_df["away_team"] == team)
+    starts = pd.to_datetime(games_df.loc[mask, date_col], utc=True, errors="coerce").dropna()
+    if starts.empty:
+        return None
+    kick_day = kick.normalize()
+    prev = starts[starts.dt.normalize() < kick_day]
+    if prev.empty:
+        return None
+    return int((kick_day - prev.max().normalize()).days)
+
+
+def _game_context(league: str, games_df: pd.DataFrame | None, row,
+                  home: str, away: str, commence_time: str | None) -> dict:
+    """The reasoning["context"] block for one game from its matched schedule
+    row (RSI phase 2). NFL: conference from the module map, division / rest
+    / neutral from the nflverse schedule row (div_game, home_rest, away_rest,
+    location). CFB: conferences / conference_game / neutral_site from the
+    CFBD row (swapped back when CFBD lists the other team as home), rest
+    days derived from the season games frame. Missing answers stay None."""
+    ctx = _empty_context()
+    swapped = row is not None and _as_str(row.get("home_team")) == away \
+        and _as_str(row.get("away_team")) == home
+    if league == "nfl":
+        hc, ac = _NFL_CONFERENCE.get(home), _NFL_CONFERENCE.get(away)
+        ctx["home_conference"], ctx["away_conference"] = hc, ac
+        ctx["conference_game"] = (hc == ac) if hc and ac else None
+        if row is not None:
+            ctx["division_game"] = _as_bool(row.get("div_game"))
+            h_rest, a_rest = _as_int(row.get("home_rest")), _as_int(row.get("away_rest"))
+            if swapped:
+                h_rest, a_rest = a_rest, h_rest
+            ctx["home_rest_days"], ctx["away_rest_days"] = h_rest, a_rest
+            loc = _as_str(row.get("location"))
+            ctx["neutral_site"] = (loc.lower() == "neutral") if loc else None
+    elif row is not None:
+        hc, ac = _as_str(row.get("home_conference")), _as_str(row.get("away_conference"))
+        if swapped:
+            hc, ac = ac, hc
+        ctx["home_conference"], ctx["away_conference"] = hc, ac
+        conf_game = _as_bool(row.get("conference_game"))
+        ctx["conference_game"] = conf_game if conf_game is not None else ((hc == ac) if hc and ac else None)
+        ctx["neutral_site"] = _as_bool(row.get("neutral_site"))
+    if ctx["home_rest_days"] is None:
+        ctx["home_rest_days"] = _rest_days(games_df, home, commence_time)
+    if ctx["away_rest_days"] is None:
+        ctx["away_rest_days"] = _rest_days(games_df, away, commence_time)
+    return ctx
+
 
 @dataclass
 class LeagueContext:
@@ -108,7 +235,10 @@ def _cfb_context(season: int, week: int, config: dict) -> LeagueContext:
     rename = {c: t for c, t in
               (("homeTeam", "home_team"), ("awayTeam", "away_team"),
                ("homePoints", "home_score"), ("awayPoints", "away_score"),
-               ("startDate", "start_date"), ("venueId", "venue_id"))
+               ("startDate", "start_date"), ("venueId", "venue_id"),
+               # Context block (RSI phase 2): conferences / neutral site.
+               ("homeConference", "home_conference"), ("awayConference", "away_conference"),
+               ("conferenceGame", "conference_game"), ("neutralSite", "neutral_site"))
               if c in games.columns}
     games = games.rename(columns=rename) if not games.empty else games
 
@@ -268,11 +398,14 @@ def _evaluate_market(ctx: LeagueContext, scored: ScoredGame, view, projection,
                      weather, g5_involved: bool, explosive_involved: bool,
                      games_min: float | None,
                      qb_hold: str | None = None,
-                     ref_spread: float | None = None) -> FootballPick | None:
+                     ref_spread: float | None = None,
+                     context: dict | None = None) -> FootballPick | None:
     """Price one market (spread or total) into a FootballPick, or None when
     the market can't be evaluated at all. `ref_spread` is the game's spread
     reference (sharp line, else bet-book line) so the CFB mismatch cap can
-    hold the TOTAL on a blowout game too."""
+    hold the TOTAL on a blowout game too. `context` is the schedule-derived
+    reasoning["context"] block (see `_game_context`); every pick carries one
+    (all-None when the caller has no schedule row)."""
     from mlb_value_bot.football.analysis import football_stability as stab
     from mlb_value_bot.football.analysis.football_confidence import confidence_for_pick
     from mlb_value_bot.football.analysis.football_ev import blend_probability, ev_with_push
@@ -449,7 +582,12 @@ def _evaluate_market(ctx: LeagueContext, scored: ScoredGame, view, projection,
                           projection.home_detail.notes if n.startswith("__ats__")), None),
         "weather": {"multiplier": weather.multiplier, "available": weather.available,
                     "indoor": weather.indoor, "temp_f": weather.temp_f,
-                    "wind_mph": weather.wind_mph, "note": weather.note},
+                    "wind_mph": weather.wind_mph, "note": weather.note,
+                    # Precipitation at kickoff (logged only, not a model input).
+                    "precip_prob": getattr(weather, "precip_prob", None),
+                    "precip_mm": getattr(weather, "precip_mm", None)},
+        # Schedule context (RSI phase 2): conference / division / rest / neutral.
+        "context": {**_empty_context(), **(context or {})},
         "hold_reason": hold_reason,
     }
 
@@ -664,6 +802,7 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
 
         picks: list[FootballPick] = []
         sigma_t = float(pcfg.get(f"{league}_total_sigma", 10.0))
+        game_context = _game_context(league, ctx.games, row, home, away, game.commence_time)
         for market_name, sigma in (("spread", sigma_m), ("total", sigma_t)):
             view = spread_view if market_name == "spread" \
                 else market_view(game, "total", config, sigma_t)
@@ -672,7 +811,8 @@ def evaluate_league_slate(league: str, date_iso: str, config: dict,
             qb_hold = qb_flags_map.get(home) or qb_flags_map.get(away)
             pick = _evaluate_market(ctx, scored, view, projection, weather,
                                     g5_involved, explosive_involved, games_min,
-                                    qb_hold=qb_hold, ref_spread=ref_spread)
+                                    qb_hold=qb_hold, ref_spread=ref_spread,
+                                    context=game_context)
             if pick is not None:
                 if qb_hold or qb_note:
                     pick.reasoning["qb_guard"] = qb_hold or qb_note

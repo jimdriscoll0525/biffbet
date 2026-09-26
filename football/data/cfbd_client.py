@@ -111,7 +111,13 @@ class CfbdClient:
 
     def games(self, year: int, week: int | None = None, season_type: str = "regular",
               force_refresh: bool = False) -> pd.DataFrame:
-        """FBS games with scores (grading) + venue ids (weather)."""
+        """FBS games with scores (grading) + venue ids (weather).
+
+        The frame is the flattened /games payload, so the context columns
+        the pick reasoning logs (RSI phase 2) survive untrimmed:
+        homeConference / awayConference / conferenceGame / neutralSite
+        (renamed to snake_case in pipeline_football._cfb_context), plus the
+        pregame Elo columns the CFB margin anchor reads."""
         params: dict = {"year": year, "seasonType": season_type, "classification": "fbs"}
         key = f"cfbd_games_{year}_{season_type}_{week if week is not None else 'all'}"
         if week is not None:

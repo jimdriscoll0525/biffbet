@@ -624,6 +624,12 @@ totals:
     # state (fixed dome) is `available=True` and is NOT held back. Set false to
     # allow betting totals without weather (not recommended).
     require_for_bet: true
+    # RSI phase 2 (2026-09-26): a retractable roof is ASSUMED open (free data
+    # can't see a closed roof). When true, a totals pick on a park whose roof
+    # state is assumed rather than verified (roof "retractable_assumed_open")
+    # is held analysis-only with pass_reason `roof_unverified` -- the same
+    # hold mechanism as the weather rule above. Off by default.
+    require_verified_roof: false
     temp_ref_c: 20.0           # neutral temperature
     temp_coef_per_c: 0.006     # run-env multiplier per degC above ref (warmer -> more offense)
     wind_out_coef: 0.010       # per km/h of wind blowing OUT to center (boost)
@@ -688,6 +694,19 @@ totals:
 
   odds:
     sharp_close_priority: ["pinnacle", "betonlineag", "lowvig"]
+
+# -----------------------------------------------------------------------------
+# Grading (`results`). RSI phase 2 (2026-09-26): with grade_analyses on, the
+# is_value=0 pass rows (below threshold, filtered, sanity-skipped) are graded
+# COUNTERFACTUALLY against the final score -- `result` set as if the
+# recommended side had been bet, profit_loss 0.0 -- so the weekly review can
+# compare what the model passed on against what it bet. They are counted in a
+# separate `analyses_graded` tally and NEVER touch the headline W-L / P&L
+# (performance filters is_value=1). Applies to the moneyline AND totals ledgers
+# (football has its own grading.grade_analyses in config_football.yaml).
+# -----------------------------------------------------------------------------
+grading:
+  grade_analyses: true
 
 logging:
   level: "INFO"

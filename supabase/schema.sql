@@ -485,3 +485,260 @@ create policy "public read live recs"
     on public.football_live_recommendations for select
     to anon, authenticated
     using (true);
+
+-- ============================================================================
+-- RSI (Recursive Self-Improvement) — 2026-09-26. ADDITIVE.
+--
+-- The engine mines its OWN recommendation history (picks AND passes, all
+-- engines) every Monday, writes Proposals for Jim's approval, runs approved
+-- changes as shadow challengers, and lets the Proposals tab promote / roll
+-- back model versions. Nothing here changes the live model on its own: the
+-- engine only ever reads rsi_model_versions(status='active') and
+-- rsi_proposals(status='approved'); every transition beyond watch/pending is
+-- a button press in the tab.
+--
+-- Invariants:
+--   * recommendations / totals_recommendations / football_recommendations
+--     only ever hold CHAMPION rows; challengers write to rsi_shadow_picks.
+--   * CLV metrics never mix: clv_pct (MLB ML, % re-pricing), clv_pp (totals +
+--     football, probability points vs sharp close), clv_blended_vs_sharp
+--     (GriffBet). Every RSI aggregate carries a clv_metric label.
+--   * rsi_* tables are personal-only: RLS enabled with NO policies, so the anon
+--     key sees nothing; the site's service-role routes (passcode-gated) and the
+--     engine's service key are the only readers/writers.
+-- ============================================================================
+
+-- --- 1. Additive columns on the MLB tables (football already has model_tag) --
+alter table public.recommendations
+    add column if not exists model_tag   text not null default 'biff_v1',
+    add column if not exists pass_reason text;   -- null on bets; see vocabulary below
+alter table public.totals_recommendations
+    add column if not exists model_tag   text not null default 'totals_v1',
+    add column if not exists pass_reason text;
+create index if not exists recommendations_model_tag_idx on public.recommendations (model_tag);
+create index if not exists totals_recs_model_tag_idx    on public.totals_recommendations (model_tag);
+-- pass_reason vocabulary (MLB ML): below_threshold | filter:heavy_favorite |
+--   filter:min_model_prob | filter:no_sharp_coverage | skip:divergence |
+--   skip:max_ev | skip:sharp_fade   (several joined with '+').
+-- Totals add: weather_held. Football keeps hold_reason inside reasoning.
+
+-- --- 2. Proposals -------------------------------------------------------------
+create table if not exists public.rsi_proposals (
+    id                 bigint generated always as identity primary key,
+    engine             text not null check (engine in ('mlb','mlb_totals','football','griffbet')),
+    sport              text not null,      -- mlb | mlb_totals | nfl | cfb | griffbet
+    finding_key        text not null,      -- ledger key format: '<pool>|<dim>=<value>'
+    kind               text not null default 'overlay' check (kind in ('overlay','insight')),
+    title              text not null,
+    description        text not null,      -- plain English pattern
+    suggested_change   text,               -- plain English rule / weight change
+    overlay            jsonb,              -- {"filters.min_model_prob": 0.5} dotted config keys; null = insight
+    status             text not null default 'watch'
+                       check (status in ('watch','pending','snoozed','approved','promoted','rejected','dropped')),
+    confidence         text not null default 'low' check (confidence in ('low','medium','high')),
+    direction          text,               -- positive | negative | structural
+    latest_stats       jsonb not null,     -- {n, settled, wins, losses, hit_rate, flat_roi, avg_clv, clv_metric,
+                                           --  clv_tracked, t_stat, p_value, bonferroni, clv_agrees, date_from, date_to}
+    evidence           jsonb not null default '[]'::jsonb,   -- one entry per review run
+    consecutive_hits   integer not null default 0,
+    consecutive_misses integer not null default 0,
+    first_seen         date not null,
+    last_seen          date not null,
+    snoozed_until      date,
+    decided_at         timestamptz,
+    decision_reason    text,
+    challenger_tag     text unique,        -- set on approve: biff_p<id> / totals_p<id> / matchup_p<id>
+    shadow_started_at  date,
+    shadow_ends_at     date,
+    shadow_stats       jsonb,              -- engine-computed champion vs challenger + gate
+    version_id         bigint,             -- rsi_model_versions.id once promoted
+    created_at         timestamptz not null default now(),
+    updated_at         timestamptz not null default now(),
+    constraint rsi_proposals_engine_key unique (engine, finding_key)
+);
+create index if not exists rsi_proposals_status_idx on public.rsi_proposals (status, sport);
+
+-- Permanent decision / lifecycle history (never deleted).
+create table if not exists public.rsi_proposal_events (
+    id           bigint generated always as identity primary key,
+    proposal_id  bigint not null references public.rsi_proposals(id) on delete cascade,
+    event        text not null,   -- seen|bar_met|pending|approved|rejected|snoozed|unsnoozed|dropped|promoted|rolled_back|imported|shadow_stats
+    actor        text not null default 'engine',   -- engine | jim
+    payload      jsonb,
+    created_at   timestamptz not null default now()
+);
+create index if not exists rsi_events_proposal_idx on public.rsi_proposal_events (proposal_id, created_at desc);
+
+-- --- 3. Model versions (one ACTIVE per engine; the engine stamps rows with tag)
+create table if not exists public.rsi_model_versions (
+    id               bigint generated always as identity primary key,
+    engine           text not null check (engine in ('mlb','mlb_totals','football')),
+    tag              text not null unique,        -- biff_v1, biff_v2, totals_v1, matchup_v1 ...
+    parent_tag       text,
+    proposal_id      bigint references public.rsi_proposals(id),
+    overlay          jsonb not null default '{}'::jsonb,   -- CUMULATIVE dotted-key overlay vs base yaml
+    status           text not null default 'active' check (status in ('active','superseded','rolled_back')),
+    promoted_at      timestamptz not null default now(),
+    retired_at       timestamptz,
+    baseline         jsonb,    -- champion stats over the shadow window at promotion time
+    rolling          jsonb,    -- latest rolling-window stats {n, avg_clv, clv_metric, flat_roi, window, computed_at}
+    rollback_flagged boolean not null default false,
+    rollback_reason  text,
+    notes            text
+);
+create unique index if not exists rsi_versions_one_active_per_engine
+    on public.rsi_model_versions (engine) where status = 'active';
+
+insert into public.rsi_model_versions (engine, tag, overlay, notes) values
+    ('mlb',        'biff_v1',    '{}', 'baseline (includes the filters.min_model_prob ability, 2026-08-30)'),
+    ('mlb_totals', 'totals_v1',  '{}', 'baseline'),
+    ('football',   'matchup_v1', '{}', 'baseline (includes the CFB elo margin anchor, 2026-08-31)')
+on conflict (tag) do nothing;
+
+-- --- 4. Shadow picks (challenger output; never in the public record) ---------
+create table if not exists public.rsi_shadow_picks (
+    id                       bigint generated always as identity primary key,
+    challenger_tag           text not null,
+    engine                   text not null,
+    sport                    text not null,   -- mlb | mlb_totals | nfl | cfb
+    league                   text,
+    date                     date not null,
+    game_id                  text not null,
+    market                   text not null,   -- moneyline | total | spread
+    home_team                text not null,
+    away_team                text not null,
+    pick_side                text not null,
+    is_value                 boolean not null,
+    pass_reason              text,
+    champion_is_value        boolean,         -- the champion's decision on the same game/market that run
+    ev_pct                   double precision,
+    adjusted_ev_pct          double precision,
+    confidence               double precision,
+    model_prob               double precision,
+    market_prob_devigged     double precision,
+    bet_odds                 integer,
+    decimal_odds             double precision,
+    line                     double precision,
+    opening_price            integer,
+    opening_line             double precision,
+    opening_devig_p_side     double precision,
+    closing_price            integer,
+    closing_line             double precision,
+    sharp_close_devig_p_side double precision,
+    clv                      double precision,
+    clv_metric               text not null,   -- clv_pct | clv_pp
+    result                   text not null default 'pending',
+    flat_pl                  double precision, -- flat 1u units (win = decimal-1, loss = -1)
+    reasoning                jsonb,
+    created_at               timestamptz not null default now(),
+    updated_at               timestamptz not null default now(),
+    constraint rsi_shadow_picks_key unique (challenger_tag, sport, date, game_id, market)
+);
+create index if not exists rsi_shadow_tag_date_idx on public.rsi_shadow_picks (challenger_tag, date desc);
+
+-- --- 5. Review runs (one row per weekly run; summary feeds the email + tab) --
+create table if not exists public.rsi_review_runs (
+    id            bigint generated always as identity primary key,
+    run_date      date not null,
+    sport         text not null,          -- all | mlb | mlb_totals | football | griffbet
+    started_at    timestamptz not null default now(),
+    finished_at   timestamptz,
+    status        text not null default 'running',   -- running | ok | error
+    params        jsonb,                  -- min_sample, t_threshold, holdout_pct ...
+    row_counts    jsonb,
+    cells_tested  integer,
+    summary       jsonb,                  -- per-sport headline block
+    email_sent_at timestamptz,
+    error         text
+);
+create index if not exists rsi_review_runs_date_idx on public.rsi_review_runs (run_date desc);
+
+alter table public.rsi_proposals       enable row level security;
+alter table public.rsi_proposal_events enable row level security;
+alter table public.rsi_model_versions  enable row level security;
+alter table public.rsi_shadow_picks    enable row level security;
+alter table public.rsi_review_runs     enable row level security;
+-- Deliberately NO policies: service-role only.
+
+-- --- 6. rsi_scored_games — every scored game across engines, one shape --------
+-- No data duplication: a UNION over the four recommendation tables. decision is
+-- 'pick' (is_value) or 'pass'; features is the full reasoning jsonb; clv_metric
+-- labels the unit. is_holdout is a deterministic 20% split on the game key
+-- (md5 of '<sport_key>:<game_id>', first 7 hex chars as an int, mod 100 < 20)
+-- that the weekly review NEVER uses for discovery — only promotion validation.
+-- Python twin: rsi/holdout.py::is_holdout (a test pins both to the same values).
+-- security_invoker: readable by whoever can read the underlying tables (all
+-- four are public-read), so the site could read it with the anon key too.
+create or replace view public.rsi_scored_games with (security_invoker = on) as
+select
+    'mlb'::text                   as engine,
+    'mlb'::text                   as sport,
+    null::text                    as league,
+    r.date,
+    r.game_id::text               as game_key,
+    r.home_team, r.away_team,
+    'moneyline'::text             as market,
+    r.recommended_side            as pick_side,
+    r.reasoning                   as features,
+    r.model_tag                   as model_version,
+    r.ev_pct,
+    (r.reasoning->'adjusted_ev'->>'adjusted_ev_pct')::double precision as adjusted_ev_pct,
+    r.confidence,
+    case when r.is_value then 'pick' else 'pass' end as decision,
+    r.pass_reason,
+    r.opening_line::double precision as opening_line,
+    r.opening_line                as opening_price,
+    r.american_odds               as pick_price,
+    null::double precision        as pick_line,
+    r.closing_line::double precision as closing_line,
+    r.closing_line                as closing_price,
+    r.result,
+    r.clv_pct                     as clv,
+    'clv_pct'::text               as clv_metric,
+    case r.result when 'win' then r.decimal_odds - 1 when 'loss' then -1 when 'push' then 0 when 'void' then 0 end as flat_pl_units,
+    r.profit_loss                 as kelly_pl_units,
+    (('x' || substr(md5('mlb:' || r.game_id::text), 1, 7))::bit(28)::int % 100) < 20 as is_holdout,
+    r.created_at, r.updated_at
+from public.recommendations r
+union all
+select
+    'mlb_totals', 'mlb_totals', null, t.date, t.game_id::text, t.home_team, t.away_team,
+    'total', t.pick_side, t.reasoning, t.model_tag,
+    t.ev_pct, null, t.confidence,
+    case when t.is_value then 'pick' else 'pass' end, t.pass_reason,
+    t.opening_line, t.opening_price, t.bet_odds, t.market_total,
+    t.closing_line, t.closing_price,
+    t.result, t.clv_pp, 'clv_pp',
+    case t.result when 'win' then t.decimal_odds - 1 when 'loss' then -1 when 'push' then 0 when 'void' then 0 end,
+    t.profit_loss,
+    (('x' || substr(md5('mlb_totals:' || t.game_id::text), 1, 7))::bit(28)::int % 100) < 20,
+    t.created_at, t.updated_at
+from public.totals_recommendations t
+union all
+select
+    'griffbet', 'griffbet', null, g.date, g.game_id::text, g.home_team, g.away_team,
+    'moneyline', g.recommended_side, g.reasoning, 'griff_v1',
+    g.ev_pct, null, g.confidence,
+    case when g.is_value then 'pick' else 'pass' end, null,
+    g.opening_line::double precision, g.opening_line, g.american_odds, null,
+    g.closing_line::double precision, g.closing_line,
+    g.result, g.clv_blended_vs_sharp, 'clv_blended_vs_sharp',
+    case g.result when 'win' then g.decimal_odds - 1 when 'loss' then -1 when 'push' then 0 when 'void' then 0 end,
+    g.profit_loss,
+    (('x' || substr(md5('griffbet:' || g.game_id::text), 1, 7))::bit(28)::int % 100) < 20,
+    g.created_at, g.updated_at
+from public.griffbet_recommendations g
+union all
+select
+    'football', f.league, f.league, f.date, f.game_id, f.home_team, f.away_team,
+    f.market, f.pick_side, f.reasoning, f.model_tag,
+    f.ev_pct, f.adjusted_ev_pct, f.confidence,
+    case when f.is_value then 'pick' else 'pass' end, f.reasoning->>'hold_reason',
+    f.opening_line, f.opening_price, f.bet_odds, f.line,
+    f.closing_line, f.closing_price,
+    f.result, f.clv_pp, 'clv_pp',
+    case f.result when 'win' then f.decimal_odds - 1 when 'loss' then -1 when 'push' then 0 when 'void' then 0 end,
+    f.profit_loss,
+    (('x' || substr(md5(f.league || ':' || f.game_id), 1, 7))::bit(28)::int % 100) < 20,
+    f.created_at, f.updated_at
+from public.football_recommendations f;

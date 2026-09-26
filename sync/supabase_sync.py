@@ -45,8 +45,11 @@ _REC_COLUMNS = (
     "model_prob", "market_prob_devigged", "american_odds", "decimal_odds",
     "ev_pct", "kelly_stake", "confidence", "opening_line", "closing_line",
     "clv_pct", "result", "profit_loss", "is_value",
+    "model_tag", "pass_reason",          # RSI phase 2 (2026-09-26)
     "created_at", "updated_at",
 )
+_REC_DEFAULT_MODEL_TAG = "biff_v1"
+_TOTALS_DEFAULT_MODEL_TAG = "totals_v1"
 
 
 # Columns we push to the `totals_recommendations` table (parallel to the ML
@@ -59,7 +62,8 @@ _TOTALS_REC_COLUMNS = (
     "expected_total", "paper", "opening_line", "opening_price", "opening_devig_p_side",
     "closing_line", "closing_price", "sharp_close_book", "sharp_close_line",
     "sharp_close_over", "sharp_close_under", "sharp_close_devig_p_side", "clv_pp",
-    "result", "profit_loss", "is_value", "created_at", "updated_at",
+    "result", "profit_loss", "is_value", "model_tag", "pass_reason",
+    "created_at", "updated_at",
 )
 _TOTALS_INT_COLS = (
     "game_id", "over_odds", "under_odds", "bet_odds", "opening_price",
@@ -173,6 +177,8 @@ def _rec_rows(since: str | None) -> list[dict]:
         else:
             # Old rows synced before the column existed -> treat as bets.
             row["is_value"] = True
+        if not row.get("model_tag"):
+            row["model_tag"] = _REC_DEFAULT_MODEL_TAG
         # reasoning_json (TEXT) -> reasoning (jsonb)
         raw = r.get("reasoning_json")
         if isinstance(raw, str) and raw:
@@ -216,6 +222,8 @@ def _totals_rec_rows(since: str | None) -> list[dict]:
             if row.get(boolcol) is not None:
                 row[boolcol] = bool(int(row[boolcol]))
         row["paper"] = True if row.get("paper") is None else row["paper"]
+        if not row.get("model_tag"):
+            row["model_tag"] = _TOTALS_DEFAULT_MODEL_TAG
         raw = r.get("reasoning_json")
         if isinstance(raw, str) and raw:
             try:
@@ -331,14 +339,15 @@ def pull_recommendations() -> int:
             # 1 (treat as bet) for rows synced before the column existed.
             is_value_raw = r.get("is_value")
             is_value = 1 if is_value_raw is None else (1 if bool(is_value_raw) else 0)
+            model_tag = r.get("model_tag") or _REC_DEFAULT_MODEL_TAG
             conn.execute(
                 """
                 INSERT INTO recommendations
                   (date, game_id, home_team, away_team, recommended_side, model_prob,
                    market_prob_devigged, american_odds, decimal_odds, ev_pct, kelly_stake,
                    confidence, reasoning_json, opening_line, closing_line, clv_pct, result,
-                   profit_loss, is_value, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   profit_loss, is_value, model_tag, pass_reason, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(date, game_id) DO UPDATE SET
                   home_team=excluded.home_team, away_team=excluded.away_team,
                   recommended_side=excluded.recommended_side,
@@ -350,6 +359,7 @@ def pull_recommendations() -> int:
                   opening_line=excluded.opening_line, closing_line=excluded.closing_line,
                   clv_pct=excluded.clv_pct, result=excluded.result,
                   profit_loss=excluded.profit_loss, is_value=excluded.is_value,
+                  model_tag=excluded.model_tag, pass_reason=excluded.pass_reason,
                   updated_at=excluded.updated_at
                 """,
                 (
@@ -358,6 +368,7 @@ def pull_recommendations() -> int:
                     r["ev_pct"], r["kelly_stake"], r["confidence"], reasoning_json,
                     r.get("opening_line"), r.get("closing_line"), r.get("clv_pct"),
                     r.get("result", "pending"), r.get("profit_loss"), is_value,
+                    model_tag, r.get("pass_reason"),
                     r.get("created_at"), r.get("updated_at"),
                 ),
             )
@@ -393,6 +404,7 @@ def pull_totals_recommendations() -> int:
             # any legacy rows missing the column.
             paper = 1 if r.get("paper") in (None, True, 1) else 0
             is_value = 1 if r.get("is_value") in (None, True, 1) else 0
+            model_tag = r.get("model_tag") or _TOTALS_DEFAULT_MODEL_TAG
             conn.execute(
                 """
                 INSERT INTO totals_recommendations
@@ -403,8 +415,8 @@ def pull_totals_recommendations() -> int:
                    reasoning_json, opening_line, opening_price, opening_devig_p_side,
                    closing_line, closing_price, sharp_close_book, sharp_close_line,
                    sharp_close_over, sharp_close_under, sharp_close_devig_p_side, clv_pp,
-                   result, profit_loss, is_value, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   result, profit_loss, is_value, model_tag, pass_reason, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(date, game_id) DO UPDATE SET
                   home_team=excluded.home_team, away_team=excluded.away_team,
                   pick_side=excluded.pick_side, market_total=excluded.market_total,
@@ -424,7 +436,8 @@ def pull_totals_recommendations() -> int:
                   sharp_close_over=excluded.sharp_close_over, sharp_close_under=excluded.sharp_close_under,
                   sharp_close_devig_p_side=excluded.sharp_close_devig_p_side, clv_pp=excluded.clv_pp,
                   result=excluded.result, profit_loss=excluded.profit_loss,
-                  is_value=excluded.is_value, updated_at=excluded.updated_at
+                  is_value=excluded.is_value, model_tag=excluded.model_tag,
+                  pass_reason=excluded.pass_reason, updated_at=excluded.updated_at
                 """,
                 (
                     r["date"], r["game_id"], r["home_team"], r["away_team"], r["pick_side"],
@@ -437,7 +450,8 @@ def pull_totals_recommendations() -> int:
                     r.get("closing_line"), r.get("closing_price"), r.get("sharp_close_book"),
                     r.get("sharp_close_line"), r.get("sharp_close_over"), r.get("sharp_close_under"),
                     r.get("sharp_close_devig_p_side"), r.get("clv_pp"), r.get("result", "pending"),
-                    r.get("profit_loss"), is_value, r.get("created_at"), r.get("updated_at"),
+                    r.get("profit_loss"), is_value, model_tag, r.get("pass_reason"),
+                    r.get("created_at"), r.get("updated_at"),
                 ),
             )
     log.info("Pulled %d totals recommendation(s) from Supabase into local SQLite.", len(rows))

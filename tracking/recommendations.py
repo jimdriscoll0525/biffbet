@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS recommendations (
     is_value              INTEGER NOT NULL DEFAULT 1,  -- 1 = actual bet (>= EV threshold);
                                                        -- 0 = analyzed but didn't clear threshold,
                                                        -- kept so the site can show full slates.
+    model_tag             TEXT NOT NULL DEFAULT 'biff_v1',  -- RSI: model version that priced it
+    pass_reason           TEXT,                   -- RSI: why an is_value=0 row was NOT bet
+                                                  -- (below_threshold | filter:* | skip:*, '+'-joined)
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
     UNIQUE(date, game_id, recommended_side)
@@ -98,6 +101,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         log.info("Migrated recommendations: deduped + added (date, game_id) unique index.")
 
+    # 2026-09-26 (RSI phase 2): model_tag stamps every row with the model
+    # version that priced it; pass_reason records WHY an analysis-only row
+    # was not bet, so the weekly review can mine passes as well as picks.
+    if "model_tag" not in cols:
+        conn.execute("ALTER TABLE recommendations ADD COLUMN model_tag TEXT NOT NULL DEFAULT 'biff_v1'")
+        log.info("Migrated recommendations: added model_tag column (existing rows -> biff_v1).")
+    if "pass_reason" not in cols:
+        conn.execute("ALTER TABLE recommendations ADD COLUMN pass_reason TEXT")
+        log.info("Migrated recommendations: added pass_reason column.")
+
 
 @dataclass
 class RecommendationRecord:
@@ -120,6 +133,8 @@ class RecommendationRecord:
     result: str = "pending"
     profit_loss: float | None = None
     is_value: bool = True
+    model_tag: str = "biff_v1"
+    pass_reason: str | None = None       # None on bets
     id: int | None = None
 
 
@@ -167,19 +182,25 @@ def upsert_recommendation(rec: RecommendationRecord) -> int:
       flip is_value, and refresh model fields (this is the first "real" snapshot
       of this bet).
     * Existing is_value=0, new is_value=0: still just an analysis. Refresh ALL
-      model fields with the latest run; opening_line/closing_line track the
-      latest prices.
+      model fields with the latest run. The opening_line stays FROZEN at the
+      first capture (so passes accumulate a genuine open->close CLV reading
+      too, RSI phase 2) UNLESS the recommended side flipped, in which case the
+      opening is re-frozen at the new side's current price (an opening price
+      on the other side is not comparable). closing_line/clv_pct track the
+      latest price on every run.
 
     We match by (date, game_id) — at most one row per game per date — so if the
     favored side flips between runs while still a non-bet analysis, we update
-    the side in place rather than creating a duplicate row.
+    the side in place rather than creating a duplicate row. model_tag and
+    pass_reason are written on every non-committed write (never on a
+    committed bet, whose model snapshot is frozen).
     """
     init_db()
     now = _now()
     with connect() as conn:
         existing = conn.execute(
             """
-            SELECT id, opening_line, is_value FROM recommendations
+            SELECT id, opening_line, is_value, recommended_side FROM recommendations
             WHERE date=? AND game_id=?
             """,
             (rec.date, rec.game_id),
@@ -205,10 +226,16 @@ def upsert_recommendation(rec: RecommendationRecord) -> int:
 
             # Was a non-bet analysis: refresh everything. If it's now a bet, this
             # run is the first "real" snapshot -> the current price becomes
-            # opening_line and is_value flips to 1.
-            opening = rec.american_odds if now_bet else (existing["opening_line"] or rec.american_odds)
+            # opening_line and is_value flips to 1. Otherwise the analysis
+            # keeps its frozen opening (re-frozen only on a side flip) and
+            # gets a close + CLV reading like a bet would.
+            side_flipped = existing["recommended_side"] != rec.recommended_side
+            if now_bet or side_flipped or existing["opening_line"] is None:
+                opening = rec.american_odds
+            else:
+                opening = existing["opening_line"]
             closing = rec.american_odds
-            clv = _compute_clv(opening, closing) if now_bet else None
+            clv = _compute_clv(opening, closing)
             conn.execute(
                 """
                 UPDATE recommendations SET
@@ -216,7 +243,8 @@ def upsert_recommendation(rec: RecommendationRecord) -> int:
                     model_prob=?, market_prob_devigged=?,
                     american_odds=?, decimal_odds=?, ev_pct=?, kelly_stake=?,
                     confidence=?, reasoning_json=?,
-                    opening_line=?, closing_line=?, clv_pct=?, is_value=?, updated_at=?
+                    opening_line=?, closing_line=?, clv_pct=?, is_value=?,
+                    model_tag=?, pass_reason=?, updated_at=?
                 WHERE id=?
                 """,
                 (
@@ -224,10 +252,14 @@ def upsert_recommendation(rec: RecommendationRecord) -> int:
                     rec.model_prob, rec.market_prob_devigged,
                     rec.american_odds, rec.decimal_odds, rec.ev_pct, rec.kelly_stake,
                     rec.confidence, json.dumps(rec.reasoning),
-                    opening, closing, clv, 1 if now_bet else 0, now,
+                    opening, closing, clv, 1 if now_bet else 0,
+                    rec.model_tag, None if now_bet else rec.pass_reason, now,
                     existing["id"],
                 ),
             )
+            if side_flipped and not now_bet:
+                log.info("Analysis side flipped on game %s (%s -> %s); opening re-frozen @ %+d",
+                         rec.game_id, existing["recommended_side"], rec.recommended_side, opening)
             if now_bet:
                 log.info("Promoted game %s (%s) to a bet @ %+d (EV %.1f%%)",
                          rec.game_id, rec.recommended_side, rec.american_odds, rec.ev_pct * 100)
@@ -241,8 +273,8 @@ def upsert_recommendation(rec: RecommendationRecord) -> int:
                 model_prob, market_prob_devigged, american_odds, decimal_odds,
                 ev_pct, kelly_stake, confidence, reasoning_json,
                 opening_line, closing_line, clv_pct, result, profit_loss, is_value,
-                created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                model_tag, pass_reason, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 rec.date, rec.game_id, rec.home_team, rec.away_team, rec.recommended_side,
@@ -250,6 +282,7 @@ def upsert_recommendation(rec: RecommendationRecord) -> int:
                 rec.ev_pct, rec.kelly_stake, rec.confidence, json.dumps(rec.reasoning),
                 opening, rec.closing_line, rec.clv_pct, rec.result, rec.profit_loss,
                 1 if rec.is_value else 0,
+                rec.model_tag, None if rec.is_value else rec.pass_reason,
                 now, now,
             ),
         )
@@ -270,18 +303,21 @@ def update_result(rec_id: int, result: str, profit_loss: float) -> None:
         )
 
 
-def get_open_for_date(game_date: str) -> list[sqlite3.Row]:
+def get_open_for_date(game_date: str, include_analyses: bool = False) -> list[sqlite3.Row]:
     """Pending BET recommendations for a given game date (is_value=1 only).
 
-    Non-value analysis rows aren't bets; they don't get graded and don't count
-    toward W/L or P&L.
+    Non-value analysis rows aren't bets; they don't count toward W/L or P&L.
+    With `include_analyses` (grading.grade_analyses, RSI phase 2) the pending
+    is_value=0 rows are returned too so `results` can grade them
+    COUNTERFACTUALLY (result set, profit_loss 0) -- callers keep those out of
+    the headline record.
     """
     init_db()
+    query = "SELECT * FROM recommendations WHERE date=? AND result='pending'"
+    if not include_analyses:
+        query += " AND is_value=1"
     with connect() as conn:
-        return conn.execute(
-            "SELECT * FROM recommendations WHERE date=? AND result='pending' AND is_value=1",
-            (game_date,),
-        ).fetchall()
+        return conn.execute(query, (game_date,)).fetchall()
 
 
 def refresh_closing_line(game_date: str, game_id: int, side_odds: dict[str, int]) -> bool:
@@ -370,7 +406,7 @@ def add_scratch_alerts(game_date: str, game_id: int, alerts: list[dict]) -> int:
         return added
 
 
-def get_open_dates(before: str | None = None) -> list[str]:
+def get_open_dates(before: str | None = None, include_analyses: bool = False) -> list[str]:
     """Distinct game dates that still have pending bets (is_value=1), ascending.
 
     `before` (YYYY-MM-DD, exclusive) restricts to past dates so an in-progress
@@ -378,9 +414,13 @@ def get_open_dates(before: str | None = None) -> list[str]:
     backfill: a bet can outlive the old "grade yesterday" default (a failed
     run, a game still in progress when graded, rows created before grading
     existed), so `results` sweeps these instead of assuming yesterday.
+    `include_analyses` widens the sweep to pending is_value=0 rows (the
+    counterfactual pass grading).
     """
     init_db()
-    query = "SELECT DISTINCT date FROM recommendations WHERE result='pending' AND is_value=1"
+    query = "SELECT DISTINCT date FROM recommendations WHERE result='pending'"
+    if not include_analyses:
+        query += " AND is_value=1"
     params: tuple = ()
     if before:
         query += " AND date < ?"

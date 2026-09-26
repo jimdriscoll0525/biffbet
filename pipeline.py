@@ -95,6 +95,9 @@ class GameAnalysis:
     # config.totals.enabled; None otherwise. The moneyline fields above are
     # unaffected by it. See pipeline_totals.TotalsAnalysis.
     totals: "object | None" = None
+    # RSI (2026-09-26): the model version that priced this game. Stamped onto
+    # the persisted row (recommendations.model_tag) by save_slate.
+    model_tag: str = "biff_v1"
 
     @property
     def best_eval(self) -> SideEvaluation | None:
@@ -103,12 +106,48 @@ class GameAnalysis:
         return self.evals[self.best_side]
 
     def is_value(self, threshold: float) -> bool:
+        """A real bet: evaluable, clears the raw-EV threshold, positive stake,
+        and NOT sanity-skipped (a skipped game keeps its evals for the record
+        but is never bet)."""
         be = self.best_eval
-        return be is not None and be.ev_pct >= threshold and be.kelly_stake > 0
+        if be is None or self.skipped_reason:
+            return False
+        return be.ev_pct >= threshold and be.kelly_stake > 0
+
+    def pass_reason(self, threshold: float) -> str | None:
+        """Why this game was NOT bet (RSI pass vocabulary), or None for a bet.
+
+        Joins every reason that applies with '+', from the fixed vocabulary:
+        skip:divergence | skip:max_ev | skip:sharp_fade (post-price sanity
+        guards), filter:heavy_favorite | filter:min_model_prob |
+        filter:no_sharp_coverage (selection filters), below_threshold (raw EV
+        under config.ev.threshold). None when there is nothing to persist
+        (no best_eval) -- those games are dropped, not recorded as passes.
+        """
+        be = self.best_eval
+        if be is None or self.is_value(threshold):
+            return None
+        parts: list[str] = []
+        kind = skip_kind(self.skipped_reason)
+        if kind:
+            parts.append(kind)
+        parts.extend(filter_kind(r) for r in self.filter_reasons)
+        if be.ev_pct < threshold:
+            parts.append("below_threshold")
+        if not parts:
+            # Positive-EV, unfiltered, unskipped but zero stake (Kelly floored
+            # at 0): indistinguishable from a marginal edge for the review.
+            parts.append("below_threshold")
+        return "+".join(dict.fromkeys(parts))
 
     def reasoning(self) -> dict:
         """Full JSON-able breakdown (model components + market-blend + sizing) for the DB."""
         data = self.wp.reasoning() if self.wp else {}
+        data["model_tag"] = self.model_tag
+        if self.skipped_reason:
+            # A post-price sanity skip (divergence / max EV / sharp fade) keeps
+            # its full evaluation for the pass record; the reason rides along.
+            data["skipped_reason"] = self.skipped_reason
         data["market_anchor"] = {
             "raw_model_home_prob": round(self.wp.home_win_prob, 4) if self.wp else None,
             "market_devig_home_prob": round(self.market_home_prob, 4) if self.market_home_prob is not None else None,
@@ -191,6 +230,40 @@ class GameAnalysis:
                 "n_total_books": mi.n_total_books,
             }
         return data
+
+
+# --- RSI pass vocabulary (2026-09-26) ----------------------------------------
+# Substring -> canonical kind. The prose reasons stay human-readable in
+# skipped_reason / filter_reasons; these are the machine labels the weekly
+# review groups on (supabase/schema.sql "pass_reason vocabulary").
+_SKIP_KINDS: tuple[tuple[str, str], ...] = (
+    ("diverge", "skip:divergence"),
+    ("implausible EV", "skip:max_ev"),
+    ("fading sharp", "skip:sharp_fade"),
+)
+_FILTER_KINDS: tuple[tuple[str, str], ...] = (
+    ("heavy favorite", "filter:heavy_favorite"),
+    ("min_model_prob", "filter:min_model_prob"),
+    ("no sharp book", "filter:no_sharp_coverage"),
+)
+
+
+def skip_kind(reason: str | None) -> str | None:
+    """Canonical `skip:<kind>` label for a post-price sanity skip reason."""
+    if not reason:
+        return None
+    for needle, kind in _SKIP_KINDS:
+        if needle in reason:
+            return kind
+    return "skip:other"
+
+
+def filter_kind(reason: str) -> str:
+    """Canonical `filter:<kind>` label for a selection-filter reason."""
+    for needle, kind in _FILTER_KINDS:
+        if needle in reason:
+            return kind
+    return "filter:other"
 
 
 def _lineup_to_dict(status) -> dict | None:
@@ -484,6 +557,11 @@ def evaluate_game(
     # market said ~27%. Mid-tier blend pulled only partway -> fake +12.6% EV.
     # We check BEFORE evaluating EV because the blended prob masks the
     # underlying disagreement. Tunable in config.sanity.
+    # RSI (2026-09-26): this and the two guards below no longer early-return.
+    # The game is still fully evaluated (evals / confidence / reasoning) so it
+    # can be persisted as an is_value=0 pass with pass_reason skip:<kind>;
+    # the skip forces tier "pass" + stake 0 at the end, and is_value() is
+    # False whenever skipped_reason is set. First guard to fire wins.
     max_div = float(config.get("sanity", {}).get("max_model_market_divergence", 0.15))
     divergence = abs(wp.home_win_prob - market_home)
     if divergence > max_div:
@@ -491,7 +569,6 @@ def evaluate_game(
             f"raw model ({wp.home_win_prob:.3f}) vs market ({market_home:.3f}) "
             f"diverge by {divergence:.3f} > {max_div:.2f} - market likely on news the model doesn't see"
         )
-        return analysis
 
     evals = evaluate_sides(
         blended_home,
@@ -508,11 +585,10 @@ def evaluate_game(
     # Catches anything that slips past the odds-band and divergence checks.
     # Tunable in config.sanity.
     max_ev = float(config.get("sanity", {}).get("max_ev", 0.30))
-    if evals[best_side].ev_pct > max_ev:
+    if evals[best_side].ev_pct > max_ev and analysis.skipped_reason is None:
         analysis.skipped_reason = (
             f"implausible EV ({evals[best_side].ev_pct * 100:.0f}%) - likely bad market data"
         )
-        return analysis
 
     confidence = compute_confidence(
         wp, home_pp, away_pp, home_tp, away_tp, evals[best_side].ev_pct, config,
@@ -540,14 +616,13 @@ def evaluate_game(
     # already catches that one. This guard catches DIFFERENT failure modes:
     # market reading a news headline, weather, lineup change we missed.)
     max_sharp_fade = float(config.get("sanity", {}).get("max_sharp_disagreement_pp", 5.0))
-    if sharp_fade_pp is not None and sharp_fade_pp * 100 > max_sharp_fade:
+    if sharp_fade_pp is not None and sharp_fade_pp * 100 > max_sharp_fade \
+            and analysis.skipped_reason is None:
         analysis.skipped_reason = (
             f"fading sharp consensus by {sharp_fade_pp * 100:.1f}pp on {best_side} "
             f"(blended {our_pick_home_prob:.3f} vs sharps {market_intel.sharp_devig_home:.3f}) "
             f"> {max_sharp_fade:.1f}pp"
         )
-        analysis.market_intel = market_intel
-        return analysis
 
     # Edge stability (Step 3, 2026-05-30). Classify the pick as
     # STABLE / MODERATE / FRAGILE based on WHICH components are driving the
@@ -619,6 +694,13 @@ def evaluate_game(
         analysis.filter_reasons = filter_reasons
         tier = "pass"
         tier_reasons = tier_reasons + filter_reasons
+        evals[best_side].kelly_stake = 0.0
+
+    # Post-price sanity skip (divergence / max EV / sharp fade): evaluated in
+    # full for the pass record, but never bet -- tier pass, stake 0.
+    if analysis.skipped_reason:
+        tier = "pass"
+        tier_reasons = tier_reasons + [f"skipped: {analysis.skipped_reason}"]
         evals[best_side].kelly_stake = 0.0
 
     analysis.blend_shrink_note = shrink_note
@@ -1048,13 +1130,40 @@ def _build_bullpen_status_provider(
     return provider
 
 
-def analyze_slate(
+@dataclass
+class SlateInputs:
+    """Everything a slate evaluation needs, fetched ONCE over the network by
+    `fetch_slate_inputs` so `evaluate_slate_inputs` can be re-run (e.g. by an
+    RSI shadow challenger with a different config) without touching an API.
+
+    Keyed by game_id: `matched_odds` (the schedule<->odds join), `profiles`
+    (pitcher/team/bullpen/lineup snapshots, playable games only) and
+    `weather` (Open-Meteo, only fetched when totals were enabled and the game
+    had odds). The provider callables are the memoized per-slate factories
+    `evaluate_game` accepts; they are only consulted when a profile is missing.
+    """
+    game_date: str
+    season: int
+    as_of: date_cls
+    schedule: list[ScheduledGame]
+    odds: list[GameOdds]
+    matched_odds: dict[int, GameOdds | None]
+    profiles: dict[int, GameProfiles]
+    weather: dict[int, object | None] = field(default_factory=dict)
+    team_provider: TeamMetricsProvider | None = None
+    bullpen_status_provider: object | None = None
+    lineup_status_provider: object | None = None
+    weather_fetched: bool = False       # totals were enabled at fetch time
+
+
+def fetch_slate_inputs(
     game_date: str,
     odds_client: OddsClient | None = None,
     mlb_client: MLBClient | None = None,
     config: dict | None = None,
-) -> list[GameAnalysis]:
-    """Analyze every game on `game_date`, sorted by best-side EV descending."""
+) -> SlateInputs:
+    """Pull every network input for `game_date`'s slate (schedule, odds, the
+    per-game metric profiles, weather) into a SlateInputs. No evaluation."""
     config = config or load_config()
     odds_client = odds_client or OddsClient(config=config)
     mlb_client = mlb_client or MLBClient(config=config)
@@ -1074,34 +1183,60 @@ def analyze_slate(
     # feed-live calls memoized so both sides share one fetch.
     lu_provider = _build_lineup_status_provider(mlb_client, season, config)
 
-    # Totals model (parallel, independent). Enabled via config.totals.enabled;
-    # reuses the SAME per-game profiles as the moneyline so the slate does one
-    # set of pulls. Imported lazily to avoid a module import cycle.
+    # Totals weather (Open-Meteo) is fetched here, once per game, only when
+    # totals are enabled AND there are odds to bet against.
     totals_enabled = bool(config.get("totals", {}).get("enabled", False))
     if totals_enabled:
         from mlb_value_bot.data.weather import weather_env
+
+    matched_odds: dict[int, GameOdds | None] = {}
+    profiles: dict[int, GameProfiles] = {}
+    weather: dict[int, object | None] = {}
+    for sched in schedule:
+        matched = _match_odds(sched, odds)
+        matched_odds[sched.game_id] = matched
+        # Build the per-game profiles ONCE (only for playable games -- skips
+        # don't need them); both evaluators read them.
+        if sched.is_playable:
+            profiles[sched.game_id] = _build_profiles(
+                sched, provider, season, as_of, config, bp_provider, lu_provider,
+            )
+        if totals_enabled:
+            weather[sched.game_id] = (
+                weather_env(sched.home_team, sched.game_date, config, sched.game_datetime)
+                if matched is not None else None
+            )
+
+    return SlateInputs(
+        game_date=game_date, season=season, as_of=as_of,
+        schedule=schedule, odds=odds, matched_odds=matched_odds,
+        profiles=profiles, weather=weather, team_provider=provider,
+        bullpen_status_provider=bp_provider, lineup_status_provider=lu_provider,
+        weather_fetched=totals_enabled,
+    )
+
+
+def evaluate_slate_inputs(inputs: SlateInputs, config: dict) -> list[GameAnalysis]:
+    """Evaluate a fetched slate under `config`: moneyline model + EV for every
+    game (and the totals model when config.totals.enabled), sorted by
+    best-side EV descending. PURE given `inputs` -- no network, no
+    load_config(); calling it twice (or with two configs) is safe."""
+    totals_enabled = bool(config.get("totals", {}).get("enabled", False))
+    if totals_enabled:
         from mlb_value_bot.pipeline_totals import evaluate_totals_game
 
     analyses: list[GameAnalysis] = []
-    for sched in schedule:
-        matched = _match_odds(sched, odds)
-        # Build the per-game profiles ONCE (only for playable games -- skips
-        # don't need them) and feed both evaluators.
-        profiles = None
-        if sched.is_playable:
-            profiles = _build_profiles(
-                sched, provider, season, as_of, config, bp_provider, lu_provider,
-            )
+    for sched in inputs.schedule:
+        matched = inputs.matched_odds.get(sched.game_id)
+        profiles = inputs.profiles.get(sched.game_id)
         analysis = evaluate_game(
-            sched, matched, provider, season, as_of, config,
-            bullpen_status_provider=bp_provider,
-            lineup_status_provider=lu_provider,
+            sched, matched, inputs.team_provider, inputs.season, inputs.as_of, config,
+            bullpen_status_provider=inputs.bullpen_status_provider,
+            lineup_status_provider=inputs.lineup_status_provider,
             profiles=profiles,
         )
         if totals_enabled:
-            # Only fetch weather (an Open-Meteo call) when there are odds to bet
-            # against -- evaluate_totals_game skips early without them anyway.
-            weather = weather_env(sched.home_team, sched.game_date, config) if matched is not None else None
+            weather = inputs.weather.get(sched.game_id) if matched is not None else None
             analysis.totals = evaluate_totals_game(sched, matched, profiles, weather, config)
         analyses.append(analysis)
 
@@ -1114,15 +1249,39 @@ def analyze_slate(
     return analyses
 
 
-def save_slate(analyses: list[GameAnalysis], threshold: float, game_date: str) -> tuple[int, int]:
+def analyze_slate(
+    game_date: str,
+    odds_client: OddsClient | None = None,
+    mlb_client: MLBClient | None = None,
+    config: dict | None = None,
+) -> list[GameAnalysis]:
+    """Analyze every game on `game_date`, sorted by best-side EV descending.
+
+    Composes `fetch_slate_inputs` (all network I/O) and `evaluate_slate_inputs`
+    (pure evaluation) -- the CLI, the web app and GriffBet call this."""
+    config = config or load_config()
+    inputs = fetch_slate_inputs(game_date, odds_client, mlb_client, config)
+    return evaluate_slate_inputs(inputs, config)
+
+
+def save_slate(
+    analyses: list[GameAnalysis],
+    threshold: float,
+    game_date: str,
+    model_tag: str = "biff_v1",
+) -> tuple[int, int]:
     """Persist the FULL evaluable slate (upsert). Returns (total, n_value).
 
     Every analysis with a `best_eval` and a `wp` (i.e. evaluable -- has odds +
     a runnable model) is persisted. Picks that clear `threshold` AND have a
-    positive Kelly stake are marked is_value=True (real bets); the rest are
-    persisted as is_value=False analyses so the site can render the whole
-    slate even on quiet days. Skipped games (no odds / postponed / no model)
-    are dropped, since they have nothing meaningful to display.
+    positive Kelly stake (and were not sanity-skipped) are marked is_value=True
+    (real bets); the rest are persisted as is_value=False analyses with a
+    `pass_reason` (RSI vocabulary, see GameAnalysis.pass_reason) so the site
+    can render the whole slate and the weekly review can mine the passes.
+    Post-price sanity skips (divergence / max EV / sharp fade) carry a
+    best_eval and ARE persisted as passes; no-price skips (no odds /
+    postponed / implausible odds) are dropped, since they have nothing
+    meaningful to display. Every row is stamped with `model_tag`.
 
     Upsert is keyed on (date, game_id): one row per game per date. Re-running
     refreshes prices/CLV on bets and overwrites analyses with the latest.
@@ -1138,7 +1297,8 @@ def save_slate(analyses: list[GameAnalysis], threshold: float, game_date: str) -
         be = a.best_eval
         if be is None or a.wp is None:
             continue
-        is_value = be.ev_pct >= threshold and be.kelly_stake > 0
+        a.model_tag = model_tag
+        is_value = a.is_value(threshold)
         rec = RecommendationRecord(
             date=game_date,
             game_id=a.game_id,
@@ -1154,6 +1314,8 @@ def save_slate(analyses: list[GameAnalysis], threshold: float, game_date: str) -
             confidence=a.confidence,
             reasoning=a.reasoning(),
             is_value=is_value,
+            model_tag=model_tag,
+            pass_reason=a.pass_reason(threshold),
         )
         upsert_recommendation(rec)
         total += 1
@@ -1223,24 +1385,23 @@ def flag_starter_scratches(analyses: list[GameAnalysis], game_date: str) -> int:
 
 
 def refresh_skipped_closing_lines(analyses: list[GameAnalysis], game_date: str) -> int:
-    """Refresh closing line + CLV on committed bets whose game was skipped.
+    """Refresh closing line + CLV on committed bets whose game was skipped
+    WITHOUT an evaluation (no best_eval).
 
-    Sanity skips (divergence, sharp fade, implausible EV) early-return before
-    save, so a committed bet on a skipped game stopped getting closing-line
-    refreshes -- its CLV froze at the last non-skipped run. Since CLV is the
-    project's primary edge metric, and a scratch/news event (the usual skip
-    trigger) is precisely when the close moves most, those are the LAST bets
-    whose CLV we can afford to lose. Only analyses whose prices cleared the
-    implausible-odds guard carry home_odds/away_odds, so a garbage line can
-    never become a closing price. Saved (evaluable) games are untouched --
-    their upsert already refreshes the close. Returns bets refreshed.
+    Since RSI phase 2 the post-price sanity skips (divergence, sharp fade,
+    implausible EV) keep their evals and are upserted by save_slate as
+    passes, so their committed bets get the close through the upsert like any
+    other saved game. Only the no-price skips remain here: they carry no
+    evaluation, and only those whose prices cleared the implausible-odds guard
+    have home_odds/away_odds (so a garbage line can never become a closing
+    price). Returns bets refreshed.
     """
     from mlb_value_bot.tracking.recommendations import refresh_closing_line
 
     n = 0
     for a in analyses:
         if a.best_eval is not None:
-            continue  # saved normally; upsert handled the close
+            continue  # persisted by save_slate (bet or pass); upsert handled the close
         if a.home_odds is None or a.away_odds is None:
             continue  # no trustworthy prices this run
         if refresh_closing_line(game_date, a.game_id, {"home": a.home_odds, "away": a.away_odds}):
@@ -1280,6 +1441,7 @@ def save_value_bets(value_bets: list[GameAnalysis], game_date: str) -> int:
             confidence=a.confidence,
             reasoning=a.reasoning(),
             is_value=True,
+            model_tag=a.model_tag,
         )
         upsert_recommendation(rec)
         count += 1

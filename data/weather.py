@@ -77,14 +77,25 @@ class WeatherEnv:
     wind_out_component: float | None  # + = blowing out to CF, - = in
     roof: str                  # "open" | "retractable_assumed_open" | "fixed_closed"
     note: str
+    # Precipitation at the (local) first-pitch hour, RSI phase 2 (2026-09-26):
+    # Open-Meteo hourly `precipitation` (mm) and `precipitation_probability`
+    # (%). Logged into reasoning["weather"] only -- NOT a model input yet.
+    # None when the hourly block is unavailable.
+    precip_mm: float | None = None
+    precip_prob: float | None = None
 
 
 class _OpenMeteoTransient(Exception):
     """Server-side flake (5xx / 429) worth retrying."""
 
 
+_HOURLY_VARS = "precipitation,precipitation_probability"
+
+
 def _get_open_meteo(lat: float, lon: float, timeout: float):
     """One GET, wrapped in the same tenacity pattern as the other API clients.
+    Requests the current block (the run-environment inputs) plus the hourly
+    precipitation block in the park's local time (see `_precip_at`).
 
     2026-07-19: six of sixteen parks failed the single un-retried fetch in one
     run, holding an otherwise-qualified totals pick to analysis-only. Retrying
@@ -110,7 +121,8 @@ def _get_open_meteo(lat: float, lon: float, timeout: float):
         resp = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={"latitude": lat, "longitude": lon,
-                    "current": "temperature_2m,wind_speed_10m,wind_direction_10m"},
+                    "current": "temperature_2m,wind_speed_10m,wind_direction_10m",
+                    "hourly": _HOURLY_VARS, "timezone": "auto"},
             timeout=timeout,
         )
         if resp.status_code == 429 or resp.status_code >= 500:
@@ -120,17 +132,68 @@ def _get_open_meteo(lat: float, lon: float, timeout: float):
     return _get()
 
 
-def _fetch_open_meteo(lat: float, lon: float, timeout: float) -> dict | None:
+def _local_hour(game_datetime: str | None, utc_offset_seconds: float | None,
+                default: int = 19) -> int:
+    """Local first-pitch hour from an ISO UTC datetime + the park's UTC offset
+    (Open-Meteo `utc_offset_seconds` with timezone=auto); `default` (7pm)
+    when either is missing."""
+    if not game_datetime or utc_offset_seconds is None:
+        return default
+    try:
+        from datetime import datetime, timedelta, timezone
+        dt = datetime.fromisoformat(str(game_datetime).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt.astimezone(timezone.utc) + timedelta(seconds=float(utc_offset_seconds))).hour
+    except (ValueError, TypeError):
+        return default
+
+
+def _precip_at(body: dict, game_date: str | None, game_datetime: str | None) -> tuple[float | None, float | None]:
+    """(precip_mm, precip_prob) from the hourly block at the local first-pitch
+    hour of `game_date`; (None, None) when the block / hour is unavailable."""
+    hourly = (body or {}).get("hourly") or {}
+    times = hourly.get("time") or []
+    if not times or not game_date:
+        return None, None
+    hour = _local_hour(game_datetime, body.get("utc_offset_seconds"))
+    stamp = f"{game_date}T{hour:02d}:00"
+    try:
+        idx = times.index(stamp)
+    except ValueError:
+        return None, None
+
+    def _pick(name: str) -> float | None:
+        vals = hourly.get(name) or []
+        if idx >= len(vals) or vals[idx] is None:
+            return None
+        try:
+            return round(float(vals[idx]), 2)
+        except (TypeError, ValueError):
+            return None
+
+    return _pick("precipitation"), _pick("precipitation_probability")
+
+
+def _fetch_open_meteo(lat: float, lon: float, timeout: float,
+                      game_date: str | None = None,
+                      game_datetime: str | None = None) -> dict | None:
+    """The `current` block (+ `precip_mm` / `precip_prob` folded in from the
+    hourly block at first pitch), or None on a hard failure."""
     try:
         resp = _get_open_meteo(lat, lon, timeout)
         if resp.status_code < 300:
-            cur = resp.json().get("current", {})
+            body = resp.json() or {}
+            cur = body.get("current", {})
             if not cur or cur.get("temperature_2m") is None:
                 # 200 with an empty/partial body: the one failure mode that was
                 # fully silent (no HTTP error, no exception). Log the body so
                 # CI-only failures are diagnosable from the pipeline logs.
                 log.warning("open-meteo HTTP %s but no current weather (body: %.200s)",
                             resp.status_code, resp.text)
+            if cur:
+                cur = dict(cur)
+                cur["precip_mm"], cur["precip_prob"] = _precip_at(body, game_date, game_datetime)
             return cur
         log.warning("open-meteo fetch failed (HTTP %s)", resp.status_code)
     except Exception as exc:  # noqa: BLE001
@@ -151,8 +214,11 @@ def _wind_out_component(wind_kmh: float, wind_from_deg: float, out_bearing: floa
     return wind_kmh * align
 
 
-def weather_env(home_team: str, game_date: str, config: dict) -> WeatherEnv:
-    """Run-environment multiplier for a game's ballpark. Degrade-safe."""
+def weather_env(home_team: str, game_date: str, config: dict,
+                game_datetime: str | None = None) -> WeatherEnv:
+    """Run-environment multiplier for a game's ballpark. Degrade-safe.
+    `game_datetime` (ISO UTC first pitch) only locates the hourly
+    precipitation reading; the multiplier still comes from current conditions."""
     cfg = config.get("totals", {}).get("weather", {})
     if not cfg.get("enabled", True):
         return WeatherEnv(1.0, False, None, None, None, "open", "weather disabled")
@@ -171,7 +237,8 @@ def weather_env(home_team: str, game_date: str, config: dict) -> WeatherEnv:
         d = _WEATHER_CACHE[key]
         return WeatherEnv(**d)
 
-    cur = _fetch_open_meteo(*coords, float(cfg.get("timeout", 8)))
+    cur = _fetch_open_meteo(*coords, float(cfg.get("timeout", 8)),
+                            game_date=game_date, game_datetime=game_datetime)
     if not cur or cur.get("temperature_2m") is None:
         env = WeatherEnv(1.0, False, None, None, None, "open", "weather feed unavailable")
         _WEATHER_CACHE[key] = env.__dict__
@@ -198,6 +265,7 @@ def weather_env(home_team: str, game_date: str, config: dict) -> WeatherEnv:
             f"{'out' if out_comp >= 0 else 'in'} {abs(out_comp):.0f}"
             + ("; retractable roof assumed OPEN" if roof == "retractable_assumed_open" else ""))
     env = WeatherEnv(round(mult, 4), True, round(temp_c, 1), round(wind_kmh, 1),
-                     round(out_comp, 1), roof, note)
+                     round(out_comp, 1), roof, note,
+                     precip_mm=cur.get("precip_mm"), precip_prob=cur.get("precip_prob"))
     _WEATHER_CACHE[key] = env.__dict__
     return env

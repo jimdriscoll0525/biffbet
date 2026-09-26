@@ -69,11 +69,27 @@ CREATE TABLE IF NOT EXISTS totals_recommendations (
     result                   TEXT DEFAULT 'pending', -- pending|win|loss|push|void
     profit_loss              REAL,                   -- paper, bankroll-fraction units
     is_value                 INTEGER NOT NULL DEFAULT 1,
+    model_tag                TEXT NOT NULL DEFAULT 'totals_v1',  -- RSI: model version that priced it
+    pass_reason              TEXT,                   -- RSI: why an is_value=0 row was NOT bet
+                                                     -- (below_threshold | weather_held | roof_unverified
+                                                     --  | skip:divergence | skip:max_ev | skip:sharp_fade)
     created_at               TEXT NOT NULL,
     updated_at               TEXT NOT NULL,
     UNIQUE(date, game_id)
 );
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent ADD COLUMN migrations (same pattern as recommendations.py)."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(totals_recommendations)")}
+    # 2026-09-26 (RSI phase 2): model version stamp + pass reason on analyses.
+    if "model_tag" not in cols:
+        conn.execute("ALTER TABLE totals_recommendations ADD COLUMN model_tag TEXT NOT NULL DEFAULT 'totals_v1'")
+        log.info("Migrated totals_recommendations: added model_tag column (existing rows -> totals_v1).")
+    if "pass_reason" not in cols:
+        conn.execute("ALTER TABLE totals_recommendations ADD COLUMN pass_reason TEXT")
+        log.info("Migrated totals_recommendations: added pass_reason column.")
 
 
 @dataclass
@@ -107,6 +123,8 @@ class TotalsRecommendationRecord:
     best_close_price: int | None = None
     reasoning: dict = field(default_factory=dict)
     is_value: bool = True
+    model_tag: str = "totals_v1"
+    pass_reason: str | None = None       # None on bets
     id: int | None = None
 
 
@@ -124,6 +142,7 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
     log.debug("Totals DB initialized at %s", DB_PATH)
 
 
@@ -161,14 +180,19 @@ def upsert_totals_recommendation(rec: TotalsRecommendationRecord) -> int:
       * committed paper bet (is_value=1): NEVER downgrade -- keep the opening
         line/price/de-vig, only refresh the close (best line + sharp close) + CLV.
       * analysis -> bet promotion: this run's price becomes the opening reference.
-      * analysis -> analysis: refresh all model fields with the latest run.
+      * analysis -> analysis: refresh all model fields with the latest run, but
+        the opening line/price/de-vig stay FROZEN at first capture (so passes
+        accumulate a genuine CLV reading too, RSI phase 2) UNLESS the pick
+        side flipped, in which case the opening is re-frozen on the new side.
+        clv_pp is computed for analysis rows as well. model_tag + pass_reason
+        are written on every non-committed write.
     """
     init_db()
     now = _now()
     sc = _sharp_close_fields(rec.pick_side, rec.sharp_close)
     with connect() as conn:
         existing = conn.execute(
-            "SELECT id, opening_line, opening_price, opening_devig_p_side, is_value "
+            "SELECT id, opening_line, opening_price, opening_devig_p_side, is_value, pick_side "
             "FROM totals_recommendations WHERE date=? AND game_id=?",
             (rec.date, rec.game_id),
         ).fetchone()
@@ -194,13 +218,16 @@ def upsert_totals_recommendation(rec: TotalsRecommendationRecord) -> int:
                 return int(existing["id"])
 
             # Was analysis: refresh everything. If now a bet, this run sets the
-            # opening reference.
-            open_line = rec.market_total if now_bet else (existing["opening_line"] if existing["opening_line"] is not None else rec.market_total)
-            open_price = rec.bet_odds if now_bet else (existing["opening_price"] if existing["opening_price"] is not None else rec.bet_odds)
-            open_devig = rec.opening_devig_p_side if now_bet else (
+            # opening reference; a side flip re-freezes it on the new side;
+            # otherwise the first-capture opening stays frozen.
+            side_flipped = existing["pick_side"] != rec.pick_side
+            refreeze = now_bet or side_flipped
+            open_line = rec.market_total if refreeze else (existing["opening_line"] if existing["opening_line"] is not None else rec.market_total)
+            open_price = rec.bet_odds if refreeze else (existing["opening_price"] if existing["opening_price"] is not None else rec.bet_odds)
+            open_devig = rec.opening_devig_p_side if refreeze else (
                 existing["opening_devig_p_side"] if existing["opening_devig_p_side"] is not None else rec.opening_devig_p_side
             )
-            clv = _clv_pp(open_devig, sc["devig_side"]) if now_bet else None
+            clv = _clv_pp(open_devig, sc["devig_side"])
             conn.execute(
                 """
                 UPDATE totals_recommendations SET
@@ -210,7 +237,7 @@ def upsert_totals_recommendation(rec: TotalsRecommendationRecord) -> int:
                     tier=?, stability=?, raw_model_total=?, expected_total=?, paper=?, reasoning_json=?,
                     opening_line=?, opening_price=?, opening_devig_p_side=?, closing_line=?, closing_price=?,
                     sharp_close_book=?, sharp_close_line=?, sharp_close_over=?, sharp_close_under=?,
-                    sharp_close_devig_p_side=?, clv_pp=?, is_value=?, updated_at=?
+                    sharp_close_devig_p_side=?, clv_pp=?, is_value=?, model_tag=?, pass_reason=?, updated_at=?
                 WHERE id=?
                 """,
                 (rec.home_team, rec.away_team, rec.pick_side, rec.market_total, rec.over_odds, rec.under_odds,
@@ -219,8 +246,11 @@ def upsert_totals_recommendation(rec: TotalsRecommendationRecord) -> int:
                  rec.tier, rec.stability, rec.raw_model_total, rec.expected_total, 1 if rec.paper else 0,
                  json.dumps(rec.reasoning), open_line, open_price, open_devig, rec.best_close_line, rec.best_close_price,
                  sc["book"], sc["line"], sc["over"], sc["under"], sc["devig_side"], clv,
-                 1 if now_bet else 0, now, existing["id"]),
+                 1 if now_bet else 0, rec.model_tag, None if now_bet else rec.pass_reason, now, existing["id"]),
             )
+            if side_flipped and not now_bet:
+                log.info("Totals analysis side flipped on game %s (%s -> %s); opening re-frozen",
+                         rec.game_id, existing["pick_side"], rec.pick_side)
             if now_bet:
                 log.info("Promoted totals game %s (%s) to a paper bet @ line %s (EV %.1f%%)",
                          rec.game_id, rec.pick_side, rec.market_total, rec.ev_pct * 100)
@@ -230,7 +260,7 @@ def upsert_totals_recommendation(rec: TotalsRecommendationRecord) -> int:
         open_line = rec.market_total
         open_price = rec.bet_odds
         open_devig = rec.opening_devig_p_side
-        clv = _clv_pp(open_devig, sc["devig_side"]) if rec.is_value else None
+        clv = _clv_pp(open_devig, sc["devig_side"])
         cur = conn.execute(
             """
             INSERT INTO totals_recommendations (
@@ -240,8 +270,8 @@ def upsert_totals_recommendation(rec: TotalsRecommendationRecord) -> int:
                 expected_total, paper, reasoning_json, opening_line, opening_price, opening_devig_p_side,
                 closing_line, closing_price, sharp_close_book, sharp_close_line, sharp_close_over,
                 sharp_close_under, sharp_close_devig_p_side, clv_pp, result, profit_loss, is_value,
-                created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                model_tag, pass_reason, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (rec.date, rec.game_id, rec.home_team, rec.away_team, rec.pick_side, rec.market_total,
              rec.over_odds, rec.under_odds, rec.bet_odds, rec.decimal_odds, rec.model_p_over,
@@ -249,7 +279,8 @@ def upsert_totals_recommendation(rec: TotalsRecommendationRecord) -> int:
              rec.ev_pct, rec.kelly_stake, rec.confidence, rec.tier, rec.stability, rec.raw_model_total,
              rec.expected_total, 1 if rec.paper else 0, json.dumps(rec.reasoning), open_line, open_price,
              open_devig, rec.best_close_line, rec.best_close_price, sc["book"], sc["line"], sc["over"],
-             sc["under"], sc["devig_side"], clv, "pending", None, 1 if rec.is_value else 0, now, now),
+             sc["under"], sc["devig_side"], clv, "pending", None, 1 if rec.is_value else 0,
+             rec.model_tag, None if rec.is_value else rec.pass_reason, now, now),
         )
         log.info("Saved totals %s: %s %.1f @ %+d (EV %.1f%%)%s",
                  "bet" if rec.is_value else "analysis", rec.pick_side, rec.market_total or 0.0,
@@ -301,20 +332,24 @@ def refresh_totals_close(game_date: str, game_id: int, analysis) -> bool:
         return True
 
 
-def get_open_for_date(game_date: str) -> list[sqlite3.Row]:
-    """Pending totals BETS (is_value=1) for a date -- the grading worklist."""
+def get_open_for_date(game_date: str, include_analyses: bool = False) -> list[sqlite3.Row]:
+    """Pending totals BETS (is_value=1) for a date -- the grading worklist.
+    `include_analyses` adds the pending is_value=0 rows (counterfactual
+    grading, config grading.grade_analyses)."""
     init_db()
+    query = "SELECT * FROM totals_recommendations WHERE date=? AND result='pending'"
+    if not include_analyses:
+        query += " AND is_value=1"
     with connect() as conn:
-        return conn.execute(
-            "SELECT * FROM totals_recommendations WHERE date=? AND result='pending' AND is_value=1",
-            (game_date,),
-        ).fetchall()
+        return conn.execute(query, (game_date,)).fetchall()
 
 
-def get_open_dates(before: str | None = None) -> list[str]:
+def get_open_dates(before: str | None = None, include_analyses: bool = False) -> list[str]:
     """Distinct dates with pending totals bets, ascending (grading backfill)."""
     init_db()
-    query = "SELECT DISTINCT date FROM totals_recommendations WHERE result='pending' AND is_value=1"
+    query = "SELECT DISTINCT date FROM totals_recommendations WHERE result='pending'"
+    if not include_analyses:
+        query += " AND is_value=1"
     params: tuple = ()
     if before:
         query += " AND date < ?"

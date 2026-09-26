@@ -33,6 +33,11 @@ class FootballWeather:
     temp_f: float | None
     wind_mph: float | None
     note: str
+    # Precipitation at the kickoff hour, RSI phase 2 (2026-09-26): Open-Meteo
+    # hourly `precipitation_probability` (%) and `precipitation` (mm). Logged
+    # into reasoning["weather"] only -- not a model input. None when missing.
+    precip_prob: float | None = None
+    precip_mm: float | None = None
 
 
 def _fetch_hourly(lat: float, lon: float, date_iso: str, timeout: float) -> dict | None:
@@ -42,7 +47,7 @@ def _fetch_hourly(lat: float, lon: float, date_iso: str, timeout: float) -> dict
             "https://api.open-meteo.com/v1/forecast",
             params={
                 "latitude": lat, "longitude": lon,
-                "hourly": "temperature_2m,wind_speed_10m",
+                "hourly": "temperature_2m,wind_speed_10m,precipitation,precipitation_probability",
                 "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
                 "start_date": date_iso, "end_date": date_iso, "timezone": "UTC",
             },
@@ -110,6 +115,20 @@ def game_weather(lat: float | None, lon: float | None, kickoff_utc: str | None,
     note = f"{temp_f:.0f}F, wind {wind_mph:.0f}mph at kickoff"
     if mult < 1.0:
         note += f" -> total x{mult:.3f}"
-    env = FootballWeather(round(mult, 4), True, False, round(temp_f, 1), round(wind_mph, 1), note)
+    precip_prob = _hourly_at(hourly, "precipitation_probability", hour)
+    precip_mm = _hourly_at(hourly, "precipitation", hour)
+    env = FootballWeather(round(mult, 4), True, False, round(temp_f, 1), round(wind_mph, 1), note,
+                          precip_prob=precip_prob, precip_mm=precip_mm)
     _WEATHER_CACHE[key] = env.__dict__
     return env
+
+
+def _hourly_at(hourly: dict | None, name: str, hour: int) -> float | None:
+    """One hourly variable at `hour`, or None when the block lacks it."""
+    vals = (hourly or {}).get(name) or []
+    if len(vals) <= hour or vals[hour] is None:
+        return None
+    try:
+        return round(float(vals[hour]), 2)
+    except (TypeError, ValueError):
+        return None

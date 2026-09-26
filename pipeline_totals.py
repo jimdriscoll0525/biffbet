@@ -83,14 +83,38 @@ class TotalsAnalysis:
     # Paper-trade gate + weather hold.
     paper: bool = True
     weather_held: bool = False           # held to analysis-only by the weather rule
+    roof_unverified: bool = False        # held: roof state assumed, not verified
+                                         # (config totals.weather.require_verified_roof)
     flags: list = field(default_factory=list)
     _orig_kelly: float | None = None
+    # RSI (2026-09-26): model version stamp, persisted as model_tag.
+    model_tag: str = "totals_v1"
 
     @property
     def best_eval(self):
         if not self.evals or not self.pick_side:
             return None
         return self.evals[self.pick_side]
+
+    def pass_reason(self, threshold: float) -> str | None:
+        """Why this total was NOT bet (RSI vocabulary), None for a value pick or
+        when nothing is persisted (no pick / no distribution). Vocabulary:
+        below_threshold | weather_held | roof_unverified | skip:divergence |
+        skip:max_ev | skip:sharp_fade, several joined with '+'."""
+        be = self.best_eval
+        if be is None or self.rd is None or self.is_value(threshold):
+            return None
+        parts: list[str] = []
+        kind = _skip_kind(self.skipped_reason)
+        if kind:
+            parts.append(kind)
+        if self.weather_held:
+            parts.append("weather_held")
+        if self.roof_unverified:
+            parts.append("roof_unverified")
+        if be.ev_pct < threshold or not parts:
+            parts.append("below_threshold")
+        return "+".join(dict.fromkeys(parts))
 
     def opening_devig_for(self, side: str) -> float | None:
         """De-vigged market P(side) at the bet book (the CLV ENTRY reference)."""
@@ -109,14 +133,16 @@ class TotalsAnalysis:
         skipped, and not held back by the weather rule. (Still PAPER while
         config.totals.paper_only is true -- value just means 'we'd bet it'.)"""
         be = self.best_eval
-        if be is None or self.skipped_reason or self.weather_held:
+        if be is None or self.skipped_reason or self.weather_held or self.roof_unverified:
             return False
         return be.ev_pct >= threshold and be.kelly_stake > 0
 
     def reasoning(self) -> dict:
         """Full JSON-able breakdown for the DB / site (mirrors the moneyline)."""
         rd = self.rd
-        data: dict = {"market_type": "totals", "paper": self.paper}
+        data: dict = {"market_type": "totals", "paper": self.paper, "model_tag": self.model_tag}
+        if self.skipped_reason:
+            data["skipped_reason"] = self.skipped_reason
         if rd is not None:
             data["run_distribution"] = {
                 "raw_model_total": rd.raw_model_total,
@@ -140,6 +166,9 @@ class TotalsAnalysis:
                 "available": w.available, "multiplier": w.multiplier, "roof": w.roof,
                 "temp_c": w.temp_c, "wind_kmh": w.wind_kmh,
                 "wind_out_component": w.wind_out_component, "note": w.note,
+                # Precipitation at first pitch (logged only, not a model input).
+                "precip_mm": getattr(w, "precip_mm", None),
+                "precip_prob": getattr(w, "precip_prob", None),
             }
         if self.intel is not None:
             mi = self.intel
@@ -192,9 +221,33 @@ class TotalsAnalysis:
         return data
 
 
+# RSI pass vocabulary: prose skip reason -> canonical `skip:<kind>` label.
+_SKIP_KINDS: tuple[tuple[str, str], ...] = (
+    ("diverge", "skip:divergence"),
+    ("implausible EV", "skip:max_ev"),
+    ("fading sharp", "skip:sharp_fade"),
+)
+
+
+def _skip_kind(reason: str | None) -> str | None:
+    if not reason:
+        return None
+    for needle, kind in _SKIP_KINDS:
+        if needle in reason:
+            return kind
+    return "skip:other"
+
+
 def evaluate_totals_game(scheduled, game_odds, profiles, weather, config=None) -> TotalsAnalysis:
     """Run the totals model + EV evaluation for one game. Always returns a
-    TotalsAnalysis (skip reasons live on `.skipped_reason`); never raises."""
+    TotalsAnalysis (skip reasons live on `.skipped_reason`); never raises.
+
+    The three post-market sanity guards (divergence / max EV / sharp fade) do
+    NOT early-return (RSI phase 2): the pick is still evaluated in full and
+    persisted as an is_value=0 pass with pass_reason skip:<kind>; the skip
+    forces tier pass + stake 0 and is_value() is False. First to fire wins.
+    Pre-market skips (no odds / no market / implausible total / no
+    distribution) still return early with nothing to persist."""
     config = config or load_config()
     tcfg = config.get("totals", {})
     analysis = TotalsAnalysis(
@@ -286,7 +339,6 @@ def evaluate_totals_game(scheduled, game_odds, profiles, weather, config=None) -
             f"raw projected total {rd.raw_model_total:.2f} vs market-implied mean {anchor_ref:.2f} "
             f"diverge by {divergence:.2f} > {max_div:.2f} runs - likely missing weather / a scratch"
         )
-        return analysis
 
     # EV + quarter-Kelly on the blended P(over) at the actual over/under prices.
     evals = evaluate_ou_sides(
@@ -302,9 +354,8 @@ def evaluate_totals_game(scheduled, game_odds, profiles, weather, config=None) -
 
     # Sanity: implausibly large EV is a data error, not real edge.
     max_ev = float(sanity.get("max_ev", 0.30))
-    if best.ev_pct > max_ev:
+    if best.ev_pct > max_ev and analysis.skipped_reason is None:
         analysis.skipped_reason = f"implausible EV ({best.ev_pct * 100:.0f}%) - likely bad totals data"
-        return analysis
 
     # Sharp-fade on the picked side (+ve = we're more bullish on our side than
     # the sharp totals consensus).
@@ -313,12 +364,11 @@ def evaluate_totals_game(scheduled, game_odds, profiles, weather, config=None) -
         over_gap = blended_over - intel.sharp_devig_over
         sharp_fade_pp = over_gap if pick_side == "over" else -over_gap
         max_fade = float(sanity.get("max_sharp_disagreement_pp", 4.0))
-        if sharp_fade_pp * 100.0 > max_fade:
+        if sharp_fade_pp * 100.0 > max_fade and analysis.skipped_reason is None:
             analysis.skipped_reason = (
                 f"fading sharp total by {sharp_fade_pp * 100:.1f}pp on {pick_side} "
                 f"(our {blended_over if pick_side == 'over' else 1 - blended_over:.3f} vs sharps) > {max_fade:.1f}pp"
             )
-            return analysis
 
     # Stability + confidence + tier sizing.
     stability = classify_totals_stability(
@@ -346,15 +396,36 @@ def evaluate_totals_game(scheduled, game_odds, profiles, weather, config=None) -
         analysis.weather_held = True
         analysis.flags.append("weather unavailable -> analysis only (not bet)")
 
+    # Roof rule (RSI phase 2, config totals.weather.require_verified_roof):
+    # a retractable roof is ASSUMED open by data/weather.py (free data can't
+    # see a closed roof). When the operator wants only verified roof states
+    # bet, an assumed state holds the pick to analysis-only, like weather_held.
+    if bool(tcfg.get("weather", {}).get("require_verified_roof", False)):
+        roof = getattr(weather, "roof", None) if weather is not None else None
+        if roof is not None and "assumed" in str(roof):
+            analysis.roof_unverified = True
+            analysis.flags.append(f"roof state assumed ({roof}) -> analysis only (not bet)")
+
+    # Post-market sanity skip: fully evaluated for the pass record, never bet.
+    if analysis.skipped_reason:
+        analysis.tier = "pass"
+        analysis.tier_reasons = list(analysis.tier_reasons) + [f"skipped: {analysis.skipped_reason}"]
+        best.kelly_stake = 0.0
+
     return analysis
 
 
-def save_totals_slate(analyses, threshold: float, game_date: str) -> tuple[int, int]:
+def save_totals_slate(analyses, threshold: float, game_date: str,
+                      model_tag: str = "totals_v1") -> tuple[int, int]:
     """Persist the evaluable totals slate (upsert). Returns (total, n_value).
 
-    Every analysis with a pick + run distribution is persisted; ones that clear
-    `threshold` with positive Kelly (and aren't weather-held) are flagged
-    is_value=True (simulated bets). Skipped games are dropped.
+    Every analysis with a pick + run distribution is persisted -- including
+    the post-market sanity skips (divergence / max EV / sharp fade), which
+    land as is_value=0 passes with pass_reason skip:<kind>. Ones that clear
+    `threshold` with positive Kelly (and aren't weather-/roof-held or
+    skipped) are flagged is_value=True (simulated bets). Pre-market skips
+    (no market / implausible total / no distribution) are dropped. Every row
+    is stamped with `model_tag`.
     """
     from mlb_value_bot.tracking.totals_recommendations import (
         TotalsRecommendationRecord,
@@ -365,8 +436,9 @@ def save_totals_slate(analyses, threshold: float, game_date: str) -> tuple[int, 
     n_value = 0
     for a in analyses:
         be = a.best_eval
-        if be is None or a.rd is None or a.skipped_reason:
+        if be is None or a.rd is None or a.intel is None:
             continue
+        a.model_tag = model_tag
         is_value = a.is_value(threshold)
         rec = TotalsRecommendationRecord(
             date=game_date,
@@ -398,6 +470,8 @@ def save_totals_slate(analyses, threshold: float, game_date: str) -> tuple[int, 
             best_close_price=(a.intel.best_over_price if a.pick_side == "over" else a.intel.best_under_price),
             reasoning=a.reasoning(),
             is_value=is_value,
+            model_tag=model_tag,
+            pass_reason=a.pass_reason(threshold),
         )
         upsert_totals_recommendation(rec)
         total += 1
@@ -408,14 +482,16 @@ def save_totals_slate(analyses, threshold: float, game_date: str) -> tuple[int, 
 
 def refresh_skipped_totals_closing(analyses, game_date: str) -> int:
     """Refresh the sharp close + CLV on committed paper bets whose totals game was
-    sanity-skipped this run (so a divergence/scratch -- exactly when the close
-    moves most -- doesn't freeze CLV). Mirrors the moneyline version."""
+    skipped this run WITHOUT a persistable evaluation (no market / implausible
+    total / no distribution) so the close doesn't freeze. Post-market sanity
+    skips are persisted by save_totals_slate since RSI phase 2, so their close
+    arrives through the upsert. Mirrors the moneyline version."""
     from mlb_value_bot.tracking.totals_recommendations import refresh_totals_close
 
     n = 0
     for a in analyses:
-        if a.best_eval is not None and not a.skipped_reason:
-            continue  # saved normally; upsert handled the close
+        if a.best_eval is not None and a.rd is not None and a.intel is not None:
+            continue  # persisted by save_totals_slate; upsert handled the close
         if a.sharp_close is None and a.intel is None:
             continue  # nothing to refresh from
         if refresh_totals_close(game_date, a.game_id, a):

@@ -97,7 +97,12 @@ def pbp_drives(season: int, config: dict, force_refresh: bool = False) -> pd.Dat
 
 
 def schedules(season: int, config: dict, force_refresh: bool = False) -> pd.DataFrame:
-    """Season schedule: kickoff, roof, surface, and final scores when played."""
+    """Season schedule: kickoff, roof, surface, and final scores when played.
+
+    Loaded UNTRIMMED on purpose: besides gameday/roof/scores the pipeline's
+    reasoning["context"] block (RSI phase 2) reads `div_game`, `home_rest`,
+    `away_rest` and `location` (Home/Neutral) straight off this frame, so
+    any future column selection here must keep those."""
     return cached_dataframe(
         f"nfl_schedules_{season}",
         lambda: _load("load_schedules", season),

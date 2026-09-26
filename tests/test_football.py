@@ -1562,3 +1562,141 @@ class TestSlateSkipsStartedGames:
         assert _slate_skip_reason("2026-09-19T23:30:00Z", now, None) is None      # no horizon
         assert _slate_skip_reason("", now, horizon) is None                         # legacy
         assert _slate_skip_reason("not-a-time", now, horizon) is None
+
+
+# =============================================================================
+# RSI phase 2 (2026-09-26) - schedule context block + precip logging
+# =============================================================================
+
+class TestScheduleContext:
+    def test_rest_days_from_games_frame(self):
+        from mlb_value_bot.football.pipeline_football import _rest_days
+
+        games = pd.DataFrame([
+            {"home_team": "KC", "away_team": "BUF", "start_date": "2026-09-06T00:20:00Z"},
+            {"home_team": "LA", "away_team": "KC", "start_date": "2026-09-13T20:25:00Z"},
+            {"home_team": "KC", "away_team": "DET", "start_date": "2026-09-24T00:15:00Z"},
+        ])
+        assert _rest_days(games, "KC", "2026-09-13T20:25:00Z") == 7
+        assert _rest_days(games, "KC", "2026-09-24T00:15:00Z") == 11
+        assert _rest_days(games, "KC", "2026-09-06T00:20:00Z") is None     # season opener
+        assert _rest_days(games, "BUF", "2026-09-13T17:00:00Z") == 7
+        assert _rest_days(games, "NYJ", "2026-09-13T17:00:00Z") is None    # not in frame
+        assert _rest_days(pd.DataFrame(), "KC", "2026-09-13T17:00:00Z") is None
+        assert _rest_days(games, "KC", None) is None
+        assert _rest_days(games, "KC", "garbage") is None
+        # nflverse-style date-only column (gameday renamed to date).
+        nfl = pd.DataFrame([{"home_team": "KC", "away_team": "BUF", "date": "2026-09-06"},
+                            {"home_team": "KC", "away_team": "LA", "date": "2026-09-13"}])
+        assert _rest_days(nfl, "KC", "2026-09-13T20:25:00Z") == 7
+
+    def test_game_context_nfl_row(self):
+        from mlb_value_bot.football.data.teams import NFL_ABBR_TO_NAME
+        from mlb_value_bot.football.pipeline_football import _NFL_CONFERENCE, _game_context
+
+        assert len(_NFL_CONFERENCE) == 32 and set(_NFL_CONFERENCE) == set(NFL_ABBR_TO_NAME)
+        assert sum(1 for c in _NFL_CONFERENCE.values() if c == "AFC") == 16
+
+        row = pd.Series({"home_team": "KC", "away_team": "LAC", "div_game": 1,
+                         "home_rest": 7, "away_rest": 10, "location": "Home"})
+        ctx = _game_context("nfl", pd.DataFrame(), row, "KC", "LAC", "2026-09-13T20:25:00Z")
+        assert ctx == {"conference_game": True, "home_conference": "AFC", "away_conference": "AFC",
+                       "division_game": True, "home_rest_days": 7, "away_rest_days": 10,
+                       "neutral_site": False}
+        # No schedule row: conference still known from the map, the rest None.
+        cross = _game_context("nfl", None, None, "KC", "SF", None)
+        assert cross["conference_game"] is False and cross["away_conference"] == "NFC"
+        assert cross["division_game"] is None and cross["home_rest_days"] is None
+        assert cross["neutral_site"] is None
+        # Neutral-site row where nflverse lists the other team as home: rest swapped.
+        neutral = pd.Series({"home_team": "LAC", "away_team": "KC", "div_game": 0,
+                             "home_rest": 6, "away_rest": 13, "location": "Neutral"})
+        ctx2 = _game_context("nfl", pd.DataFrame(), neutral, "KC", "LAC", "2026-09-13T20:25:00Z")
+        assert ctx2["neutral_site"] is True and ctx2["division_game"] is False
+        assert ctx2["home_rest_days"] == 13 and ctx2["away_rest_days"] == 6
+
+    def test_game_context_cfb_row_swapped_and_rest_from_frame(self):
+        from mlb_value_bot.football.pipeline_football import _game_context
+
+        games = pd.DataFrame([
+            {"home_team": "LSU", "away_team": "Clemson", "start_date": "2026-09-05T23:30:00Z",
+             "home_conference": "SEC", "away_conference": "ACC", "conference_game": False,
+             "neutral_site": True},
+            {"home_team": "Clemson", "away_team": "Georgia Tech", "start_date": "2026-09-12T19:30:00Z",
+             "home_conference": "ACC", "away_conference": "ACC", "conference_game": True,
+             "neutral_site": False},
+        ])
+        # The Odds API says Clemson is home; CFBD lists LSU -> conferences swapped back.
+        ctx = _game_context("cfb", games, games.iloc[0], "Clemson", "LSU", "2026-09-05T23:30:00Z")
+        assert ctx["home_conference"] == "ACC" and ctx["away_conference"] == "SEC"
+        assert ctx["conference_game"] is False and ctx["neutral_site"] is True
+        assert ctx["division_game"] is None
+        assert ctx["home_rest_days"] is None and ctx["away_rest_days"] is None   # openers
+        ctx2 = _game_context("cfb", games, games.iloc[1], "Clemson", "Georgia Tech",
+                             "2026-09-12T19:30:00Z")
+        assert ctx2["conference_game"] is True and ctx2["home_rest_days"] == 7
+        assert ctx2["away_rest_days"] is None
+        # CFB with no row at all -> every key present, every value None.
+        empty = _game_context("cfb", games, None, "Clemson", "LSU", None)
+        assert set(empty) == set(ctx) and all(v is None for v in empty.values())
+
+    def test_evaluate_market_carries_context_and_precip(self):
+        from mlb_value_bot.football.data.football_weather import FootballWeather
+        from mlb_value_bot.football.pipeline_football import _CONTEXT_KEYS, _evaluate_market
+
+        ctx, scored, view, projection, weather = TestEvaluateMarket()._fixture(total_line=42.0)
+        pick = _evaluate_market(ctx, scored, view, projection, weather, False, False, 10.0)
+        assert set(pick.reasoning["context"]) == set(_CONTEXT_KEYS)
+        assert all(v is None for v in pick.reasoning["context"].values())
+        assert pick.reasoning["weather"]["precip_prob"] is None
+        assert pick.reasoning["weather"]["precip_mm"] is None
+
+        wet = FootballWeather(1.0, True, False, 60.0, 5.0, "test", precip_prob=70.0, precip_mm=2.5)
+        pick2 = _evaluate_market(ctx, scored, view, projection, wet, False, False, 10.0,
+                                 context={"conference_game": True, "home_rest_days": 7})
+        c = pick2.reasoning["context"]
+        assert c["conference_game"] is True and c["home_rest_days"] == 7
+        assert c["neutral_site"] is None and set(c) == set(_CONTEXT_KEYS)
+        assert pick2.reasoning["weather"]["precip_prob"] == 70.0
+        assert pick2.reasoning["weather"]["precip_mm"] == 2.5
+
+    def test_slate_output_carries_context(self, monkeypatch):
+        """Offline evaluate_league_slate: the matched nflverse row feeds
+        reasoning["context"] on every pick of the game."""
+        from mlb_value_bot.football import pipeline_football as pf
+        from mlb_value_bot.football.data import football_weather, qb_status
+        from mlb_value_bot.football.data.football_odds import FootballGameOdds, SpreadQuote, TotalQuote
+        from mlb_value_bot.football.data.football_weather import FootballWeather
+
+        raw = {"epa_dropback": 0.10, "rush_epa": 0.03, "plays_pg": 63.0,
+               "epa_dropback_allowed": 0.02, "rush_epa_allowed": 0.00, "games": 6}
+        unit_stats = pd.DataFrame({"KC": raw, "BUF": dict(raw)}).T
+        pcts = pd.DataFrame({"KC": _units(pass_off_pct=80.0), "BUF": _units(pass_def_pct=30.0)}).T
+        games = pd.DataFrame([
+            {"game_id": "2030_01_KC_LA", "week": 1, "home_team": "KC", "away_team": "LA",
+             "date": "2030-09-08", "roof": "outdoors", "div_game": 0, "home_rest": 7,
+             "away_rest": 7, "location": "Home"},
+            {"game_id": "2030_02_BUF_KC", "week": 2, "home_team": "KC", "away_team": "BUF",
+             "date": "2030-09-15", "roof": "outdoors", "div_game": 0, "home_rest": 7,
+             "away_rest": 10, "location": "Home"},
+        ])
+        ctx = pf.LeagueContext("nfl", 2030, 2, M3_CFG, unit_stats, pcts, games)
+        monkeypatch.setattr(pf, "build_league_context", lambda league, season, week, config: ctx)
+        monkeypatch.setattr(qb_status, "compute_flags", lambda season, config: ({}, None))
+        monkeypatch.setattr(football_weather, "game_weather",
+                            lambda *a, **k: FootballWeather(1.0, True, False, 62.0, 4.0, "test",
+                                                            precip_prob=15.0, precip_mm=0.0))
+        game = FootballGameOdds(
+            event_id="ev1", commence_time="2030-09-15T17:00:00Z",
+            home_name_raw="Kansas City Chiefs", away_name_raw="Buffalo Bills",
+            spreads={"draftkings": SpreadQuote(-3.0, -110, -110)},
+            totals={"draftkings": TotalQuote(47.5, -110, -110)},
+        )
+        out = pf.evaluate_league_slate("nfl", "2030-09-15", M3_CFG, odds_games=[game])
+        assert len(out) == 1 and out[0].game_id == "2030_02_BUF_KC" and out[0].picks
+        for pick in out[0].picks:
+            c = pick.reasoning["context"]
+            assert c == {"conference_game": True, "home_conference": "AFC",
+                         "away_conference": "AFC", "division_game": False,
+                         "home_rest_days": 7, "away_rest_days": 10, "neutral_site": False}
+            assert pick.reasoning["weather"]["precip_prob"] == 15.0

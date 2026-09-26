@@ -1093,6 +1093,16 @@ def test_evaluate_game_skips_on_extreme_model_market_divergence():
     result = evaluate_game(sched, odds, _Stub(), 2026, date(2026, 5, 28))
     assert result.skipped_reason is not None
     assert "diverge" in result.skipped_reason
+    # RSI phase 2 (2026-09-26): the skip no longer discards the evaluation.
+    # The game is fully priced for the pass record (evals / confidence /
+    # reasoning) but forced to tier pass + stake 0, so it can never be bet.
+    assert result.best_eval is not None and result.wp is not None
+    assert result.tier == "pass" and result.best_eval.kelly_stake == 0.0
+    assert not result.is_value(0.0)
+    assert result.pass_reason(0.03).startswith("skip:divergence")
+    reasoning = result.reasoning()
+    assert reasoning["skipped_reason"] == result.skipped_reason
+    assert reasoning["model_tag"] == "biff_v1"
 
 
 # --- Multi-window recent form (2026-05-28) ----------------------------------
@@ -1497,6 +1507,360 @@ def test_classify_bet_tier():
 
 
 # --- Manual runner -----------------------------------------------------------
+
+# --- RSI phase 2 (2026-09-26): pass logging, skip fall-through, slate split --
+def _tmp_recs():
+    """Redirect the ML tracking DB to a throwaway file. Returns (utils, orig, recs)."""
+    import importlib
+    import tempfile
+    from pathlib import Path
+    import mlb_value_bot.utils as utils
+
+    tmpdir = Path(tempfile.mkdtemp())
+    orig_db = utils.DB_PATH
+    utils.DB_PATH = tmpdir / "test.db"
+    recs = importlib.reload(importlib.import_module("mlb_value_bot.tracking.recommendations"))
+    return utils, orig_db, recs
+
+
+def _restore_recs(utils, orig_db, recs):
+    import importlib
+    utils.DB_PATH = orig_db
+    importlib.reload(recs)
+
+
+def _rsi_rec(recs, gid=7, side="home", odds=-110, is_value=False,
+             pass_reason="below_threshold", model_tag="biff_v1", date="2026-09-20"):
+    return recs.RecommendationRecord(
+        date=date, game_id=gid, home_team="H", away_team="A",
+        recommended_side=side, model_prob=0.55, market_prob_devigged=0.52,
+        american_odds=odds, decimal_odds=ev.american_to_decimal(odds),
+        ev_pct=0.01, kelly_stake=0.0 if not is_value else 0.005, confidence=70.0,
+        is_value=is_value, pass_reason=pass_reason, model_tag=model_tag,
+    )
+
+
+def test_upsert_analysis_freezes_opening_tracks_clv_and_refreezes_on_flip():
+    """Analysis rows (passes) now keep a frozen opening + a live close/CLV like
+    bets, re-freeze the opening on a side flip, and carry pass_reason /
+    model_tag; committed bets stay untouched."""
+    utils, orig, recs = _tmp_recs()
+    try:
+        recs.upsert_recommendation(_rsi_rec(recs, odds=-110))
+        row = recs.get_for_date("2026-09-20")[0]
+        assert row["is_value"] == 0 and row["opening_line"] == -110
+        assert row["pass_reason"] == "below_threshold" and row["model_tag"] == "biff_v1"
+        assert row["closing_line"] is None and row["clv_pct"] is None   # no close yet (like a bet)
+
+        # analysis -> analysis: opening FROZEN, close + CLV move, pass_reason refreshed.
+        recs.upsert_recommendation(_rsi_rec(recs, odds=-130,
+                                            pass_reason="below_threshold+filter:heavy_favorite"))
+        row = recs.get_for_date("2026-09-20")[0]
+        assert row["opening_line"] == -110 and row["closing_line"] == -130
+        assert row["clv_pct"] > 0
+        assert row["pass_reason"] == "below_threshold+filter:heavy_favorite"
+
+        # side flip while still an analysis -> opening re-frozen on the new side.
+        recs.upsert_recommendation(_rsi_rec(recs, side="away", odds=115))
+        row = recs.get_for_date("2026-09-20")[0]
+        assert row["recommended_side"] == "away"
+        assert row["opening_line"] == 115 and row["closing_line"] == 115 and row["clv_pct"] == 0.0
+
+        # analysis -> bet: opening = bet price, pass_reason cleared.
+        recs.upsert_recommendation(_rsi_rec(recs, side="away", odds=120, is_value=True,
+                                            pass_reason=None, model_tag="biff_v2"))
+        row = recs.get_for_date("2026-09-20")[0]
+        assert row["is_value"] == 1 and row["opening_line"] == 120
+        assert row["pass_reason"] is None and row["model_tag"] == "biff_v2"
+
+        # committed bet: never downgraded; only the close/CLV move.
+        recs.upsert_recommendation(_rsi_rec(recs, side="away", odds=110, is_value=False,
+                                            pass_reason="below_threshold", model_tag="biff_v9"))
+        row = recs.get_for_date("2026-09-20")[0]
+        assert row["is_value"] == 1 and row["opening_line"] == 120 and row["closing_line"] == 110
+        assert row["pass_reason"] is None and row["model_tag"] == "biff_v2"
+
+        # include_analyses widens the grading worklists to the pass rows.
+        recs.upsert_recommendation(_rsi_rec(recs, gid=8))
+        assert len(recs.get_open_for_date("2026-09-20")) == 1
+        assert len(recs.get_open_for_date("2026-09-20", include_analyses=True)) == 2
+        assert recs.get_open_dates() == ["2026-09-20"]
+        assert recs.get_open_dates(include_analyses=True) == ["2026-09-20"]
+        recs.update_result(row["id"], "win", 0.004)
+        assert recs.get_open_dates() == []
+        assert recs.get_open_dates(include_analyses=True) == ["2026-09-20"]
+    finally:
+        _restore_recs(utils, orig, recs)
+
+
+def test_grade_date_grades_passes_counterfactually_when_configured():
+    """grading.grade_analyses: is_value=0 rows get a result from the final
+    score (same side logic as bets) with profit_loss 0, counted ONLY in
+    analyses_graded; the headline bet counters are unchanged."""
+    from mlb_value_bot.data.mlb_client import GameResult
+    from mlb_value_bot.tracking import results as R
+
+    utils, orig, recs = _tmp_recs()
+    try:
+        recs.upsert_recommendation(_rsi_rec(recs, gid=1, side="home", is_value=True, pass_reason=None))
+        recs.upsert_recommendation(_rsi_rec(recs, gid=2, side="home"))
+        recs.upsert_recommendation(_rsi_rec(recs, gid=3, side="away"))
+
+        class FakeMLB:
+            def get_results(self, d):
+                return [GameResult(g, "Final", "H", "A", 5, 3) for g in (1, 2, 3)]   # home wins
+
+        off = R.grade_date("2026-09-20", mlb_client=FakeMLB(), config={"grading": {"grade_analyses": False}})
+        assert off.graded == 1 and off.wins == 1 and off.analyses_graded == 0
+        rows = {r["game_id"]: r for r in recs.get_for_date("2026-09-20")}
+        assert rows[1]["result"] == "win" and rows[1]["profit_loss"] > 0
+        assert rows[2]["result"] == "pending" and rows[3]["result"] == "pending"
+
+        on = R.grade_date("2026-09-20", mlb_client=FakeMLB(), config={"grading": {"grade_analyses": True}})
+        assert on.graded == 0 and on.wins == 0 and on.losses == 0 and on.profit_loss == 0.0
+        assert on.analyses_graded == 2 and on.analyses_pending == 0
+        rows = {r["game_id"]: r for r in recs.get_for_date("2026-09-20")}
+        assert rows[2]["result"] == "win" and rows[2]["profit_loss"] == 0.0
+        assert rows[3]["result"] == "loss" and rows[3]["profit_loss"] == 0.0
+        # The sweep honours the flag too (nothing left open either way now).
+        assert R.grade_all_open("2026-09-21", mlb_client=FakeMLB(),
+                                config={"grading": {"grade_analyses": True}}) == []
+    finally:
+        _restore_recs(utils, orig, recs)
+
+
+def test_pass_reason_vocabulary_joins_every_reason():
+    from mlb_value_bot.analysis.ev_calculator import evaluate_sides
+    from mlb_value_bot.pipeline import GameAnalysis, filter_kind, skip_kind
+
+    a = GameAnalysis(game_id=1, game_date="2026-09-20", home_team="H", away_team="A",
+                     status="Scheduled", home_pitcher=None, away_pitcher=None)
+    assert a.pass_reason(0.03) is None                    # nothing to persist
+    a.evals = evaluate_sides(0.55, -110, -110)
+    a.best_side = "home"
+    assert a.best_eval.ev_pct > 0.03 and a.best_eval.kelly_stake > 0
+    assert a.is_value(0.03) and a.pass_reason(0.03) is None
+    assert a.pass_reason(0.10) == "below_threshold"
+
+    a.filter_reasons = ["filtered: heavy favorite -160 (at or below -150)",
+                        "filtered: no sharp book priced this game"]
+    a.best_eval.kelly_stake = 0.0                          # what the filters do in evaluate_game
+    assert a.pass_reason(0.03) == "filter:heavy_favorite+filter:no_sharp_coverage"
+    a.filter_reasons.insert(1, "filtered: blend has pick at 48% (below min_model_prob 50%)")
+    assert a.pass_reason(0.03) == (
+        "filter:heavy_favorite+filter:min_model_prob+filter:no_sharp_coverage")
+
+    a.skipped_reason = "fading sharp consensus by 6.0pp on home (...) > 5.0pp"
+    assert not a.is_value(0.0)
+    assert a.pass_reason(0.10) == (
+        "skip:sharp_fade+filter:heavy_favorite+filter:min_model_prob"
+        "+filter:no_sharp_coverage+below_threshold")
+    a.filter_reasons = []
+    a.skipped_reason = "implausible EV (45%) - likely bad market data"
+    assert a.pass_reason(0.03) == "skip:max_ev"
+    a.skipped_reason = "raw model (0.500) vs market (0.250) diverge by 0.250 > 0.15"
+    assert a.pass_reason(0.03) == "skip:divergence"
+    assert skip_kind(None) is None and skip_kind("something else") == "skip:other"
+    assert filter_kind("filtered: heavy favorite") == "filter:heavy_favorite"
+
+
+def _divergent_game():
+    """The divergence-guard fixture (model ~50/50, market +400/-500)."""
+    from datetime import date
+
+    from mlb_value_bot.analysis.team_metrics import TeamProfile
+    from mlb_value_bot.data.mlb_client import ProbablePitcher, ScheduledGame
+    from mlb_value_bot.data.odds_client import GameOdds, SidePrice
+
+    sched = ScheduledGame(
+        game_id=41, game_date="2026-05-28", status="Scheduled",
+        home_team="Home", away_team="Away",
+        home_pitcher=ProbablePitcher(player_id=None, name=None),
+        away_pitcher=ProbablePitcher(player_id=None, name=None),
+        game_datetime=None,
+    )
+    odds = GameOdds(
+        event_id="e1", commence_time="2026-05-28T20:00:00Z",
+        home_team="Home", away_team="Away",
+        home=SidePrice(team="Home", american_odds=400, bookmaker="dk"),
+        away=SidePrice(team="Away", american_odds=-500, bookmaker="dk"),
+    )
+
+    class _Stub:
+        def build_team_profile(self, name, is_home):
+            return TeamProfile(team=name, raw_winpct=0.55, games=60, wins=33, losses=27,
+                               offense_wrc_plus=100, bullpen_fip=4.0, park_factor=100)
+
+    return sched, odds, _Stub(), date(2026, 5, 28)
+
+
+def test_save_slate_persists_sanity_skips_as_passes():
+    """A divergence-skipped game lands in the DB as an is_value=0 pass with
+    pass_reason skip:divergence and the model_tag stamp; the upsert owns its
+    close, so the no-eval refresh pass leaves it alone."""
+    import json
+
+    from mlb_value_bot.pipeline import evaluate_game, refresh_skipped_closing_lines, save_slate
+
+    utils, orig, recs = _tmp_recs()
+    try:
+        sched, odds, stub, as_of = _divergent_game()
+        a = evaluate_game(sched, odds, stub, 2026, as_of)
+        assert a.skipped_reason and a.best_eval is not None
+        total, n_value = save_slate([a], 0.03, "2026-05-28", model_tag="biff_v2")
+        assert (total, n_value) == (1, 0)
+        row = recs.get_for_date("2026-05-28")[0]
+        assert row["is_value"] == 0 and row["model_tag"] == "biff_v2"
+        assert row["pass_reason"].startswith("skip:divergence")
+        assert row["opening_line"] == a.best_eval.american_odds and row["closing_line"] is None
+        assert row["kelly_stake"] == 0.0
+        # Second run at a moved price: the pass gets its close + CLV via the upsert.
+        b = evaluate_game(sched, odds, stub, 2026, as_of)
+        b.evals[b.best_side].american_odds = 380
+        save_slate([b], 0.03, "2026-05-28", model_tag="biff_v2")
+        row = recs.get_for_date("2026-05-28")[0]
+        assert row["opening_line"] == 400 and row["closing_line"] == 380 and row["clv_pct"] > 0
+        stored = json.loads(row["reasoning_json"])
+        assert stored["skipped_reason"] == a.skipped_reason and stored["model_tag"] == "biff_v2"
+        assert refresh_skipped_closing_lines([a], "2026-05-28") == 0
+    finally:
+        _restore_recs(utils, orig, recs)
+
+
+def _slate_fixture():
+    """A 4-game offline slate: two priced games, one without odds, one postponed."""
+    from mlb_value_bot.data.mlb_client import ProbablePitcher, ScheduledGame
+    from mlb_value_bot.data.odds_client import GameOdds, SidePrice
+
+    def sg(gid, home, away, status="Scheduled"):
+        return ScheduledGame(
+            game_id=gid, game_date="2026-06-10", status=status, home_team=home, away_team=away,
+            home_pitcher=ProbablePitcher(player_id=None, name=None),
+            away_pitcher=ProbablePitcher(player_id=None, name=None),
+            game_datetime="2026-06-10T23:10:00Z",
+        )
+
+    def go(eid, home, away, h, a):
+        return GameOdds(event_id=eid, commence_time="2026-06-10T23:10:00Z",
+                        home_team=home, away_team=away,
+                        home=SidePrice(home, h, "dk"), away=SidePrice(away, a, "dk"))
+
+    schedule = [
+        sg(1, "Boston Red Sox", "New York Yankees"),
+        sg(2, "Chicago Cubs", "St. Louis Cardinals"),
+        sg(3, "Seattle Mariners", "Athletics"),
+        sg(4, "Miami Marlins", "Atlanta Braves", status="Postponed"),
+    ]
+    odds = [go("e1", "Boston Red Sox", "New York Yankees", -120, 105),
+            go("e2", "Chicago Cubs", "St. Louis Cardinals", 130, -150)]
+    return schedule, odds
+
+
+def _serialize_slate(analyses):
+    out = []
+    for a in analyses:
+        be = a.best_eval
+        out.append({
+            "game_id": a.game_id, "skipped": a.skipped_reason, "side": a.best_side,
+            "ev": be.ev_pct if be else None, "kelly": be.kelly_stake if be else None,
+            "tier": a.tier, "confidence": a.confidence, "reasoning": a.reasoning(),
+            "totals": a.totals.reasoning() if a.totals is not None else None,
+            "totals_skip": a.totals.skipped_reason if a.totals is not None else None,
+        })
+    return out
+
+
+def test_golden_evaluate_slate_inputs_is_pure_and_matches_analyze_slate():
+    """evaluate_slate_inputs(inputs, config) twice -> identical output, and
+    equal to analyze_slate on the same fixtures (fetch + evaluate composed)."""
+    import copy
+
+    import mlb_value_bot.pipeline as P
+    from mlb_value_bot.analysis.team_metrics import TeamProfile
+    from mlb_value_bot.data import weather as WX
+    from mlb_value_bot.utils import load_config
+
+    schedule, odds = _slate_fixture()
+
+    class _StubOdds:
+        def get_odds(self):
+            return list(odds)
+
+    class _StubMLB:
+        def get_schedule(self, d):
+            return list(schedule)
+
+        def get_per_player_hitting(self, season):
+            return {}
+
+        def get_per_pitcher_reliever_stats(self, season):
+            return {}
+
+    class _StubProvider:
+        def __init__(self, season=None, config=None, mlb_client=None):
+            pass
+
+        def build_team_profile(self, name, is_home):
+            return TeamProfile(team=name, raw_winpct=0.52 if is_home else 0.48, games=60,
+                               wins=31, losses=29, offense_wrc_plus=102, bullpen_fip=4.1,
+                               park_factor=100)
+
+    cfg = copy.deepcopy(load_config())
+    cfg["totals"]["enabled"] = True
+    for team in ("Boston Red Sox", "Chicago Cubs"):
+        WX._WEATHER_CACHE[("2026-06-10", team)] = WX.WeatherEnv(
+            1.0, True, 20.0, 5.0, 2.0, "open", "test", precip_mm=0.0, precip_prob=10.0).__dict__
+
+    orig_provider = P.TeamMetricsProvider
+    P.TeamMetricsProvider = _StubProvider
+    try:
+        inputs = P.fetch_slate_inputs("2026-06-10", _StubOdds(), _StubMLB(), cfg)
+        assert isinstance(inputs, P.SlateInputs)
+        assert set(inputs.matched_odds) == {1, 2, 3, 4}
+        assert inputs.matched_odds[3] is None and inputs.matched_odds[4] is None
+        assert set(inputs.profiles) == {1, 2, 3}            # postponed game: no profiles
+        assert inputs.weather[1] is not None and inputs.weather[3] is None
+        assert inputs.weather_fetched
+
+        first = P.evaluate_slate_inputs(inputs, cfg)
+        second = P.evaluate_slate_inputs(inputs, cfg)
+        assert _serialize_slate(first) == _serialize_slate(second)
+        assert [a.game_id for a in first[:2]] != [3, 4]      # priced games rank first
+        skips = {a.game_id: a.skipped_reason for a in first}
+        assert skips[3] == "no odds found" and skips[4].startswith("not playable")
+        assert first[0].totals is not None and first[0].totals.reasoning()["weather"]["precip_prob"] == 10.0
+        assert first[0].totals.reasoning()["model_tag"] == "totals_v1"
+
+        composed = P.analyze_slate("2026-06-10", _StubOdds(), _StubMLB(), cfg)
+        assert _serialize_slate(composed) == _serialize_slate(first)
+
+        # A second config through the SAME inputs (the shadow-challenger
+        # contract): no network, a different answer only where the config differs.
+        cfg2 = copy.deepcopy(cfg)
+        cfg2["totals"]["enabled"] = False
+        third = P.evaluate_slate_inputs(inputs, cfg2)
+        assert all(a.totals is None for a in third)
+        assert [a.game_id for a in third] == [a.game_id for a in first]
+    finally:
+        P.TeamMetricsProvider = orig_provider
+
+
+def test_sync_rows_carry_model_tag_and_pass_reason():
+    from mlb_value_bot.sync import supabase_sync as S
+
+    assert "model_tag" in S._REC_COLUMNS and "pass_reason" in S._REC_COLUMNS
+    assert "model_tag" in S._TOTALS_REC_COLUMNS and "pass_reason" in S._TOTALS_REC_COLUMNS
+    utils, orig, recs = _tmp_recs()
+    try:
+        recs.upsert_recommendation(_rsi_rec(recs, gid=1, pass_reason="below_threshold"))
+        recs.upsert_recommendation(_rsi_rec(recs, gid=2, is_value=True, pass_reason=None))
+        rows = {r["game_id"]: r for r in S._rec_rows(None)}
+        assert rows[1]["model_tag"] == "biff_v1" and rows[1]["pass_reason"] == "below_threshold"
+        assert rows[2]["pass_reason"] is None and rows[2]["is_value"] is True
+    finally:
+        _restore_recs(utils, orig, recs)
+
+
 def _run_all() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = 0

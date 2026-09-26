@@ -283,6 +283,12 @@ def test_pipeline_divergence_skip():
                      _team(wrc=160, bp=5.5, pf=120), _team(wrc=160, bp=5.5, pf=120))
     a = evaluate_totals_game(_sched(), _odds(7.0, -110, -110), prof, _wx(), cfg)
     assert a.skipped_reason and "diverge" in a.skipped_reason
+    # RSI phase 2: the skip keeps its market + distribution + pick for the
+    # pass record (tier pass, stake 0, never value), with pass_reason skip:*.
+    assert a.best_eval is not None and a.rd is not None
+    assert a.tier == "pass" and a.best_eval.kelly_stake == 0.0 and not a.is_value(0.0)
+    assert a.pass_reason(0.03).startswith("skip:divergence")
+    assert a.reasoning()["skipped_reason"] == a.skipped_reason
 
 
 def test_pipeline_market_bounds_and_no_market():
@@ -539,6 +545,167 @@ def test_results_grades_totals_even_with_no_open_ml_dates():
     finally:
         results_mod.grade_all_open = orig_ml
         results_mod.grade_all_open_totals = orig_totals
+
+
+
+# --- RSI phase 2 (2026-09-26): pass logging + weather precip + roof rule ------
+def test_totals_upsert_analysis_freezes_opening_and_refreezes_on_flip():
+    T, path = _totals_db()
+    sc = TM.SharpTotalsLine("pinnacle", 8.5, -110, -110, 0.50)
+    # Analysis row: opening captured, CLV computed (not None), pass_reason + tag stored.
+    T.upsert_totals_recommendation(_rec(T, is_value=False, pass_reason="below_threshold",
+                                        opening_devig_p_side=0.49, sharp_close=sc))
+    r = T.to_dataframe().iloc[0]
+    assert int(r["is_value"]) == 0 and r["pass_reason"] == "below_threshold"
+    assert r["model_tag"] == "totals_v1"
+    assert approx(float(r["opening_devig_p_side"]), 0.49) and int(r["opening_price"]) == 105
+    assert approx(float(r["clv_pp"]), 1.0, tol=0.05)          # under: 0.50 - 0.49
+    # Same side again with a moved price/de-vig: opening FROZEN, close + CLV move.
+    sc2 = TM.SharpTotalsLine("pinnacle", 8.5, -105, -115, 0.47)
+    T.upsert_totals_recommendation(_rec(T, is_value=False, pass_reason="below_threshold+weather_held",
+                                        bet_odds=115, opening_devig_p_side=0.45, sharp_close=sc2))
+    r = T.to_dataframe().iloc[0]
+    assert int(r["opening_price"]) == 105 and approx(float(r["opening_devig_p_side"]), 0.49)
+    assert approx(float(r["clv_pp"]), 4.0, tol=0.05)          # under close 0.53 - 0.49
+    assert r["pass_reason"] == "below_threshold+weather_held"
+    # Side flip (under -> over) while still an analysis: opening re-frozen on the new side.
+    T.upsert_totals_recommendation(_rec(T, is_value=False, pick_side="over", bet_odds=-115,
+                                        opening_devig_p_side=0.53, sharp_close=sc2,
+                                        pass_reason="below_threshold"))
+    r = T.to_dataframe().iloc[0]
+    assert r["pick_side"] == "over" and int(r["opening_price"]) == -115
+    assert approx(float(r["opening_devig_p_side"]), 0.53)
+    assert approx(float(r["clv_pp"]), -6.0, tol=0.05)         # over close 0.47 - 0.53
+    # Promotion to a paper bet clears pass_reason and re-sets the opening.
+    T.upsert_totals_recommendation(_rec(T, is_value=True, pick_side="over", bet_odds=-110,
+                                        opening_devig_p_side=0.50, sharp_close=sc2, model_tag="totals_v2"))
+    r = T.to_dataframe().iloc[0]
+    assert int(r["is_value"]) == 1 and r["pass_reason"] is None and r["model_tag"] == "totals_v2"
+    assert int(r["opening_price"]) == -110
+    # include_analyses on the grading worklists.
+    T.upsert_totals_recommendation(_rec(T, game_id=602, is_value=False, pass_reason="below_threshold"))
+    assert len(T.get_open_for_date("2026-06-16")) == 1
+    assert len(T.get_open_for_date("2026-06-16", include_analyses=True)) == 2
+    assert T.get_open_dates(include_analyses=True) == ["2026-06-16"]
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def test_grade_totals_analyses_counterfactually():
+    from mlb_value_bot.data.mlb_client import GameResult
+    from mlb_value_bot.tracking import results as R
+    T, path = _totals_db()
+    sc = TM.SharpTotalsLine("pinnacle", 8.5, -110, -110, 0.5)
+    T.upsert_totals_recommendation(_rec(T, game_id=621, pick_side="under", market_total=8.5, sharp_close=sc))
+    T.upsert_totals_recommendation(_rec(T, game_id=622, pick_side="over", market_total=8.5,
+                                        is_value=False, pass_reason="weather_held", sharp_close=sc))
+
+    class FakeMLB:
+        def get_results(self, d):
+            return [GameResult(621, "Final", "Boston Red Sox", "New York Yankees", 3, 4),   # 7 -> under wins
+                    GameResult(622, "Final", "Boston Red Sox", "New York Yankees", 3, 4)]   # 7 -> over loses
+
+    s_off = R.grade_totals_date("2026-06-16", mlb_client=FakeMLB(), config={"grading": {"grade_analyses": False}})
+    df = T.to_dataframe().set_index("game_id")
+    assert s_off.graded == 1 and s_off.analyses_graded == 0 and df.loc[622, "result"] == "pending"
+    s_on = R.grade_totals_date("2026-06-16", mlb_client=FakeMLB(), config={"grading": {"grade_analyses": True}})
+    df = T.to_dataframe().set_index("game_id")
+    assert s_on.graded == 0 and s_on.analyses_graded == 1
+    assert df.loc[622, "result"] == "loss" and approx(float(df.loc[622, "profit_loss"]), 0.0)
+    assert df.loc[621, "result"] == "win"
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def test_save_totals_slate_persists_divergence_skip_as_pass():
+    from mlb_value_bot.pipeline_totals import evaluate_totals_game, refresh_skipped_totals_closing, save_totals_slate
+    T, path = _totals_db()
+    cfg = _cfg()
+    prof = _Profiles(_pitcher(xfip=6.0), _pitcher(xfip=6.0),
+                     _team(wrc=160, bp=5.5, pf=120), _team(wrc=160, bp=5.5, pf=120))
+    a = evaluate_totals_game(_sched(), _odds(7.0, -110, -110, sharp_over=-108, sharp_under=-102), prof, _wx(), cfg)
+    assert a.skipped_reason and "diverge" in a.skipped_reason
+    total, n_value = save_totals_slate([a], 0.03, "2026-06-16", model_tag="totals_v3")
+    assert (total, n_value) == (1, 0)
+    r = T.to_dataframe().iloc[0]
+    assert int(r["is_value"]) == 0 and r["model_tag"] == "totals_v3"
+    assert str(r["pass_reason"]).startswith("skip:divergence")
+    assert float(r["kelly_stake"]) == 0.0 and r["sharp_close_book"] == "pinnacle"
+    # The upsert owns the close; the no-eval refresh pass ignores persisted rows.
+    assert refresh_skipped_totals_closing([a], "2026-06-16") == 0
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def test_pipeline_roof_unverified_hold_and_precip_logged():
+    import copy
+    from mlb_value_bot.pipeline_totals import evaluate_totals_game
+    cfg = copy.deepcopy(_cfg())
+    prof = _Profiles(_pitcher(), _pitcher(), _team(), _team())
+    WX._WEATHER_CACHE[("2026-06-16", "Boston Red Sox")] = WX.WeatherEnv(
+        1.0, True, 20, 0, 0, "retractable_assumed_open", "test", precip_mm=0.4, precip_prob=35.0).__dict__
+    wx = WX.weather_env("Boston Red Sox", "2026-06-16", cfg)
+    assert wx.precip_mm == 0.4 and wx.precip_prob == 35.0
+    # Default (require_verified_roof false): an assumed roof does NOT hold.
+    a = evaluate_totals_game(_sched(), _odds(8.5, -110, -110), prof, wx, cfg)
+    assert not a.roof_unverified
+    w = a.reasoning()["weather"]
+    assert w["precip_mm"] == 0.4 and w["precip_prob"] == 35.0 and w["roof"] == "retractable_assumed_open"
+    # Opt-in: held analysis-only with pass_reason roof_unverified.
+    cfg["totals"]["weather"]["require_verified_roof"] = True
+    b = evaluate_totals_game(_sched(), _odds(8.5, -110, -110), prof, wx, cfg)
+    assert b.roof_unverified and not b.is_value(0.0)
+    assert any("roof" in f for f in b.flags)
+    assert "roof_unverified" in (b.pass_reason(0.0) or "")
+    # A verified state (open-air / fixed dome) is never held by the rule.
+    open_wx = WX.WeatherEnv(1.0, True, 20, 0, 0, "open", "test")
+    c = evaluate_totals_game(_sched(), _odds(8.5, -110, -110), prof, open_wx, cfg)
+    assert not c.roof_unverified
+
+
+def test_weather_precip_picks_local_first_pitch_hour():
+    body = {
+        "utc_offset_seconds": -14400,      # EDT
+        "current": {"temperature_2m": 25.0, "wind_speed_10m": 5.0, "wind_direction_10m": 100.0},
+        "hourly": {
+            "time": [f"2026-06-16T{h:02d}:00" for h in range(24)],
+            "precipitation": [0.0] * 19 + [0.6, 0.2, 0.0, 0.0, 0.0],
+            "precipitation_probability": [5] * 19 + [60, 30, 10, 10, 10],
+        },
+    }
+    # 23:00Z first pitch = 19:00 local -> the 19:00 bucket.
+    assert WX._precip_at(body, "2026-06-16", "2026-06-16T23:00:00Z") == (0.6, 60.0)
+    # No first pitch -> 7pm local default; unknown date / missing hourly -> None.
+    assert WX._precip_at(body, "2026-06-16", None) == (0.6, 60.0)
+    assert WX._precip_at(body, "2026-06-17", "2026-06-17T23:00:00Z") == (None, None)
+    assert WX._precip_at({"current": {}}, "2026-06-16", None) == (None, None)
+    assert WX._local_hour("2026-06-16T23:00:00Z", None) == 19
+    assert WX._local_hour("2026-06-16T17:10:00Z", -25200) == 10   # PDT
+
+    # _fetch_open_meteo folds the precip reading into the current block.
+    import requests
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return body
+
+    orig = requests.get
+    requests.get = lambda url, params=None, timeout=None: _Resp()
+    try:
+        cur = WX._fetch_open_meteo(42.3, -71.1, 2.0, game_date="2026-06-16",
+                                   game_datetime="2026-06-16T23:00:00Z")
+    finally:
+        requests.get = orig
+    assert cur["temperature_2m"] == 25.0 and cur["precip_mm"] == 0.6 and cur["precip_prob"] == 60.0
 
 
 def _run_all():
