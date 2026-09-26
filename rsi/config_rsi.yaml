@@ -1,0 +1,106 @@
+# =============================================================================
+# RSI (Recursive Self-Improvement) loop config. Independent of config.yaml and
+# config_football.yaml; loaded by rsi.load_rsi_config(). Every knob of the
+# weekly review, the promotion bar, the shadow gate and the rollback monitor
+# lives here so the loop itself stays config-driven and reversible.
+# =============================================================================
+
+# Minimum SETTLED rows (win/loss) a segment cell needs before it can become a
+# candidate, per sport. THE per-cell evidence floor: below it a cell is
+# reported but never proposed. Football is lower because its season is short.
+min_sample:
+  mlb: 75
+  mlb_totals: 75
+  football: 40
+  griffbet: 75
+
+# |t| of the one-sample t-test on flat 1u P/L that a cell must clear to be a
+# candidate (the alternative trigger is a strong CLV sign, see clv_min_tracked).
+t_threshold: 2.0
+
+# A watch item becomes PENDING (a decision for Jim) only after clearing the bar
+# in this many consecutive weekly runs with the settled count growing.
+consecutive_runs_for_pending: 2
+
+# Minimum CLV-tracked rows in a cell before its avg CLV counts as evidence
+# (clv_agrees) or can trigger a candidate on its own.
+clv_min_tracked: 10
+
+# Deterministic holdout share (percent of games, by md5 of sport_key:game_id)
+# that the review NEVER mines; only promotion validation reads it. Must match
+# the SQL in the rsi_scored_games view (rsi/holdout.py mirrors it).
+holdout_pct: 20
+
+# How long an approved challenger runs in shadow before its gate can open.
+shadow_weeks:
+  mlb: 4
+  mlb_totals: 4
+  football: 3
+
+# Rolling-window size (settled champion picks) for the rollback monitor.
+rolling_window:
+  mlb: 75
+  mlb_totals: 75
+  football: 40
+
+# Rollback monitor: flag the active version when its rolling avg CLV falls
+# below clv_floor, or below the promotion-time baseline by clv_drop_vs_baseline
+# (in the engine's own CLV unit). Flagging never changes status by itself.
+rollback:
+  clv_floor: 0.0
+  clv_drop_vs_baseline: 0.5
+
+# Minimum holdout rows on BOTH sides before the holdout slice of the shadow gate
+# counts; fewer -> "holdout sample too small" and the gate stays closed.
+holdout_min_n: 10
+
+# Maximum concurrently approved challengers per engine (the site enforces on
+# approve; reported here for the summary).
+max_shadows: 3
+
+# Dotted config-key prefixes an overlay may touch, per engine. validate_overlay
+# rejects anything else, so a proposal can never reach the sanity guards,
+# data clients or bankroll settings.
+overlay_allowlist:
+  mlb:
+    - ev.
+    - sanity.
+    - filters.
+    - adjusted_ev.
+    - bet_sizing.
+    - model.market_blend
+    - model.blend_shrink
+    - model.weights.
+    - stability.
+  mlb_totals:
+    - totals.
+  football:
+    - projections.
+    - ev.
+    - adjusted_ev.
+    - weather.
+    - college.
+    - percentiles.
+    - qb_guard.
+    - matchup.
+    - ol_layer.
+    - variance.
+    - betting.flat_stake
+
+# Weekly email (Resend). `always: true` sends even when nothing is pending.
+email:
+  to: jim@financewithjim.com
+  from: "BiffBet RSI <onboarding@resend.dev>"
+  always: true
+
+# Link printed in the email (the Proposals tab). The email carries no action
+# links -- decisions are always made on the site.
+site_url: https://biffbet.com/proposals
+
+# Pre-registered single-cell test (runs FIRST, exempt from Bonferroni): the
+# small-favorite pass/bet question the old ledger kept reappearing on. The
+# listed fav_size values are pooled into one cell per pool.
+small_favorites:
+  pools: [ml-bets, ml-passes]
+  dim: fav_size
+  values: ["small fav -101..-119", "fav -120..-149"]

@@ -1,6 +1,7 @@
 # Core data / numerics
 pandas>=2.0
 numpy>=1.24
+scipy>=1.10           # t-test p-values for the RSI review (rsi/stats.py)
 pyarrow>=12.0          # parquet engine for the cache layer
 
 # HTTP + resilience

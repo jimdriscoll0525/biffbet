@@ -38,72 +38,20 @@ class PerformanceReport:
 
 
 def _prepare(df: pd.DataFrame) -> pd.DataFrame:
-    """Add derived columns used for segmentation and flat-stake P&L."""
+    """Add derived columns used for segmentation and flat-stake P&L.
+
+    Bucket definitions live in rsi/segments.py (the single source shared with
+    the weekly RSI review) -- this is a thin delegation that keeps the exact
+    columns, labels and categorical dtypes this module has always produced:
+    settled, flat_pl, confidence_bucket, ev_bucket, kelly_bucket, side_type,
+    venue_side, clv_sign, bet_tier, blend_tier, stability, sharp_fade,
+    odds_bucket (plus the RSI-only lenses, which the report ignores).
+    """
     if df.empty:
         return df
-    df = df.copy()
-    df["settled"] = df["result"].isin(SETTLED)
+    from mlb_value_bot.rsi.segments import prepare_mlb
 
-    # Flat-stake (1u) P/L for settled bets.
-    def _flat_pl(row) -> float:
-        if row["result"] == "win":
-            return american_to_decimal(row["american_odds"]) - 1.0
-        if row["result"] == "loss":
-            return -1.0
-        return np.nan
-
-    df["flat_pl"] = df.apply(_flat_pl, axis=1)
-
-    # Segmentation dimensions.
-    df["confidence_bucket"] = pd.cut(
-        df["confidence"], bins=[0, 40, 60, 80, 100],
-        labels=["0-40", "40-60", "60-80", "80-100"], include_lowest=True,
-    )
-    df["ev_bucket"] = pd.cut(
-        df["ev_pct"], bins=[-np.inf, 0.03, 0.05, 0.08, 0.12, np.inf],
-        labels=["<3%", "3-5%", "5-8%", "8-12%", "12%+"],
-    )
-    # Kelly buckets reveal whether bigger stakes actually pay off (a real edge
-    # signal) or just amplify variance. Edges in bp of bankroll: 0..50, 50..100,
-    # 100..150, 150..200 (the cap).
-    df["kelly_bucket"] = pd.cut(
-        df["kelly_stake"], bins=[-np.inf, 0.005, 0.01, 0.015, np.inf],
-        labels=["<0.5%", "0.5-1%", "1-1.5%", "1.5%+"],
-    )
-    df["side_type"] = np.where(df["american_odds"] < 0, "favorite", "underdog")
-    df["venue_side"] = np.where(df["recommended_side"] == "home", "home", "road")
-    df["clv_sign"] = np.where(
-        df["clv_pct"].isna(), "unknown",
-        np.where(df["clv_pct"] > 0, "CLV+", "CLV-"),
-    )
-
-    # Bet sizing tier + dynamic blend tier come from reasoning_json (only set
-    # on rows synced after 2026-05-28; older rows fall to "n/a"). Tells us
-    # which of our newer guardrails are actually predictive.
-    df["bet_tier"] = df["reasoning_json"].apply(_extract_bet_tier).astype("string")
-    df["blend_tier"] = df["reasoning_json"].apply(_extract_blend_tier).astype("string")
-
-    # Stratified view (2026-06-11): the three slices that drove the sharp-fade
-    # tightening — edge stability label, signed sharp-fade pp, and a finer
-    # odds split than favorite/underdog. All derivable from stored rows, so
-    # history back-fills the moment this ships.
-    df["stability"] = pd.Categorical(
-        df["reasoning_json"].apply(_extract_stability),
-        categories=["stable", "moderate", "fragile", "n/a"],
-    )
-    fade_pp = df.apply(_sharp_fade_pp, axis=1)
-    df["sharp_fade"] = pd.cut(
-        fade_pp, bins=[-np.inf, -3.0, 3.0, 4.0, np.inf],
-        labels=["sharps agree 3pp+", "neutral", "fade 3-4pp", "fade 4pp+"],
-    ).cat.add_categories(["n/a"]).fillna("n/a")
-    # American odds are never in (-100, 100), so a bin edge at 0 splits
-    # favorites from underdogs exactly.
-    df["odds_bucket"] = pd.cut(
-        df["american_odds"], bins=[-np.inf, -150, 0, 150, np.inf],
-        labels=["big fav (-150+)", "small fav (-101..-149)",
-                "small dog (+100..+150)", "big dog (+151+)"],
-    )
-    return df
+    return prepare_mlb(df)
 
 
 def _extract_bet_tier(raw: str | None) -> str:

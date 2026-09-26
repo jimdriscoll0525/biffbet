@@ -13,13 +13,17 @@ on:
   # cadence vs MLB's daily): POST {"ref":"main","inputs":{"scope":"football"}}
   # for football-only runs (Sat/Sun closing windows), "mlb" for MLB-only, and
   # the default "all" runs everything (the existing daily ticks stay valid).
+  # "rsi" (2026-09-26) is the WEEKLY self-improvement review: a Monday
+  # cron-job.org tick POSTs {"ref":"main","inputs":{"scope":"rsi"}}; it runs
+  # only the RSI block below (pull history -> review -> proposals -> email),
+  # never the pick pipelines.
   workflow_dispatch:
     inputs:
       scope:
         description: "Which pipelines to run"
         type: choice
         default: all
-        options: [all, mlb, football]
+        options: [all, mlb, football, rsi]
 
 # Never let two runs clobber each other (they share the Supabase tables).
 concurrency:
@@ -63,7 +67,7 @@ jobs:
             data-cache-
 
       - name: Run pipeline (pull -> grade -> slate -> sync)
-        if: ${{ inputs.scope != 'football' }}
+        if: ${{ inputs.scope != 'football' && inputs.scope != 'rsi' }}
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -74,6 +78,9 @@ jobs:
           python -m mlb_value_bot results || echo "results: nothing to settle"
           python -m mlb_value_bot today
           python -m mlb_value_bot sync
+          # RSI: settle yesterday's shadow (challenger) picks. Tolerant: the
+          # champion run above is already synced.
+          python -m mlb_value_bot.rsi grade --engine mlb || echo "rsi grade mlb: skipped"
 
       # GriffBet (challenger) — ADDITIVE. Runs the same pull -> grade -> slate ->
       # sync flow on GriffBet's independent config + store + Supabase tables,
@@ -81,7 +88,7 @@ jobs:
       # snapshot (cross-model report). BiffBet's steps above are unchanged; a
       # GriffBet failure must not mask BiffBet's run, so each step is tolerant.
       - name: Run GriffBet pipeline (pull -> grade -> slate -> sync)
-        if: ${{ inputs.scope != 'football' }}
+        if: ${{ inputs.scope != 'football' && inputs.scope != 'rsi' }}
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -99,7 +106,7 @@ jobs:
       # versa. In-season cron-job.org ticks fire scope=football on the weekly
       # line-capture cadence (Tue open, daily refresh, Thu/Sat/Sun/Mon closes).
       - name: Run Football pipeline (pull -> grade -> slate -> sync)
-        if: ${{ inputs.scope != 'mlb' }}
+        if: ${{ inputs.scope != 'mlb' && inputs.scope != 'rsi' }}
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
@@ -110,6 +117,7 @@ jobs:
           python -m mlb_value_bot.football results         || echo "football results: nothing to settle"
           python -m mlb_value_bot.football today            || echo "football today: skipped"
           python -m mlb_value_bot.football sync             || echo "football sync: skipped"
+          python -m mlb_value_bot.rsi grade --engine football || echo "rsi grade football: skipped"
 
       # Live totals (live_total_v1) — ADDITIVE. Grades the site-written live
       # in-game over/under recommendations and refreshes the drive-stat priors
@@ -118,10 +126,30 @@ jobs:
       # (`sync` above already pushes drive stats; the explicit step keeps the
       # priors fresh even when the odds-driven sync short-circuits off-season.)
       - name: Grade live totals + refresh drive priors
-        if: ${{ inputs.scope != 'mlb' }}
+        if: ${{ inputs.scope != 'mlb' && inputs.scope != 'rsi' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: |
           python -m mlb_value_bot.football grade-live      || echo "grade-live: skipped"
           python -m mlb_value_bot.football drive-stats --sync || echo "drive-stats: skipped"
+
+      # RSI weekly review (2026-09-26) — ONLY on scope=rsi (Monday tick). Pulls
+      # every engine's history into fresh SQLite (the review itself reads the
+      # rsi_scored_games view in Supabase, but the pulls keep the runner's
+      # local stores consistent for any helper that opens them), then mines
+      # segments, reconciles proposals, refreshes champion-vs-challenger stats
+      # and rolling-window rollback flags, and emails the summary via Resend.
+      # Nothing here changes the live model: it writes rsi_* tables only.
+      - name: RSI weekly review (segments -> proposals -> email)
+        if: ${{ inputs.scope == 'rsi' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: |
+          python -m mlb_value_bot pull                     || echo "rsi: mlb pull skipped"
+          python -m mlb_value_bot.griffbet pull            || echo "rsi: griff pull skipped"
+          python -m mlb_value_bot.football pull            || echo "rsi: football pull skipped"
+          python -m mlb_value_bot.rsi review --sport all --no-email
+          python -m mlb_value_bot.rsi email                || echo "rsi email: skipped"
