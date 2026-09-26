@@ -91,14 +91,27 @@ def get_rows(table: str, filters: Filters = None, select: str = "*",
 
 
 def upsert_rows(table: str, rows: list[dict], on_conflict: str) -> int:
-    """Upsert `rows` (JSON-sanitised) merging on `on_conflict`; returns count."""
+    """Upsert `rows` (JSON-sanitised) merging on `on_conflict`; returns count.
+
+    PostgREST rejects a bulk body whose objects carry different key sets
+    (PGRST102 "All object keys must match"), and the review legitimately
+    mixes full rows (new proposals) with partial patches (existing ones), so
+    rows are grouped by key set and each group is posted on its own. Padding
+    with nulls instead would overwrite existing values on merge-duplicates.
+    """
     if not rows:
         return 0
     url, key = _credentials()
-    clean = [_clean(r) for r in rows]
-    for start in range(0, len(clean), 500):
-        _post(url, key, table, clean[start:start + 500], on_conflict=on_conflict)
-    return len(clean)
+    groups: dict[tuple[str, ...], list[dict]] = {}
+    for r in rows:
+        clean = _clean(r)
+        groups.setdefault(tuple(sorted(clean.keys())), []).append(clean)
+    total = 0
+    for group in groups.values():
+        for start in range(0, len(group), 500):
+            _post(url, key, table, group[start:start + 500], on_conflict=on_conflict)
+        total += len(group)
+    return total
 
 
 def patch_rows(table: str, filters: Filters, fields: dict) -> None:
