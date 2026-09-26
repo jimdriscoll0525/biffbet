@@ -196,3 +196,59 @@ Keep the same "transparent weighted components + CLV-first measurement" ethos.
 - Logging via `utils.get_logger(...)` (rich console + file at
   `storage/mlb_value_bot.log`). No bare `print` outside the CLI's rich output.
 - Don't commit `.env` or `storage/` contents.
+
+## RSI (Recursive Self-Improvement) — 2026-09-26, `rsi/`
+
+The engine learns from its own history and PROPOSES model changes; Jim
+decides in the Proposals tab (biffbet.com/proposals). Nothing here changes
+the live model on its own. It replaced the 2026-08 retro sidecar + ledger
+(`docs/abilities/` is frozen history; `.claude/skills/self-improve/SKILL.md`
+explains how to run things by hand).
+
+**Logging (every scored game, picks AND passes).** `recommendations` and
+`totals_recommendations` carry `model_tag` (biff_vN / totals_vN) and
+`pass_reason` (below_threshold, filter:*, skip:*, weather_held,
+roof_unverified); the post-price sanity guards (divergence, max EV, sharp
+fade) fall through as passes instead of vanishing, no-price skips stay
+unpersisted. Analysis rows keep a frozen opening (re-frozen on a side flip)
+and accumulate CLV; `grading.grade_analyses` grades is_value=0 rows
+counterfactually with zero P/L, counted separately, never in the record.
+Football picks carry `reasoning.context` (conference/division game, rest
+days, neutral site); weather carries precipitation. The Supabase view
+`rsi_scored_games` unions the four recommendation tables into one shape
+(decision pick|pass, features jsonb, clv + `clv_metric`, `is_holdout`).
+`pipeline.analyze_slate` = `fetch_slate_inputs` + `evaluate_slate_inputs`
+so a second config can be evaluated on the same fetched slate.
+
+**Weekly review** (`python -m mlb_value_bot.rsi review --sport all`,
+GitHub Actions `scope=rsi`, Monday via cron-job.org): `rsi/segments.py` is
+THE bucket source (`tracking/performance.py` delegates to it);
+`rsi/stats.py` cell stats; `rsi/review.py` per-pool candidates with the
+pre-registered small-favorites test first; `rsi/reconcile.py` lifecycle
+watch -> pending (2 consecutive runs with settled growth AND Bonferroni or
+CLV agreement) -> dropped (2 misses); `rsi/suggest.py` maps findings to
+config overlays (dotted keys) or insights; `rsi/shadow_stats.py` champion
+vs challenger + promotion gate; `rsi/versions.py` rolling-window rollback
+flags; `rsi/report.py` + `rsi/email.py` (Resend). Config: `rsi/config_rsi.yaml`
+(min_sample 75 MLB / 40 football per cell, shadow weeks 4 / 3, holdout 20%,
+overlay allowlist per engine).
+
+**Runtime.** `rsi.config.effective_config(engine)` = base YAML + the ACTIVE
+version's cumulative overlay from `rsi_model_versions` (cached in
+`storage/rsi/`, degrades to base); `today` stamps every row with the tag.
+Approved proposals run as shadow challengers inside `today` on the same
+slate (`rsi/shadow.py` -> `rsi_shadow_picks`, never the public tables) and
+are graded by `rsi grade` after each engine run. Promote/rollback are site
+actions that insert/retire `rsi_model_versions` rows; the engine only reads.
+
+Rules for future sessions:
+- Engines are `mlb`, `mlb_totals`, `football` (one config for NFL+CFB);
+  GriffBet is review-only. Public record tables hold CHAMPION rows only.
+- CLV metrics never mix (`clv_pct`, `clv_pp`, `clv_blended_vs_sharp`); every
+  aggregate carries `clv_metric`. CLV before win/loss.
+- The holdout (`rsi/holdout.py`, exact twin of the SQL) is for promotion
+  validation only, never discovery. Calendar-only findings never promote.
+- Overlays may only touch allowlisted keys that flow through the explicit
+  `config` argument of the pipelines; a bare `load_config()` inside model
+  code silently ignores overlays — do not add one.
+- Never hand-edit `rsi_proposals` status; every transition is an event.
