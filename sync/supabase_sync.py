@@ -255,10 +255,24 @@ def _segments_to_json(segments: dict[str, pd.DataFrame]) -> dict[str, list[dict]
     return out
 
 
-def push_performance(url: str, key: str, since: str | None = None) -> int:
-    report = perf.compute_performance(since=since)
-    scope = "all" if not since else f"since:{since}"
-    payload = [{
+def _mlb_lineage() -> tuple[list[str] | None, str | None]:
+    """(every tag ever in rsi_model_versions for engine mlb, the active tag).
+    (None, None) when RSI is unreachable -> the caller applies no filter."""
+    try:
+        from mlb_value_bot.rsi import supa
+
+        rows = supa.get_rows("rsi_model_versions", {"engine": "mlb"}, select="tag,status",
+                             order="id.asc")
+    except Exception as exc:  # noqa: BLE001 - the snapshot must still sync
+        log.warning("model lineage unavailable (%s); performance scope 'all' is unfiltered", exc)
+        return None, None
+    tags = [str(r["tag"]) for r in rows if r.get("tag")]
+    active = next((str(r["tag"]) for r in rows if r.get("status") == "active" and r.get("tag")), None)
+    return (tags or None), active
+
+
+def _performance_payload(scope: str, report: perf.PerformanceReport) -> dict:
+    return {
         "scope": scope,
         "overall": _clean(report.overall),
         "segments": _segments_to_json(report.segments),
@@ -266,10 +280,26 @@ def push_performance(url: str, key: str, since: str | None = None) -> int:
         # upsert keeps whatever was first written unless we send it explicitly,
         # which froze the site's "updated ..." stamp at the first-ever sync.
         "computed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }]
+    }
+
+
+def push_performance(url: str, key: str, since: str | None = None) -> int:
+    """Push the performance snapshot. scope 'all' (or 'since:<d>') is the
+    PUBLIC record: computed over the champion LINEAGE -- every tag that was
+    ever an mlb model version -- so a promotion never resets the site's
+    record. A second scope 'tag:<active_tag>' isolates the current version.
+    Without RSI access the 'all' scope is unfiltered (legacy behaviour)."""
+    lineage, active = _mlb_lineage()
+    report = perf.compute_performance(since=since, model_tags=lineage)
+    scope = "all" if not since else f"since:{since}"
+    payload = [_performance_payload(scope, report)]
+    if active:
+        tag_scope = f"tag:{active}" if not since else f"tag:{active}:since:{since}"
+        payload.append(_performance_payload(
+            tag_scope, perf.compute_performance(since=since, model_tags=[active])))
     _post(url, key, "performance_snapshot", payload, on_conflict="scope")
-    log.info("Synced performance snapshot (scope=%s) to Supabase.", scope)
-    return 1
+    log.info("Synced performance snapshot scope(s) %s to Supabase.", [p["scope"] for p in payload])
+    return len(payload)
 
 
 # --- entrypoint --------------------------------------------------------------

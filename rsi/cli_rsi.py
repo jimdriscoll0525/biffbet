@@ -143,7 +143,55 @@ def import_ledger_cmd(path: Path, dry_run: bool) -> None:
             click.echo(f"  {r['engine']:10s} {r['status']:9s} {r['finding_key']}")
 
 
-# --- runtime half (added by the runtime agent) -------------------------------
-# `grade`  -- settle rsi_shadow_picks against results and re-price CLV.
-# `state`  -- print the active version + approved challengers per engine.
-# Do not implement here; rsi/state.py, rsi/shadow.py, rsi/shadow_grade.py own them.
+# --- runtime half --------------------------------------------------------------
+# `grade`  -- settle rsi_shadow_picks against results (rsi/shadow_grade.py).
+# `state`  -- print the active version + approved challengers (rsi/state.py).
+@cli.command()
+@click.option("--engine", type=click.Choice(["mlb", "football"]), default="mlb", show_default=True,
+              help="mlb grades both the moneyline and totals shadow rows.")
+@click.option("--before", type=str, default=None, help="Grade rows dated before YYYY-MM-DD (default: today).")
+def grade(engine: str, before: str | None) -> None:
+    """Settle pending shadow picks against final scores (flat 1u P/L)."""
+    from mlb_value_bot.rsi.shadow_grade import grade_shadow
+
+    out = grade_shadow(engine, before=before)
+    click.echo(f"[{engine}] shadow picks < {out['before']}: {out['rows']} pending row(s) -> "
+               f"{out['graded']} settled ({out['win']}W-{out['loss']}L-{out['push']}P, "
+               f"{out['void']} void), {out['pending']} still pending"
+               + (f", {out['errors']} error(s)" if out.get("errors") else ""))
+
+
+@cli.command()
+@click.option("--engine", type=click.Choice(["mlb", "mlb_totals", "football"]), default="mlb",
+              show_default=True)
+def state(engine: str) -> None:
+    """Print the effective model tag, its overlay vs the base yaml, and the
+    challengers running in shadow. Degrades to the cache / baseline offline."""
+    from mlb_value_bot.rsi.config import effective_config
+    from mlb_value_bot.rsi.overlay import flatten
+    from mlb_value_bot.rsi.state import load_state
+
+    st = load_state(engine)
+    cfg, tag = effective_config(engine)
+    click.echo(f"[{engine}] active tag: {tag} (state source: {st.source})")
+    if st.active_overlay:
+        if engine == "football":
+            from mlb_value_bot.football import load_football_config as _base
+        else:
+            from mlb_value_bot.utils import load_config as _base
+        flat_base = flatten(_base())
+        click.echo("  overlay vs base yaml:")
+        for key in sorted(st.active_overlay):
+            click.echo(f"    {key}: {flat_base.get(key, '<unset>')} -> {st.active_overlay[key]}")
+    else:
+        click.echo("  overlay: none (base yaml)")
+    if not st.shadow:
+        click.echo("  shadows: none")
+    for p in st.shadow:
+        click.echo(f"  shadow #{p.id} {p.challenger_tag} [{p.sport}] "
+                   f"{p.shadow_started_at or '?'} -> {p.shadow_ends_at or '?'}: "
+                   + ", ".join(f"{k}={v}" for k, v in sorted(p.overlay.items())))
+    if engine == "football":
+        click.echo(f"  cfg.model_tag = {cfg.get('model_tag')}")
+    else:
+        click.echo(f"  cfg.rsi = {cfg.get('rsi')}")

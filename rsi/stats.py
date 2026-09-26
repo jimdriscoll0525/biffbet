@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats as _scipy_stats
 
-from mlb_value_bot.rsi.segments import SETTLED
+from mlb_value_bot.rsi.segments import DIAGNOSTIC_DIMS, NA_VALUES, SETTLED
 
 
 def wilson_ci(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -167,6 +167,10 @@ def segment_report(df: pd.DataFrame, dims: list[str], pool: str, min_n: int,
             if stats["settled"] >= 5:
                 cells_tested += 1
             if stats["settled"] < min_n:
+                continue
+            # Tabulated, never a finding: circular dims (clv_sign) and
+            # "data absent" buckets.
+            if dim in DIAGNOSTIC_DIMS or str(value).strip().lower() in NA_VALUES:
                 continue
             t_trigger = stats["t_stat"] is not None and abs(stats["t_stat"]) >= t_threshold
             clv_sign, strong = clv_strength(sub, t_threshold)

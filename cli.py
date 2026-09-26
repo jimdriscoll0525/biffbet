@@ -31,6 +31,8 @@ from rich.table import Table
 from mlb_value_bot.pipeline import (  # save_value_bets kept for back-compat imports
     GameAnalysis,
     analyze_slate,
+    evaluate_slate_inputs,
+    fetch_slate_inputs,
     flag_starter_scratches,
     refresh_skipped_closing_lines,
     save_slate,
@@ -76,10 +78,13 @@ def cli() -> None:
 @click.option("--all", "show_all", is_flag=True, help="Show every game, not just +EV ones.")
 @click.option("--market-blend", type=float, default=None,
               help="Override the model/market blend weight (0=market only, 1=model only).")
+@click.option("--no-shadow", is_flag=True, help="Skip the RSI shadow challengers.")
 def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
-          market_blend: float | None) -> None:
+          market_blend: float | None, no_shadow: bool) -> None:
     """Analyze today's slate and print the ranked +EV table."""
-    config = load_config()
+    # RSI: the champion config = config.yaml + the active version's overlay
+    # (identical to the plain yaml while no version has been promoted).
+    config, rsi_tag, totals_tag = _effective_mlb_config()
     if market_blend is not None:
         config = {**config, "model": {**config["model"], "market_blend": market_blend}}
     game_date = date_ or date.today().isoformat()
@@ -92,7 +97,10 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
     fetch_ledger.reset()
 
     try:
-        analyses = analyze_slate(game_date, config=config)
+        # Fetch once, evaluate with the champion config; the same inputs are
+        # re-evaluated (no network) for every shadow challenger below.
+        inputs = fetch_slate_inputs(game_date, config=config)
+        analyses = evaluate_slate_inputs(inputs, config)
     except Exception as exc:
         console.print(f"[bold red]Failed to analyze slate:[/] {exc}")
         log.exception("analyze_slate failed")
@@ -124,7 +132,7 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
         )
 
     if save and persistable:
-        total, n_value = save_slate(persistable, threshold, game_date)
+        total, n_value = save_slate(persistable, threshold, game_date, model_tag=rsi_tag)
         console.print(
             f"[green]Saved/updated {total} slate row(s) "
             f"({n_value} flagged +EV) to the tracking DB.[/]"
@@ -179,7 +187,63 @@ def today(date_: str | None, save: bool, min_ev: float | None, show_all: bool,
     # Totals (over/under) -- a parallel, PAPER-ONLY market. Rendered + saved to
     # its own tracking table; graded on CLV vs the totals close. Never affects
     # the moneyline output above.
-    _render_totals(analyses, config, bankroll, game_date, save, show_all)
+    _render_totals(analyses, config, bankroll, game_date, save, show_all, model_tag=totals_tag)
+
+    # RSI shadow challengers: approved proposals re-price the SAME fetched
+    # inputs under their overlay and land in rsi_shadow_picks only. Every
+    # challenger is isolated -- a failure logs and moves on.
+    if save and not no_shadow:
+        _run_mlb_shadows(inputs, config, analyses, game_date, min_ev)
+
+
+def _effective_mlb_config() -> tuple[dict, str, str]:
+    """(champion config, moneyline tag, totals tag). Falls back to the plain
+    config.yaml + baseline tags if the RSI layer is unavailable."""
+    try:
+        from mlb_value_bot.rsi.config import effective_config
+
+        cfg, tag = effective_config("mlb")
+        totals_tag = str((cfg.get("rsi") or {}).get("totals_tag") or "totals_v1")
+        return cfg, tag, totals_tag
+    except Exception as exc:  # noqa: BLE001 - never block the slate on RSI
+        log.warning("RSI effective config unavailable (%s); using config.yaml", exc)
+        return load_config(), "biff_v1", "totals_v1"
+
+
+def _run_mlb_shadows(inputs, config: dict, champion: list[GameAnalysis], game_date: str,
+                     min_ev: float | None) -> None:
+    try:
+        from mlb_value_bot.rsi import shadow as _shadow
+        from mlb_value_bot.rsi.config import challenger_config
+        from mlb_value_bot.rsi.state import load_state
+
+        proposals = load_state("mlb").shadow + load_state("mlb_totals").shadow
+    except Exception as exc:  # noqa: BLE001
+        log.warning("RSI shadow state unavailable (%s); shadows skipped", exc)
+        return
+    if not proposals:
+        return
+    champ_ml_thr = min_ev if min_ev is not None else float(config["ev"]["threshold"])
+    champ_tot_thr = float(config.get("totals", {}).get("ev_threshold", 0.03))
+    for p in proposals:
+        try:
+            chal_cfg = challenger_config(config, p)
+            chal = evaluate_slate_inputs(inputs, chal_cfg)
+            if p.sport == "mlb_totals":
+                if not chal_cfg.get("totals", {}).get("enabled", False):
+                    log.info("shadow %s: totals disabled; skipped", p.challenger_tag)
+                    continue
+                thr = float(chal_cfg["totals"].get("ev_threshold", 0.03))
+                n = _shadow.save_shadow_mlb(p.challenger_tag, "mlb_totals", chal, champion, thr,
+                                            game_date, chal_cfg, champion_threshold=champ_tot_thr)
+            else:
+                thr = min_ev if min_ev is not None else float(chal_cfg["ev"]["threshold"])
+                n = _shadow.save_shadow_mlb(p.challenger_tag, "mlb", chal, champion, thr,
+                                            game_date, chal_cfg, champion_threshold=champ_ml_thr)
+            console.print(f"[dim]Shadow {p.challenger_tag} ({p.sport}): {n} row(s) written.[/]")
+        except Exception as exc:  # noqa: BLE001 - one challenger never stops the rest
+            log.warning("shadow %s failed: %s", p.challenger_tag, exc)
+            continue
 
 
 def _render_slate_table(analyses: list[GameAnalysis], threshold: float, bankroll: float, game_date: str) -> None:
@@ -339,7 +403,8 @@ def _render_totals_breakdowns(totals: list) -> None:
 
 
 def _render_totals(analyses: list[GameAnalysis], config: dict, bankroll: float,
-                   game_date: str, save: bool, show_all: bool) -> None:
+                   game_date: str, save: bool, show_all: bool,
+                   model_tag: str = "totals_v1") -> None:
     """Render + persist the totals slate (PAPER). No-op if totals disabled."""
     if not config.get("totals", {}).get("enabled", False):
         return
@@ -369,7 +434,7 @@ def _render_totals(analyses: list[GameAnalysis], config: dict, bankroll: float,
     persistable = [t for t in totals if t.best_eval is not None and t.rd is not None and t.intel is not None]
     if save and persistable:
         from mlb_value_bot.pipeline_totals import refresh_skipped_totals_closing, save_totals_slate
-        total, n_value = save_totals_slate(persistable, threshold, game_date)
+        total, n_value = save_totals_slate(persistable, threshold, game_date, model_tag=model_tag)
         console.print(f"[green]Saved/updated {total} totals row(s) ({n_value} flagged value) to the tracking DB.[/]")
         n_ref = refresh_skipped_totals_closing(totals, game_date)
         if n_ref:

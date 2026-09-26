@@ -35,6 +35,12 @@ from mlb_value_bot.analysis.ev_calculator import american_to_decimal
 
 SETTLED = {"win", "loss"}
 CALENDAR_DIMS = {"month"}
+# Dims that are tabulated for the report but NEVER become findings: a cell
+# defined by its own CLV sign is circular (CLV- bets losing to the close is
+# a tautology, not a pattern).
+DIAGNOSTIC_DIMS = {"clv_sign"}
+# Bucket values that mean "data absent" -- tabulated, never a finding.
+NA_VALUES = {"n/a", "unknown", "none", ""}
 
 # --- dim lists per pool ------------------------------------------------------
 ML_BET_DIMS = ["stability", "sharp_fade", "odds_bucket", "fav_size", "confidence_bucket",

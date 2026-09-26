@@ -88,8 +88,11 @@ overlay_allowlist:
     - betting.flat_stake
 
 # Weekly email (Resend). `always: true` sends even when nothing is pending.
+# The default sender onboarding@resend.dev can only deliver to the Resend
+# account owner's address (jim@meploans.com). To send to another address,
+# verify a domain in Resend and change `from` to an address on it.
 email:
-  to: jim@financewithjim.com
+  to: jim@meploans.com
   from: "BiffBet RSI <onboarding@resend.dev>"
   always: true
 

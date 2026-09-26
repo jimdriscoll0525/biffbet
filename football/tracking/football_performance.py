@@ -29,10 +29,12 @@ EV_BUCKETS: tuple[tuple[float, str], ...] = (
 )
 
 
-def _bets(df: pd.DataFrame, model_tag: str, league: str | None,
+def _bets(df: pd.DataFrame, model_tag: str | list[str], league: str | None,
           market: str | None) -> pd.DataFrame:
-    """The one and only row filter aggregates may use."""
-    out = df[(df["is_value"] == 1) & (df["model_tag"] == model_tag)]
+    """The one and only row filter aggregates may use. `model_tag` is one tag
+    or (RSI lineage) a list of tags -- still always tag-filtered."""
+    tags = [model_tag] if isinstance(model_tag, str) else list(model_tag)
+    out = df[(df["is_value"] == 1) & (df["model_tag"].isin(tags))]
     if league is not None:
         out = out[out["league"] == league]
     if market is not None:
@@ -54,7 +56,8 @@ def record(df: pd.DataFrame, model_tag: str, league: str | None = None,
     pl = settled["profit_loss"].fillna(0.0).sum()
     clv = bets["clv_pp"].dropna()
     return {
-        "league": league or "all", "market": market or "all", "model_tag": model_tag,
+        "league": league or "all", "market": market or "all",
+        "model_tag": model_tag if isinstance(model_tag, str) else ",".join(model_tag),
         "bets": int(len(bets)), "graded": graded,
         "wins": wins, "losses": losses, "pushes": pushes, "voids": voids,
         "pending": int((bets["result"] == "pending").sum()),
@@ -158,6 +161,22 @@ def calibration(df: pd.DataFrame, model_tag: str, config: dict) -> dict:
     }
 
 
+def lineage_tags(model_tag: str) -> list[str]:
+    """Every tag that was ever a football model version (rsi_model_versions,
+    any status) plus the config tag; [model_tag] when RSI is unreachable."""
+    try:
+        from mlb_value_bot.rsi import supa
+
+        rows = supa.get_rows("rsi_model_versions", {"engine": "football"}, select="tag", order="id.asc")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("football lineage unavailable (%s); using %s only", exc, model_tag)
+        return [model_tag]
+    tags = [str(r["tag"]) for r in rows if r.get("tag")]
+    if model_tag not in tags:
+        tags.append(model_tag)
+    return tags
+
+
 def compute_snapshot(config: dict) -> dict[str, dict]:
     """All football_snapshot scopes, keyed like referee/performance snapshots:
     record:<league>:<market>, ev:<league>:<market>, weeks:<league>,
@@ -177,6 +196,10 @@ def compute_snapshot(config: dict) -> dict[str, dict]:
         scopes[f"weeks:{league}"] = weekly_records(df, model_tag, league)
         scopes[f"distribution:{league}:total"] = pick_distribution(df, model_tag, config, league)
     scopes["record:all:all"] = record(df, model_tag)
+    # RSI: the public record across every promoted football version, so a
+    # promotion never resets the site's W-L. Falls back to the config tag.
+    lineage = lineage_tags(model_tag)
+    scopes["record:all:all:lineage"] = {**record(df, lineage), "model_tags": lineage}
     scopes["distribution:all:total"] = pick_distribution(df, model_tag, config)
     scopes[f"calibration:{model_tag}"] = calibration(df, model_tag, config)
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")

@@ -650,3 +650,607 @@ def test_review_sport_end_to_end_with_preregistered_test():
 def test_review_sport_empty_frame_is_fine():
     sr = review_sport("football", pd.DataFrame(), [], CFG, "2026-09-21")
     assert sr.rows == 0 and sr.findings == [] and sr.changes == []
+
+
+# =============================================================================
+# Runtime half (2026-09-26): state / effective config / shadow picks / grading.
+# Fixtures only: every Supabase call goes through _MemSupa (rsi.supa is
+# monkeypatched), the MLB client and football finals are stubs.
+# =============================================================================
+from mlb_value_bot.rsi import config as rsi_config
+from mlb_value_bot.rsi import shadow as rsi_shadow
+from mlb_value_bot.rsi import shadow_grade
+from mlb_value_bot.rsi import state as rsi_state
+from mlb_value_bot.rsi import supa as rsi_supa
+from mlb_value_bot.rsi.state import RsiState, ShadowProposal
+
+
+class _MemSupa:
+    """In-memory stand-in for rsi.supa (get_rows / upsert_rows / patch_rows)."""
+
+    def __init__(self, tables=None):
+        self.tables = {k: [dict(r) for r in v] for k, v in (tables or {}).items()}
+        self.upserts: list[list[dict]] = []
+        self.patches: list[tuple] = []
+        self._next_id = 1000
+
+    @staticmethod
+    def _match(row, filters):
+        for col, spec in (filters or {}).items():
+            op, val = spec if isinstance(spec, tuple) else ("eq", spec)
+            v = row.get(col)
+            if op == "eq" and v != val:
+                return False
+            if op == "in" and v not in val:
+                return False
+            if op == "lt" and not str(v) < str(val):
+                return False
+            if op == "gte" and not str(v) >= str(val):
+                return False
+        return True
+
+    def get_rows(self, table, filters=None, select="*", order=None, limit=None):
+        rows = [dict(r) for r in self.tables.get(table, []) if self._match(r, filters)]
+        return rows[:limit] if limit else rows
+
+    def upsert_rows(self, table, rows, on_conflict):
+        keys = on_conflict.split(",")
+        store = self.tables.setdefault(table, [])
+        self.upserts.append([dict(r) for r in rows])
+        for r in rows:
+            k = tuple(str(r.get(c)) for c in keys)
+            for ex in store:
+                if tuple(str(ex.get(c)) for c in keys) == k:
+                    ex.update(r)
+                    break
+            else:
+                self._next_id += 1
+                store.append({"id": self._next_id, "result": "pending", **r})
+        return len(rows)
+
+    def patch_rows(self, table, filters, fields):
+        for r in self.tables.get(table, []):
+            if self._match(r, filters):
+                r.update(fields)
+                self.patches.append((r["id"], dict(fields)))
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(rsi_supa, "get_rows", self.get_rows)
+        monkeypatch.setattr(rsi_supa, "upsert_rows", self.upsert_rows)
+        monkeypatch.setattr(rsi_supa, "patch_rows", self.patch_rows)
+        return self
+
+    def row(self, table, **where):
+        for r in self.tables.get(table, []):
+            if all(str(r.get(k)) == str(v) for k, v in where.items()):
+                return r
+        return None
+
+
+def _supa_down(monkeypatch):
+    def _raise(*a, **k):
+        raise RuntimeError("supabase unreachable")
+    monkeypatch.setattr(rsi_supa, "get_rows", _raise)
+    monkeypatch.setattr(rsi_supa, "upsert_rows", _raise)
+    monkeypatch.setattr(rsi_supa, "patch_rows", _raise)
+
+
+def _ga(gid, side="home", odds=-110, ev_pct=0.05, kelly=0.01, filters=(), skipped=None,
+        date="2026-06-10"):
+    from mlb_value_bot.analysis.ev_calculator import SideEvaluation, american_to_decimal
+    from mlb_value_bot.pipeline import GameAnalysis
+
+    se = SideEvaluation(side=side, american_odds=odds, decimal_odds=american_to_decimal(odds),
+                        model_prob=0.55, market_prob_raw=0.52, market_prob_devigged=0.50,
+                        ev_pct=ev_pct, kelly_stake=kelly)
+    return GameAnalysis(game_id=gid, game_date=date, home_team="H", away_team="A",
+                        status="Scheduled", home_pitcher=None, away_pitcher=None,
+                        evals={side: se}, best_side=side, confidence=60.0,
+                        skipped_reason=skipped, adjusted_ev_pct=ev_pct,
+                        filter_reasons=list(filters))
+
+
+def _ta(gid, side="over", odds=-110, ev_pct=0.05, kelly=0.01, line=8.5, devig_over=0.52,
+        sharp_over=0.55):
+    """A TotalsAnalysis-shaped stub (only what save_shadow_mlb reads)."""
+    from mlb_value_bot.analysis.ev_calculator import SideEvaluation, american_to_decimal
+
+    se = SideEvaluation(side=side, american_odds=odds, decimal_odds=american_to_decimal(odds),
+                        model_prob=0.56, market_prob_raw=0.52, market_prob_devigged=devig_over,
+                        ev_pct=ev_pct, kelly_stake=kelly)
+    ns = SimpleNamespace(game_id=gid, home_team="H", away_team="A", best_eval=se, rd=object(),
+                         intel=SimpleNamespace(best_over_price=odds, best_under_price=-105, bet_line=line),
+                         pick_side=side, market_total=line, confidence=55.0)
+    ns.opening_devig_for = lambda s: devig_over if s == "over" else 1.0 - devig_over
+    ns.sharp_close_devig_for = lambda s: sharp_over if s == "over" else 1.0 - sharp_over
+    ns.is_value = lambda thr: ev_pct >= thr and kelly > 0
+    ns.pass_reason = lambda thr: None if ns.is_value(thr) else "below_threshold"
+    ns.reasoning = lambda: {"model_tag": "stub"}
+    return ns
+
+
+def _fb_pick(market="spread", side="home", line=-3.0, is_value=True, odds=-110, sharp_p=0.52,
+             hold=None):
+    from mlb_value_bot.football.pipeline_football import FootballPick
+
+    return FootballPick(
+        market=market, side=side, line=line, american_odds=odds, model_prob=0.55,
+        market_prob=0.5, p_push=0.02, raw_ev=0.04, adjusted_ev=0.04, adjustments=[],
+        confidence=70.0, tier="standard" if is_value else "pass",
+        stake_pct=0.01 if is_value else 0.0, stability_label="stable", is_value=is_value,
+        hold_reason=hold,
+        reasoning={"market": {"devig_p_a": 0.50, "sharp_devig_p_a": sharp_p, "sharp_line": line},
+                   "matchup": {"home_edge": 20.0, "archetype": "neutral"},
+                   "projection": {"margin": 4.0, "total": 44.0}})
+
+
+def _fb_analysis(picks, game_id="2026_01_A_H", date="2026-09-13"):
+    from mlb_value_bot.football.pipeline_football import FootballGameAnalysis
+
+    return FootballGameAnalysis(league="nfl", date=date, week=1, game_id=game_id, home="H",
+                                away="A", commence_time=f"{date}T17:00:00Z", picks=picks)
+
+
+# --- state ---------------------------------------------------------------------
+def test_load_state_default_cache_and_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(rsi_state, "STATE_DIR", tmp_path)
+    _supa_down(monkeypatch)
+    st = rsi_state.load_state("mlb", cfg={"max_shadows": 2})
+    assert (st.active_tag, st.active_overlay, st.shadow, st.source) == ("biff_v1", {}, [], "default")
+    assert rsi_state.load_state("mlb_totals").active_tag == "totals_v1"
+    assert rsi_state.load_state("football").active_tag == "matchup_v1"
+    assert rsi_state.load_state("nope").active_tag == "nope_v1"
+
+    mem = _MemSupa({
+        "rsi_model_versions": [
+            {"id": 1, "engine": "mlb", "tag": "biff_v1", "status": "superseded", "overlay": {}},
+            {"id": 2, "engine": "mlb", "tag": "biff_v2", "status": "active",
+             "overlay": {"ev.threshold": 0.04}}],
+        "rsi_proposals": [
+            {"id": 12, "engine": "mlb", "sport": "mlb", "status": "approved", "challenger_tag": "biff_p12",
+             "overlay": {"filters.min_model_prob": 0.55}, "decided_at": "2026-09-20T10:00:00Z",
+             "shadow_started_at": "2026-09-20", "shadow_ends_at": "2026-10-18"},
+            {"id": 10, "engine": "mlb", "sport": "mlb", "status": "approved", "challenger_tag": "biff_p10",
+             "overlay": {"ev.threshold": 0.035}, "decided_at": "2026-09-10T10:00:00Z"},
+            {"id": 11, "engine": "mlb", "sport": "mlb", "status": "approved", "challenger_tag": "biff_p11",
+             "overlay": {"model.market_blend": 0.3}, "decided_at": "2026-09-15T10:00:00Z"},
+            {"id": 13, "engine": "mlb", "sport": "mlb", "status": "approved", "challenger_tag": None,
+             "overlay": {"ev.threshold": 0.02}},                       # no tag -> unusable
+            {"id": 14, "engine": "mlb", "sport": "mlb", "status": "approved", "challenger_tag": "biff_p14",
+             "overlay": None},                                          # insight -> unusable
+            {"id": 15, "engine": "mlb", "sport": "mlb", "status": "pending", "challenger_tag": "biff_p15",
+             "overlay": {"ev.threshold": 0.02}},                       # not approved
+            {"id": 16, "engine": "football", "sport": "nfl", "status": "approved",
+             "challenger_tag": "matchup_p16", "overlay": {"ev.threshold": 0.02}}],
+    }).install(monkeypatch)
+    st = rsi_state.load_state("mlb", cfg={"max_shadows": 2})
+    assert st.source == "supabase" and st.active_tag == "biff_v2"
+    assert st.active_overlay == {"ev.threshold": 0.04}
+    assert [p.challenger_tag for p in st.shadow] == ["biff_p10", "biff_p11"]   # oldest first, capped
+    assert st.shadow[0].overlay == {"ev.threshold": 0.035} and st.shadow[0].sport == "mlb"
+    cache = tmp_path / "state_mlb.json"
+    assert cache.exists()
+    assert rsi_state.load_state("football", cfg={"max_shadows": 3}).shadow[0].id == 16
+
+    # Supabase down again -> the cache serves the last good state.
+    _supa_down(monkeypatch)
+    st2 = rsi_state.load_state("mlb", cfg={"max_shadows": 2})
+    assert st2.source == "cache" and st2.active_tag == "biff_v2"
+    assert [p.challenger_tag for p in st2.shadow] == ["biff_p10", "biff_p11"]
+    assert st2.shadow[0].shadow_started_at is None
+    # A corrupt cache degrades to the default rather than raising.
+    cache.write_text("{not json", encoding="utf-8")
+    assert rsi_state.load_state("mlb").source == "default"
+
+
+# --- effective / challenger config ------------------------------------------------
+def _fake_states(**overrides):
+    base = {
+        "mlb": RsiState("mlb", "biff_v2", {"ev.threshold": 0.045}, [], "supabase"),
+        "mlb_totals": RsiState("mlb_totals", "totals_v2", {"totals.ev_threshold": 0.05}, [], "supabase"),
+        "football": RsiState("football", "matchup_v2", {"ev.threshold": 0.04}, [], "supabase"),
+    }
+    base.update(overrides)
+    return lambda engine, cfg=None: base[engine]
+
+
+def test_effective_config_applies_overlay_stamps_tag_and_degrades(monkeypatch):
+    import copy
+
+    from mlb_value_bot.football import load_football_config
+    from mlb_value_bot.utils import load_config
+
+    base = copy.deepcopy(load_config())
+    monkeypatch.setattr(rsi_config, "load_state", _fake_states())
+    cfg, tag = rsi_config.effective_config("mlb")
+    assert tag == "biff_v2" and cfg["ev"]["threshold"] == 0.045
+    assert cfg["totals"]["ev_threshold"] == 0.05                     # both MLB overlays applied
+    assert cfg["rsi"] == {"tag": "biff_v2", "totals_tag": "totals_v2"}
+    assert load_config() == base                                     # the cached base is untouched
+    cfg_t, tag_t = rsi_config.effective_config("mlb_totals")
+    assert tag_t == "totals_v2" and cfg_t["ev"]["threshold"] == 0.045
+    fcfg, ftag = rsi_config.effective_config("football")
+    assert ftag == "matchup_v2" and fcfg["model_tag"] == "matchup_v2" and fcfg["ev"]["threshold"] == 0.04
+
+    # No overlay at all -> the champion config IS the yaml (plus the tag bookkeeping).
+    monkeypatch.setattr(rsi_config, "load_state", _fake_states(
+        mlb=RsiState("mlb", "biff_v1", {}, []), mlb_totals=RsiState("mlb_totals", "totals_v1", {}, []),
+        football=RsiState("football", "matchup_v1", {}, [])))
+    cfg, tag = rsi_config.effective_config("mlb")
+    assert tag == "biff_v1" and {k: v for k, v in cfg.items() if k != "rsi"} == base
+    fcfg, ftag = rsi_config.effective_config("football")
+    fbase = load_football_config()
+    assert {k: v for k, v in fcfg.items() if k != "model_tag"} == {k: v for k, v in fbase.items() if k != "model_tag"}
+
+    # Degrade path: load_state blowing up (it never should) -> base + default tags.
+    def _boom(engine, cfg=None):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(rsi_config, "load_state", _boom)
+    cfg, tag = rsi_config.effective_config("mlb")
+    assert tag == "biff_v1" and cfg["ev"]["threshold"] == base["ev"]["threshold"]
+    assert cfg["rsi"] == {"tag": "biff_v1", "totals_tag": "totals_v1"}
+    fcfg, ftag = rsi_config.effective_config("football")
+    assert ftag == "matchup_v1" and fcfg["model_tag"] == "matchup_v1"
+
+
+def test_challenger_config_retags_by_sport():
+    cfg = {"ev": {"threshold": 0.03}, "totals": {"ev_threshold": 0.03},
+           "rsi": {"tag": "biff_v1", "totals_tag": "totals_v1"}}
+    ml = rsi_config.challenger_config(cfg, ShadowProposal(1, "biff_p1", {"ev.threshold": 0.05}, "mlb"))
+    assert ml["ev"]["threshold"] == 0.05 and ml["rsi"] == {"tag": "biff_p1", "totals_tag": "totals_v1"}
+    assert cfg["ev"]["threshold"] == 0.03                              # deep copy
+    tot = rsi_config.challenger_config(cfg, ShadowProposal(2, "totals_p2", {"totals.ev_threshold": 0.04}, "mlb_totals"))
+    assert tot["totals"]["ev_threshold"] == 0.04 and tot["rsi"] == {"tag": "biff_v1", "totals_tag": "totals_p2"}
+    fb = rsi_config.challenger_config({"model_tag": "matchup_v1", "ev": {"threshold": 0.03}},
+                                      ShadowProposal(3, "matchup_p3", {"ev.threshold": 0.02}, "nfl"))
+    assert fb["model_tag"] == "matchup_p3" and fb["ev"]["threshold"] == 0.02
+
+
+# --- shadow picks: MLB -------------------------------------------------------------
+def test_save_shadow_mlb_shapes_rows_and_freezes(monkeypatch):
+    from mlb_value_bot.tracking.recommendations import _compute_clv
+
+    mem = _MemSupa().install(monkeypatch)
+    cfg = {"ev": {"threshold": 0.02}, "totals": {"ev_threshold": 0.03}}
+    champion = [_ga(1, ev_pct=0.05, kelly=0.01), _ga(2, ev_pct=0.025, kelly=0.004),
+                _ga(3, side="home", ev_pct=0.01, kelly=0.0)]
+    challenger = [_ga(1, ev_pct=0.05, kelly=0.01), _ga(2, ev_pct=0.025, kelly=0.004),
+                  _ga(3, side="home", ev_pct=0.01, kelly=0.0),
+                  _ga(4, ev_pct=0.05, kelly=0.0, skipped="raw model vs market diverge by 0.3")]
+    n = rsi_shadow.save_shadow_mlb("biff_p1", "mlb", challenger, champion, 0.02, "2026-06-10", cfg,
+                                   champion_threshold=0.03)
+    assert n == 4
+    r1 = mem.row("rsi_shadow_picks", game_id="1")
+    assert r1["challenger_tag"] == "biff_p1" and r1["engine"] == "mlb" and r1["sport"] == "mlb"
+    assert r1["game_id"] == "1" and r1["market"] == "moneyline" and r1["clv_metric"] == "clv_pct"
+    assert r1["is_value"] is True and r1["pass_reason"] is None and r1["champion_is_value"] is True
+    assert r1["opening_price"] == -110 and r1["closing_price"] == -110 and r1["clv"] == 0.0
+    assert r1["bet_odds"] == -110 and r1["line"] is None and r1["reasoning"]["model_tag"] == "biff_v1"
+    r2 = mem.row("rsi_shadow_picks", game_id="2")
+    assert r2["is_value"] is True and r2["champion_is_value"] is False   # 2.5% clears 2% not 3%
+    r3 = mem.row("rsi_shadow_picks", game_id="3")
+    assert r3["is_value"] is False and r3["pass_reason"] == "below_threshold" and r3["champion_is_value"] is False
+    r4 = mem.row("rsi_shadow_picks", game_id="4")
+    assert r4["pass_reason"] == "skip:divergence" and r4["champion_is_value"] is None
+    assert all("result" not in r and "flat_pl" not in r for r in mem.upserts[0])   # grading owns them
+
+    # Re-run at new prices: value row keeps its opening, refreshes the close +
+    # CLV; a pass keeps its opening unless the side flips (re-freeze).
+    challenger2 = [_ga(1, odds=-130, ev_pct=0.04, kelly=0.008),
+                   _ga(3, side="away", odds=120, ev_pct=0.01, kelly=0.0),
+                   _ga(2, odds=-115, ev_pct=0.01, kelly=0.0)]
+    rsi_shadow.save_shadow_mlb("biff_p1", "mlb", challenger2, champion, 0.02, "2026-06-10", cfg)
+    r1 = mem.row("rsi_shadow_picks", game_id="1")
+    assert r1["opening_price"] == -110 and r1["closing_price"] == -130
+    assert r1["clv"] == _compute_clv(-110, -130) and r1["clv"] > 0
+    assert r1["is_value"] is True and r1["bet_odds"] == -110            # frozen commit
+    r3 = mem.row("rsi_shadow_picks", game_id="3")
+    assert r3["pick_side"] == "away" and r3["opening_price"] == 120     # flipped -> re-frozen
+    r2 = mem.row("rsi_shadow_picks", game_id="2")
+    assert r2["is_value"] is True and r2["opening_price"] == -110        # never downgraded
+    assert mem.row("rsi_shadow_picks", game_id="4")["result"] == "pending"
+
+    # Totals rows read .totals off the GameAnalysis (or a TotalsAnalysis directly).
+    g = _ga(5)
+    g.totals = _ta(5, side="under", line=8.5, devig_over=0.48, sharp_over=0.45)
+    n = rsi_shadow.save_shadow_mlb("totals_p2", "mlb_totals", [g, _ga(6)], [g], None, "2026-06-10", cfg)
+    assert n == 1
+    t = mem.row("rsi_shadow_picks", game_id="5", sport="mlb_totals")
+    assert t["engine"] == "mlb_totals" and t["market"] == "total" and t["clv_metric"] == "clv_pp"
+    assert t["line"] == 8.5 and t["opening_line"] == 8.5 and t["closing_price"] == -105
+    assert t["opening_devig_p_side"] == pytest.approx(0.52) and t["sharp_close_devig_p_side"] == pytest.approx(0.55)
+    assert t["clv"] == pytest.approx(3.0) and t["is_value"] is True and t["champion_is_value"] is True
+
+    # Best-effort: a failing upsert logs and returns 0, never raises.
+    def _boom(*a, **k):
+        raise RuntimeError("down")
+    monkeypatch.setattr(rsi_supa, "upsert_rows", _boom)
+    assert rsi_shadow.save_shadow_mlb("biff_p1", "mlb", challenger, champion, 0.02, "2026-06-10", cfg) == 0
+    assert rsi_shadow.save_shadow_mlb("biff_p1", "hockey", challenger, champion, 0.02, "2026-06-10", cfg) == 0
+
+
+# --- shadow picks: football -------------------------------------------------------
+def test_save_shadow_football_shapes_rows_and_freezes(monkeypatch):
+    mem = _MemSupa().install(monkeypatch)
+    cfg = {"model_tag": "matchup_p3"}
+    champ = [_fb_analysis([_fb_pick(is_value=False, hold="below threshold"),
+                           _fb_pick(market="total", side="under", line=44.5, is_value=True)])]
+    chal = [_fb_analysis([_fb_pick(sharp_p=0.52),
+                          _fb_pick(market="total", side="under", line=44.5, is_value=False,
+                                   hold="divergence guard")]),
+            _fb_analysis([_fb_pick(side="away", line=3.0, odds=-105)], game_id="2026_01_B_C",
+                         date="2026-09-14")]
+    n = rsi_shadow.save_shadow_football("matchup_p3", "nfl", chal, champ, cfg)
+    assert n == 3
+    s = mem.row("rsi_shadow_picks", game_id="2026_01_A_H", market="spread")
+    assert s["engine"] == "football" and s["sport"] == "nfl" and s["league"] == "nfl"
+    assert s["is_value"] is True and s["champion_is_value"] is False and s["pass_reason"] is None
+    assert s["line"] == -3.0 and s["opening_line"] == -3.0 and s["opening_devig_p_side"] == 0.5
+    assert s["sharp_close_devig_p_side"] == 0.52 and s["clv"] == pytest.approx(2.0)
+    assert s["clv_metric"] == "clv_pp" and s["decimal_odds"] == pytest.approx(1.909, abs=1e-3)
+    t = mem.row("rsi_shadow_picks", game_id="2026_01_A_H", market="total")
+    assert t["is_value"] is False and t["pass_reason"] == "divergence guard" and t["champion_is_value"] is True
+    assert t["line"] == 44.5
+    away = mem.row("rsi_shadow_picks", game_id="2026_01_B_C", market="spread")
+    assert away["date"] == "2026-09-14" and away["line"] == -3.0        # picked-side line (home -3 -> away +3 stored as picked)
+    assert away["champion_is_value"] is None
+
+    # Later run: line moved and the sharps came to us -> opening frozen, close + CLV refreshed.
+    chal2 = [_fb_analysis([_fb_pick(line=-3.5, odds=-115, sharp_p=0.55),
+                           _fb_pick(market="total", side="over", line=44.0, is_value=False, hold="x")])]
+    rsi_shadow.save_shadow_football("matchup_p3", "nfl", chal2, champ, cfg)
+    s = mem.row("rsi_shadow_picks", game_id="2026_01_A_H", market="spread")
+    assert s["opening_line"] == -3.0 and s["opening_price"] == -110 and s["opening_devig_p_side"] == 0.5
+    assert s["closing_line"] == -3.5 and s["closing_price"] == -115
+    assert s["sharp_close_devig_p_side"] == 0.55 and s["clv"] == pytest.approx(5.0)
+    t = mem.row("rsi_shadow_picks", game_id="2026_01_A_H", market="total")
+    assert t["pick_side"] == "over" and t["opening_line"] == 44.0        # side flipped -> re-frozen
+    assert rsi_shadow.save_shadow_football("matchup_p3", "nfl", [], champ, cfg) == 0
+
+
+# --- grading -------------------------------------------------------------------------
+def test_grade_shadow_mlb_and_football_outcomes(monkeypatch):
+    from mlb_value_bot.data.mlb_client import GameResult
+    from mlb_value_bot.football.tracking import football_results as fr
+
+    def _row(i, sport, market, side, gid, date, line=None, dec=1.91, league=None):
+        return {"id": i, "sport": sport, "engine": "football" if league else sport, "league": league,
+                "market": market, "pick_side": side, "game_id": gid, "date": date, "line": line,
+                "decimal_odds": dec, "result": "pending"}
+
+    mem = _MemSupa({"rsi_shadow_picks": [
+        _row(1, "mlb", "moneyline", "home", "10", "2026-06-01"),
+        _row(2, "mlb", "moneyline", "away", "11", "2026-06-01", dec=2.4),
+        _row(3, "mlb", "moneyline", "home", "12", "2026-06-01"),          # postponed -> void
+        _row(4, "mlb_totals", "total", "over", "13", "2026-06-01", line=8.5),
+        _row(5, "mlb_totals", "total", "under", "14", "2026-06-01", line=9.0),   # exact -> push
+        _row(6, "mlb", "moneyline", "home", "15", "2026-06-01"),          # no final yet
+        _row(7, "mlb", "moneyline", "home", "16", "2026-09-30"),          # future: not in scope
+        _row(8, "nfl", "spread", "home", "g1", "2026-09-13", line=-3.0, league="nfl"),
+        _row(9, "nfl", "total", "over", "g2", "2026-09-13", line=44.5, league="nfl"),
+        _row(10, "cfb", "spread", "away", "c1", "2026-09-01", line=3.0, league="cfb"),  # no final, old -> void
+        _row(11, "nfl", "spread", "away", "g3", "2026-09-13", line=3.0, league="nfl"),  # exact -> push
+    ]}).install(monkeypatch)
+
+    class _MLB:
+        def get_results(self, d):
+            assert d == "2026-06-01"
+            return [GameResult(10, "Final", "H", "A", 5, 3), GameResult(11, "Final", "H", "A", 5, 3),
+                    GameResult(12, "Postponed", "H", "A", None, None),
+                    GameResult(13, "Final", "H", "A", 5, 4), GameResult(14, "Final", "H", "A", 5, 4)]
+
+    out = shadow_grade.grade_shadow("mlb", before="2026-09-26", mlb_client=_MLB())
+    assert out["rows"] == 6 and out["graded"] == 5 and out["pending"] == 1
+    assert (out["win"], out["loss"], out["push"], out["void"]) == (2, 1, 1, 1)
+    got = {i: (f["result"], f["flat_pl"]) for i, f in mem.patches}
+    assert got[1] == ("win", pytest.approx(0.91)) and got[2] == ("loss", -1.0)
+    assert got[3] == ("void", 0.0) and got[4] == ("win", pytest.approx(0.91)) and got[5] == ("push", 0.0)
+    assert 6 not in got and 7 not in got
+    assert mem.row("rsi_shadow_picks", id=1)["result"] == "win"
+
+    mem.patches.clear()
+    monkeypatch.setattr(fr, "_nfl_finals", lambda season, cfg: {"g1": (27, 20), "g2": (20, 24), "g3": (23, 20)})
+    monkeypatch.setattr(fr, "_cfb_finals", lambda season, cfg: {})
+    out = shadow_grade.grade_shadow("football", before="2026-09-26",
+                                    football_config={"grading": {"void_after_days": 10}})
+    assert out["rows"] == 4 and out["graded"] == 4
+    got = {i: (f["result"], f["flat_pl"]) for i, f in mem.patches}
+    assert got[8] == ("win", pytest.approx(0.91)) and got[9] == ("loss", -1.0)
+    assert got[10] == ("void", 0.0) and got[11] == ("push", 0.0)
+    with pytest.raises(ValueError):
+        shadow_grade.grade_shadow("hockey")
+    assert shadow_grade.flat_pl("win", 2.5) == 1.5 and shadow_grade.flat_pl("pending", 2.5) is None
+
+
+# --- end to end: a challenger re-prices the SAME inputs and differs only by its overlay --
+def test_shadow_differs_from_champion_when_overlay_changes_threshold(monkeypatch):
+    """Reuses test_core's offline golden slate: fetch once, evaluate the
+    champion, then a challenger whose overlay raises ev.threshold to 5%.
+    Game 2 (EV ~3.5%) is a pass either way, but ONLY the challenger's
+    pass_reason carries below_threshold; the champion output is untouched."""
+    import copy
+
+    import mlb_value_bot.pipeline as P
+    from mlb_value_bot.analysis.team_metrics import TeamProfile
+    from mlb_value_bot.tests.test_core import _serialize_slate, _slate_fixture
+    from mlb_value_bot.utils import load_config
+
+    schedule, odds = _slate_fixture()
+
+    class _StubOdds:
+        def get_odds(self):
+            return list(odds)
+
+    class _StubMLB:
+        def get_schedule(self, d):
+            return list(schedule)
+
+        def get_per_player_hitting(self, season):
+            return {}
+
+        def get_per_pitcher_reliever_stats(self, season):
+            return {}
+
+    class _StubProvider:
+        def __init__(self, season=None, config=None, mlb_client=None):
+            pass
+
+        def build_team_profile(self, name, is_home):
+            return TeamProfile(team=name, raw_winpct=0.52 if is_home else 0.48, games=60,
+                               wins=31, losses=29, offense_wrc_plus=102, bullpen_fip=4.1,
+                               park_factor=100)
+
+    monkeypatch.setattr(P, "TeamMetricsProvider", _StubProvider)
+    monkeypatch.setattr(rsi_config, "load_state", _fake_states(
+        mlb=RsiState("mlb", "biff_v1", {}, []), mlb_totals=RsiState("mlb_totals", "totals_v1", {}, [])))
+    cfg, tag = rsi_config.effective_config("mlb")
+    cfg["totals"]["enabled"] = False
+    assert tag == "biff_v1"
+    plain = copy.deepcopy(load_config())
+    plain["totals"]["enabled"] = False
+
+    inputs = P.fetch_slate_inputs("2026-06-10", _StubOdds(), _StubMLB(), cfg)
+    champion = P.evaluate_slate_inputs(inputs, cfg)
+    # The champion config prices exactly what the plain yaml prices.
+    assert _serialize_slate(champion) == _serialize_slate(P.evaluate_slate_inputs(inputs, plain))
+    champ_thr = float(cfg["ev"]["threshold"])
+    assert champ_thr == 0.03
+
+    proposal = ShadowProposal(7, "biff_p7", {"ev.threshold": 0.05}, "mlb")
+    chal_cfg = rsi_config.challenger_config(cfg, proposal)
+    assert chal_cfg["rsi"]["tag"] == "biff_p7" and chal_cfg["ev"]["threshold"] == 0.05
+    challenger = P.evaluate_slate_inputs(inputs, chal_cfg)
+    # Same inputs, same pricing math (side / EV / skip); only the decision
+    # layer (threshold, sizing tier prose) moves with the overlay.
+    _core = lambda xs: [(a.game_id, a.skipped_reason, a.best_side,  # noqa: E731
+                         a.best_eval.ev_pct if a.best_eval else None) for a in xs]
+    assert _core(challenger) == _core(champion)
+
+    mem = _MemSupa().install(monkeypatch)
+    n = rsi_shadow.save_shadow_mlb(proposal.challenger_tag, "mlb", challenger, champion,
+                                   float(chal_cfg["ev"]["threshold"]), "2026-06-10", chal_cfg,
+                                   champion_threshold=champ_thr)
+    assert n == 2                                                   # the two priced games
+    champ_by_id = {a.game_id: a for a in champion}
+    r2 = mem.row("rsi_shadow_picks", game_id="2")
+    assert r2["ev_pct"] == pytest.approx(champ_by_id[2].best_eval.ev_pct)
+    assert "below_threshold" in r2["pass_reason"]
+    assert "below_threshold" not in (champ_by_id[2].pass_reason(champ_thr) or "")
+    assert r2["is_value"] is False and r2["champion_is_value"] is False
+    r1 = mem.row("rsi_shadow_picks", game_id="1")
+    assert r1["pass_reason"] == champ_by_id[1].pass_reason(champ_thr)   # unchanged where the overlay is moot
+    assert {r["challenger_tag"] for r in mem.tables["rsi_shadow_picks"]} == {"biff_p7"}
+
+
+# --- continuity of the public record across promoted tags --------------------------
+def test_compute_performance_model_tags_filter():
+    from mlb_value_bot.tests.test_core import _restore_recs, _rsi_rec, _tmp_recs
+    from mlb_value_bot.tracking import performance as perf
+
+    utils, orig, recs = _tmp_recs()
+    try:
+        recs.upsert_recommendation(_rsi_rec(recs, gid=1, is_value=True, pass_reason=None, model_tag="biff_v1"))
+        recs.upsert_recommendation(_rsi_rec(recs, gid=2, is_value=True, pass_reason=None, model_tag="biff_v2"))
+        recs.upsert_recommendation(_rsi_rec(recs, gid=3, is_value=True, pass_reason=None, model_tag="biff_p9"))
+        recs.upsert_recommendation(_rsi_rec(recs, gid=4, is_value=False, model_tag="biff_v2"))
+        assert perf.compute_performance().overall["bets"] == 3
+        assert perf.compute_performance(model_tags=["biff_v1", "biff_v2"]).overall["bets"] == 2
+        assert perf.compute_performance(model_tags=["biff_v2"]).overall["bets"] == 1
+        assert perf.compute_performance(model_tags=["nope"]).overall == {"bets": 0, "settled": 0}
+    finally:
+        _restore_recs(utils, orig, recs)
+
+
+def test_push_performance_pushes_lineage_and_active_tag_scopes(monkeypatch):
+    from mlb_value_bot.sync import supabase_sync as S
+    from mlb_value_bot.tracking import performance as perf
+
+    calls, posted = [], []
+
+    def _fake_perf(since=None, model_tags=None):
+        calls.append(model_tags)
+        return perf.PerformanceReport(overall={"bets": 1, "settled": 0}, segments={})
+
+    monkeypatch.setattr(perf, "compute_performance", _fake_perf)
+    monkeypatch.setattr(S, "_post", lambda url, key, table, rows, on_conflict: posted.append((table, rows, on_conflict)))
+    _MemSupa({"rsi_model_versions": [
+        {"id": 1, "engine": "mlb", "tag": "biff_v1", "status": "superseded"},
+        {"id": 2, "engine": "mlb", "tag": "biff_v2", "status": "active"},
+        {"id": 3, "engine": "football", "tag": "matchup_v1", "status": "active"}]}).install(monkeypatch)
+    assert S.push_performance("u", "k") == 2
+    assert calls == [["biff_v1", "biff_v2"], ["biff_v2"]]
+    assert [p["scope"] for p in posted[-1][1]] == ["all", "tag:biff_v2"] and posted[-1][2] == "scope"
+    assert S.push_performance("u", "k", since="2026-06-01") == 2
+    assert [p["scope"] for p in posted[-1][1]] == ["since:2026-06-01", "tag:biff_v2:since:2026-06-01"]
+
+    calls.clear()
+    _supa_down(monkeypatch)
+    assert S.push_performance("u", "k") == 1                          # legacy: unfiltered 'all' only
+    assert calls == [None] and [p["scope"] for p in posted[-1][1]] == ["all"]
+
+
+def test_football_record_lineage_scope(monkeypatch, tmp_path):
+    from mlb_value_bot.football.tracking import football_performance as fp
+    from mlb_value_bot.football.tracking import football_store as store
+
+    def _r(tag, result="win"):
+        return {"is_value": 1, "model_tag": tag, "league": "nfl", "market": "spread", "result": result,
+                "flat_stake": 0.01, "profit_loss": 0.0091 if result == "win" else -0.01,
+                "clv_pp": 1.0, "pick_side": "home", "created_at": "2026-09-13", "week": 1, "date": "2026-09-13"}
+
+    df = pd.DataFrame([_r("matchup_v1"), _r("matchup_v2", "loss"), _r("matchup_p5")])
+    assert fp.record(df, "matchup_v1")["bets"] == 1
+    lineage = fp.record(df, ["matchup_v1", "matchup_v2"])
+    assert lineage["bets"] == 2 and lineage["wins"] == 1 and lineage["losses"] == 1
+    assert lineage["model_tag"] == "matchup_v1,matchup_v2"
+
+    _MemSupa({"rsi_model_versions": [{"id": 1, "engine": "football", "tag": "matchup_v1"},
+                                     {"id": 2, "engine": "football", "tag": "matchup_v2"},
+                                     {"id": 3, "engine": "mlb", "tag": "biff_v1"}]}).install(monkeypatch)
+    assert fp.lineage_tags("matchup_v2") == ["matchup_v1", "matchup_v2"]
+    assert fp.lineage_tags("matchup_v9") == ["matchup_v1", "matchup_v2", "matchup_v9"]
+
+    # compute_snapshot carries the lineage scope beside the tag-filtered ones.
+    monkeypatch.setattr(store, "FOOTBALL_DB_PATH", tmp_path / "fb.db")
+    store.save_slate([_fb_analysis([_fb_pick()])], {"model_tag": "matchup_v1", "betting": {"paper_only": True}})
+    store.save_slate([_fb_analysis([_fb_pick()], game_id="2026_01_B_C")],
+                     {"model_tag": "matchup_v2", "betting": {"paper_only": True}})
+    cfg = {"model_tag": "matchup_v2", "distribution_monitor": {"window": 50, "alert_share": 0.6, "min_picks": 25}}
+    scopes = fp.compute_snapshot(cfg)
+    assert scopes["record:all:all"]["bets"] == 1
+    assert scopes["record:all:all:lineage"]["bets"] == 2
+    assert scopes["record:all:all:lineage"]["model_tags"] == ["matchup_v1", "matchup_v2"]
+    _supa_down(monkeypatch)
+    assert fp.lineage_tags("matchup_v2") == ["matchup_v2"]
+    assert fp.compute_snapshot(cfg)["record:all:all:lineage"]["bets"] == 1
+
+
+# --- CLI ---------------------------------------------------------------------------------
+def test_cli_rsi_grade_and_state_commands(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from mlb_value_bot.rsi.cli_rsi import cli
+
+    runner = CliRunner()
+    out = runner.invoke(cli, ["--help"])
+    assert out.exit_code == 0 and "grade" in out.output and "state" in out.output
+
+    monkeypatch.setattr(rsi_state, "STATE_DIR", tmp_path)
+    _supa_down(monkeypatch)
+    out = runner.invoke(cli, ["state", "--engine", "mlb"])
+    assert out.exit_code == 0, out.output
+    assert "biff_v1" in out.output and "default" in out.output and "shadows: none" in out.output
+
+    _MemSupa({
+        "rsi_model_versions": [{"id": 2, "engine": "football", "tag": "matchup_v2", "status": "active",
+                                "overlay": {"ev.threshold": 0.04}}],
+        "rsi_proposals": [{"id": 5, "engine": "football", "sport": "nfl", "status": "approved",
+                           "challenger_tag": "matchup_p5", "overlay": {"weather.wind_mph": 12}}],
+        "rsi_shadow_picks": [],
+    }).install(monkeypatch)
+    out = runner.invoke(cli, ["state", "--engine", "football"])
+    assert out.exit_code == 0, out.output
+    assert "matchup_v2" in out.output and "ev.threshold" in out.output and "matchup_p5" in out.output
+    out = runner.invoke(cli, ["grade", "--engine", "football"])
+    assert out.exit_code == 0, out.output
+    assert "0 pending row(s)" in out.output

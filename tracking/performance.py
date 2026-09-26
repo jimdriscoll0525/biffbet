@@ -145,9 +145,22 @@ def _segment(df: pd.DataFrame, column: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def compute_performance(since: str | None = None) -> PerformanceReport:
-    """Build the full performance report from stored recommendations."""
+def compute_performance(since: str | None = None,
+                        model_tags: list[str] | None = None) -> PerformanceReport:
+    """Build the full performance report from stored recommendations.
+
+    `model_tags` restricts the report to rows whose model_tag is in the list
+    (RSI: the champion lineage for the public record, or one tag). Rows with
+    no tag count as the baseline 'biff_v1'. None = every row (legacy)."""
     df = recs.to_dataframe(since=since)
+    if df.empty:
+        return PerformanceReport(overall={"bets": 0, "settled": 0}, segments={})
+    if model_tags:
+        tags = {str(t) for t in model_tags}
+        if "model_tag" in df.columns:
+            df = df[df["model_tag"].fillna("biff_v1").astype(str).isin(tags)]
+        elif "biff_v1" not in tags:
+            df = df.iloc[0:0]
     if df.empty:
         return PerformanceReport(overall={"bets": 0, "settled": 0}, segments={})
 

@@ -98,11 +98,16 @@ def data_status(season: int | None, odds: bool) -> None:
 @click.option("--date", "date_", default=None, help="Slate date YYYY-MM-DD (default: today).")
 @click.option("--league", "league_", type=click.Choice(["nfl", "cfb", "all"]), default="all")
 @click.option("--save/--no-save", default=True, help="Persist the slate to football's DB.")
-def today(date_: str | None, league_: str, save: bool) -> None:
+@click.option("--no-shadow", is_flag=True, help="Skip the RSI shadow challengers.")
+def today(date_: str | None, league_: str, save: bool, no_shadow: bool) -> None:
     """Analyze the current football board and print the paper slate."""
+    from mlb_value_bot.football.data.football_odds import fetch_league_odds
     from mlb_value_bot.football.pipeline_football import evaluate_league_slate
 
-    config = load_football_config()
+    # RSI: the champion config = config_football.yaml + the active version's
+    # overlay, with model_tag stamped for the store (matchup_v1 until a
+    # promotion happens).
+    config, model_tag = _effective_football_config()
     game_date = date_ or date.today().isoformat()
     if not football_in_season(game_date, config):
         click.echo(f"Football off-season ({game_date}): Odds API pull skipped "
@@ -112,15 +117,22 @@ def today(date_: str | None, league_: str, save: bool) -> None:
     paper = config.get("betting", {}).get("paper_only", True)
 
     all_analyses = []
+    odds_by_league: dict[str, list] = {}
+    champion_by_league: dict[str, list] = {}
     for lg in leagues:
         if not config.get("leagues", {}).get(lg, {}).get("enabled", True):
             continue
         try:
-            analyses = evaluate_league_slate(lg, game_date, config)
+            # Odds are pulled ONCE per league (credits) and shared with every
+            # shadow challenger below.
+            odds = fetch_league_odds(lg, config)
+            analyses = evaluate_league_slate(lg, game_date, config, odds_games=odds)
         except Exception as exc:  # noqa: BLE001 -- one league failing must not kill the other
             log.warning("%s slate failed: %s", lg, exc)
             click.echo(f"{lg.upper()}: slate unavailable ({exc})")
             continue
+        odds_by_league[lg] = odds
+        champion_by_league[lg] = analyses
         all_analyses.extend(analyses)
 
         bets = [(a, p) for a in analyses for p in a.bets]
@@ -144,7 +156,52 @@ def today(date_: str | None, league_: str, save: bool) -> None:
         from mlb_value_bot.football.tracking.football_store import save_slate
 
         total, n_value = save_slate(all_analyses, config)
-        click.echo(f"Saved {total} football market row(s) ({n_value} paper bets).")
+        click.echo(f"Saved {total} football market row(s) ({n_value} paper bets) [{model_tag}].")
+
+    # RSI shadow challengers: the same odds, re-priced under each approved
+    # proposal's overlay, written to rsi_shadow_picks only.
+    if save and not no_shadow and odds_by_league:
+        _run_football_shadows(game_date, config, odds_by_league, champion_by_league)
+
+
+def _effective_football_config() -> tuple[dict, str]:
+    """(champion config with model_tag stamped, active tag); falls back to the
+    plain config_football.yaml + matchup_v1 if the RSI layer is unavailable."""
+    try:
+        from mlb_value_bot.rsi.config import effective_config
+
+        return effective_config("football")
+    except Exception as exc:  # noqa: BLE001 - never block the slate on RSI
+        log.warning("RSI effective config unavailable (%s); using config_football.yaml", exc)
+        cfg = load_football_config()
+        return cfg, str(cfg.get("model_tag", "matchup_v1"))
+
+
+def _run_football_shadows(game_date: str, config: dict, odds_by_league: dict,
+                          champion_by_league: dict) -> None:
+    try:
+        from mlb_value_bot.football.pipeline_football import evaluate_league_slate
+        from mlb_value_bot.rsi.config import challenger_config
+        from mlb_value_bot.rsi.shadow import save_shadow_football
+        from mlb_value_bot.rsi.state import load_state
+
+        proposals = load_state("football").shadow
+    except Exception as exc:  # noqa: BLE001
+        log.warning("RSI shadow state unavailable (%s); shadows skipped", exc)
+        return
+    for p in proposals:
+        # A proposal for one league (sport nfl | cfb) only shadows that league.
+        leagues = [p.sport] if p.sport in odds_by_league else (
+            [] if p.sport in ("nfl", "cfb") else list(odds_by_league))
+        for lg in leagues:
+            try:
+                chal_cfg = challenger_config(config, p)
+                chal = evaluate_league_slate(lg, game_date, chal_cfg, odds_games=odds_by_league[lg])
+                n = save_shadow_football(p.challenger_tag, lg, chal, champion_by_league.get(lg, []), chal_cfg)
+                click.echo(f"Shadow {p.challenger_tag} ({lg}): {n} row(s) written.")
+            except Exception as exc:  # noqa: BLE001 - one challenger never stops the rest
+                log.warning("shadow %s/%s failed: %s", p.challenger_tag, lg, exc)
+                continue
 
 
 @cli.command()
